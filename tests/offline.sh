@@ -36,9 +36,16 @@ unset INSTABOX_KEY_FILE IBX_STALE_SECS IBX_MAXTIME IBX_EXEC_MAXTIME IBX_REEXEC C
 # The key reaches the mock through its environment, so no process has it in its arguments.
 TMPDIR=$S/mock MOCK_API_KEY=$KEY python3 "$MOCK" --port 0 --exec "$EXEC_MODE" >"$S/mock.port" 2>"$S/mock.log" &
 MOCK_PID=$!
-for _ in $(seq 100); do [ -s "$S/mock.port" ] && break; sleep 0.1; done
+# A cold python3 can take several seconds on a CI runner: wait up to 60 s.
+for _ in $(seq 600); do [ -s "$S/mock.port" ] && break; sleep 0.1; done
 PORT=$(head -n 1 "$S/mock.port")
-[ -n "$PORT" ] || { echo "offline.sh: the mock did not start:" >&2; cat "$S/mock.log" >&2; exit 2; }
+if [ -z "$PORT" ]; then
+	echo "offline.sh: the mock did not start:" >&2
+	cat "$S/mock.log" >&2
+	if kill -0 "$MOCK_PID" 2>/dev/null; then echo "(still running after 60 s)" >&2; else wait "$MOCK_PID"; echo "(exited with $?)" >&2; fi
+	echo "python3: $(command -v python3) $(python3 -V 2>&1)" >&2
+	exit 2
+fi
 BASE=http://127.0.0.1:$PORT
 export INSTABOX_API_URL=$BASE INSTABOX_API_KEY=$KEY
 
