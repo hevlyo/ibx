@@ -1,0 +1,12 @@
+{
+  "name": "ibx",
+  "description": "Borrow a disposable instabox.sh cloud sandbox from a shared pool, safely: reservations between agents, idle-pause handling, exec that is never retried blindly, file copy, SSH with short-lived tokens, and cleanup on release.",
+  "author": {
+    "name": "hevlyo",
+    "url": "https://github.com/hevlyo"
+  },
+  "homepage": "https://github.com/hevlyo/ibx",
+  "repository": "https://github.com/hevlyo/ibx",
+  "license": "MIT",
+  "keywords": ["instabox", "sandbox", "cloud-vm", "agents", "skill", "isolation"]
+}

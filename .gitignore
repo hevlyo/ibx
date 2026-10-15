@@ -1,0 +1,32 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+
+# Local agent state (Claude Code worktrees and personal settings)
+.claude/worktrees/
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Python bytecode (tests/mock_api.py)
+__pycache__/
+*.pyc
+
+# Scratch output from local runs. The tests make their scratch directories with mktemp under
+# $TMPDIR; these patterns catch them if TMPDIR points into the clone.
+*.log
+*.tmp
+.ibx-install.*
+ibx-offline.*/
+ibx-live.*/
+ibx-install.*/
+ibx.*/
+
+# Credentials never belong in this repository
+api-key
+*.key
+.env
+.env.*

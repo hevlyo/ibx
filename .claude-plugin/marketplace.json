@@ -1,0 +1,16 @@
+{
+  "name": "ibx",
+  "owner": {
+    "name": "hevlyo"
+  },
+  "metadata": {
+    "description": "ibx: an agent skill and bash helper for borrowing instabox.sh sandboxes from a shared pool."
+  },
+  "plugins": [
+    {
+      "name": "ibx",
+      "source": "./",
+      "description": "Borrow a disposable instabox.sh cloud sandbox from a shared pool, safely: reservations between agents, idle-pause handling, exec that is never retried blindly, file copy, SSH with short-lived tokens, and cleanup on release."
+    }
+  ]
+}

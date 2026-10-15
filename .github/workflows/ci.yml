@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The release binary, checksum verified: the same shellcheck as in development (apt's can be
+      # older and flag different things).
+      - name: Install shellcheck
+        env:
+          SC_VERSION: v0.11.0
+          SC_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/shellcheck.tar.xz" \
+            "https://github.com/koalaman/shellcheck/releases/download/$SC_VERSION/shellcheck-$SC_VERSION.linux.x86_64.tar.xz"
+          echo "$SC_SHA256  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/shellcheck.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-$SC_VERSION" >>"$GITHUB_PATH"
+          "$RUNNER_TEMP/shellcheck-$SC_VERSION/shellcheck" --version
+
+      - name: bash -n
+        run: for f in skills/ibx/scripts/ibx install.sh tests/*.sh; do bash -n "$f"; done
+
+      - name: shellcheck
+        run: shellcheck -x skills/ibx/scripts/ibx install.sh tests/*.sh
+
+      - name: Python syntax of the mock API
+        run: python3 -m py_compile tests/mock_api.py
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            mock_exec: real # the mock runs the commands: put/get are tested (GNU coreutils)
+          - os: macos-latest
+            mock_exec: "" # canned exec results: put/get are skipped
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          prefix=$(brew --prefix)
+          [ -x "$prefix/bin/bash" ] || brew install bash
+          command -v jq >/dev/null || brew install jq
+          echo "$prefix/bin" >>"$GITHUB_PATH"
+
+      - name: Dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: command -v jq >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q jq; }
+
+      - name: Versions
+        run: |
+          bash --version | sed -n 1p
+          jq --version
+          curl -V | sed -n 1p
+          python3 --version
+
+      - name: The system bash 3.2 is refused with a clear message (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set +e
+          out=$(IBX_REEXEC=1 /bin/bash skills/ibx/scripts/ibx --version 2>&1)
+          rc=$?
+          set -e
+          printf '%s\n' "$out"
+          [ "$rc" = 125 ] || { echo "expected exit code 125, got $rc"; exit 1; }
+          grep -q 'needs bash >= 4.4' <<<"$out"
+
+      - name: The system bash 3.2 re-executes with Homebrew bash (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          out=$(/bin/bash skills/ibx/scripts/ibx --version)
+          printf '%s\n' "$out"
+          [ "$out" = "ibx $(sed -n 's/^IBX_VERSION=//p' skills/ibx/scripts/ibx)" ]
+
+      - name: Offline tests
+        env:
+          MOCK_EXEC: ${{ matrix.mock_exec }}
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then test_bash=$(brew --prefix)/bin/bash; else test_bash=bash; fi
+          "$test_bash" tests/offline.sh

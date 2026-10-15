@@ -1,0 +1,777 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2317,SC2329 # jq programs are single-quoted on purpose; cleanup_fns calls the rest
+# ibx: borrow a disposable instabox.sh sandbox from a shared pool, safely, from any coding agent.
+# https://github.com/hevlyo/ibx  (MIT). Run `ibx --help`; the agent-facing guide is SKILL.md.
+
+# bash >= 4.4 is required (inherit_errexit, empty arrays under set -u). macOS ships 3.2: re-exec
+# with Homebrew's bash when it is there.
+if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
+	{ [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -lt 4 ]; }; then
+	if [ -z "${IBX_REEXEC:-}" ]; then
+		for b in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+			[ -x "$b" ] && IBX_REEXEC=1 exec "$b" "$0" "$@"
+		done
+	fi
+	printf 'ibx: needs bash >= 4.4 (this is %s). macOS: brew install bash\n' "${BASH_VERSION:-not bash}" >&2
+	exit 125
+fi
+set -euo pipefail
+shopt -s inherit_errexit
+umask 077
+# Before any child process (uname, cksum, curl -V, jq, mktemp...) inherits it; see load_key.
+ENV_KEY=${INSTABOX_API_KEY:-}
+unset INSTABOX_API_KEY
+
+IBX_VERSION=0.1.0
+
+usage() {
+	cat <<'EOF'
+ibx - borrow a disposable instabox.sh sandbox from a shared pool
+
+Agents
+  ibx claim "<purpose>"                  reserve a free pool sandbox and print its name. Write the
+                                         name down: shell variables do not survive between calls.
+                                         The purpose is stored in the sandbox metadata: keep it generic
+  ibx exec <box> [-t SECS] [-i] -- <cmd> run as the sandbox user with bash -lc (HOME /data/home).
+                                         Default 300 s, max 600; -i sends this stdin (up to 1 MiB).
+                                         One argument = a bash script; several = one command with
+                                         each argument quoted
+  ibx put [--force] <box> <local> <remote>
+                                         copy a file in (up to 750 KB; relative paths are under HOME).
+                                         Refuses files that look like credentials unless --force
+  ibx get <box> <remote> [local]         copy a file out (same limit, text or binary)
+  ibx ssh <box> [cmd...]                 ssh through a 1-hour token revoked on exit; streams stdio:
+                                           ibx ssh BOX 'bash -s' <script.sh
+                                           tar c dir | ibx ssh BOX 'tar x'    ibx ssh BOX 'tar c dir' | tar x
+  ibx port <box> <port> [name]           publish an HTTP port at a public URL (NO authentication)
+  ibx unport <box> <port>                unpublish it
+  ibx renew <box>                        refresh your reservation (jobs that run past 24 h)
+  ibx release <box>                      give it back: unpublishes ibx ports, drops the lease and
+                                         the reservation
+  ibx ls [--all] [--json]                pool sandboxes, state and who holds each (--all: every one)
+
+Humans
+  ibx pool add [--allow-vault] <box>...  let agents claim these sandboxes (refuses ones that receive
+                                         Vault secrets unless --allow-vault)
+  ibx pool rm <box>...                   take them out of the pool
+  ibx keepalive [--all]                  renew a 1-hour activity lease on reserved pool sandboxes
+                                         (--all: on every pool sandbox); run it from a timer
+  ibx doctor                             check dependencies, key, API access and the pool
+  ibx --version | --help
+
+Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox; 125 ibx
+itself failed (API, network, usage); 255 ssh could not connect; 143 also when ibx itself got
+SIGTERM (it says so, and the remote command may still be running); keepalive exits 1 when any
+lease could not be renewed.
+
+Environment: INSTABOX_API_KEY (else the file IBX_KEY_FILE, default
+${XDG_CONFIG_HOME:-~/.config}/instabox/api-key), INSTABOX_API_URL (https://api.instabox.sh;
+another host needs IBX_ALLOW_CUSTOM_API=1), IBX_AGENT_NAME (shown in reservations; default a
+pseudonymous id of this user and host), IBX_STALE_SECS (reservation age that counts as abandoned,
+86400), IBX_ALLOW_ANY=1 (agent commands on sandboxes outside the pool), IBX_ALLOW_VAULT=1 (claim
+sandboxes that receive Vault secrets).
+EOF
+}
+
+case "${1:-}" in
+"" | -h | --help) usage; exit 0 ;;
+--version | version) echo "ibx $IBX_VERSION"; exit 0 ;;
+esac
+
+API=${INSTABOX_API_URL:-https://api.instabox.sh}
+KEYFILE=${IBX_KEY_FILE:-${INSTABOX_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/instabox/api-key}}
+STALE_SECS=${IBX_STALE_SECS:-86400}
+LEASE=ibx-keepalive
+IBX_MAXTIME=${IBX_MAXTIME:-} # set during claim: caps each API call, retries included
+LABEL=''                     # the sandbox name, for messages
+host_id=$(printf '%s@%s' "${USER:-}" "$(uname -n)" | cksum | cut -d' ' -f1)
+AGENT=${IBX_AGENT_NAME:-agent-$host_id}
+AGENT=${AGENT//[^A-Za-z0-9@._:-]/_}
+AGENT=${AGENT:0:64}
+
+die() { printf 'ibx: %s\n' "$*" >&2; exit 125; }
+warn() { printf 'ibx: %s\n' "$*" >&2; }
+
+# The key goes only to api.instabox.sh unless told otherwise; plain http only to a local test server.
+if [[ $API =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
+	:
+elif [[ $API =~ ^https://([A-Za-z0-9.-]+)(:[0-9]+)?$ ]]; then
+	[ "${BASH_REMATCH[1]}" = api.instabox.sh ] || [ "${IBX_ALLOW_CUSTOM_API:-}" = 1 ] ||
+		die "INSTABOX_API_URL points at ${BASH_REMATCH[1]}, not api.instabox.sh: set IBX_ALLOW_CUSTOM_API=1 if that is intended"
+else
+	die "INSTABOX_API_URL must be https://host"
+fi
+[[ $STALE_SECS =~ ^[0-9]+$ ]] || die "IBX_STALE_SECS must be a number of seconds"
+
+deps_ok() { # prints problems, one per line
+	command -v curl >/dev/null || echo "curl is missing"
+	command -v jq >/dev/null || echo "jq is missing (macOS: brew install jq)"
+	command -v ssh >/dev/null || echo "ssh is missing (needed only by ibx ssh)"
+	if command -v curl >/dev/null; then
+		local v
+		v=$(curl -q -V | awk 'NR==1{print $2}')
+		awk -v v="$v" 'BEGIN{split(v,a,"."); exit !((a[1]>7)||(a[1]==7&&a[2]>=71))}' ||
+			echo "curl $v is too old (need 7.71+)"
+	fi
+	if command -v jq >/dev/null; then
+		jq -n '"a" | sub("a"; "b") | IN("b")' >/dev/null 2>&1 || echo "jq is too old (need 1.6+)"
+	fi
+}
+if [ "$1" != doctor ]; then
+	problems=$(deps_ok | grep -v 'needed only by' || true)
+	[ -z "$problems" ] || die "$problems"
+fi
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX")
+cleanup_fns=()
+cleanup() {
+	trap '' INT TERM
+	local f
+	for f in "${cleanup_fns[@]}"; do "$f" || true; done
+	rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'warn "interrupted by SIGTERM: a remote command it started may still be running"; exit 143' TERM
+
+# The key stays in this (unexported) variable and reaches curl through stdin (-H @-): it is never
+# in argv, in the environment of child processes, or in a file that a SIGKILL would leave behind.
+AUTH=
+KEY_SOURCE=
+load_key() {
+	local key=$ENV_KEY
+	KEY_SOURCE=INSTABOX_API_KEY
+	if [ -z "$key" ] && [ -r "$KEYFILE" ]; then
+		[ -z "$(find "$KEYFILE" -prune \( -perm -040 -o -perm -004 \) 2>/dev/null)" ] ||
+			warn "WARNING: $KEYFILE is readable by other users: chmod 600 $(printf %q "$KEYFILE")"
+		key=$(tr -d '[:space:]' <"$KEYFILE")
+		KEY_SOURCE=$KEYFILE
+	fi
+	[[ $key =~ ^ibk_[a-z2-7]{20,}$ ]] || return 1
+	AUTH="Authorization: Bearer $key"
+}
+if [ "$1" != doctor ]; then
+	load_key || die "no API key: set INSTABOX_API_KEY or write it to $KEYFILE (chmod 600)"
+	ENV_KEY=
+fi
+
+idem() { od -An -N12 -tx1 /dev/urandom | tr -d ' \n'; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+size_of() { wc -c <"$1" | tr -d ' '; }
+shuffle() { # lines of stdin in random order (no shuf on macOS)
+	awk -v s="$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')" 'BEGIN { srand(s) } { printf "%.9f\t%s\n", rand(), $0 }' |
+		sort -n | cut -f2-
+}
+printable() { LC_ALL=C tr -d '\000-\010\013-\037\177'; } # drop control chars from text shown to a terminal
+
+# api METHOD PATH [BODY-FILE]: prints the body of a 2xx reply; otherwise prints the body (an error
+# envelope) to stderr and returns 1. The API sometimes drops TLS mid-reply, so idempotent calls are
+# retried (the body goes to a file, which curl rewrites on a retry). exec and SSH-token creation
+# are never retried: the command would run twice, or a second token would be left behind.
+# curl -q skips ~/.curlrc, which could otherwise turn on verbose output and print the key.
+api() {
+	local m=$1 p=$2 code rc
+	case "$p" in *..* | *'#'* | *[[:space:]]*) printf '{"error":{"code":"bad_path","message":"refusing path %s"}}\n' "$p" >&2; return 1 ;; esac
+	local args=(-q -sS -o "$tmp/resp" -w '%{http_code}' -X "$m" -H @- -H 'Content-Type: application/json')
+	[ $# -ge 3 ] && args+=(--data-binary @"$3")
+	case "$m $p" in
+	"POST "*/exec) args+=(-m "${IBX_EXEC_MAXTIME:-700}") ;;
+	"POST "*/ssh-tokens) args+=(-m 60) ;;
+	*)
+		args+=(-m "${IBX_MAXTIME:-120}" --retry 3 --retry-delay 2 --retry-all-errors)
+		[ -n "${IBX_MAXTIME:-}" ] && args+=(--retry-max-time "$IBX_MAXTIME")
+		;;
+	esac
+	# Routes that take an Idempotency-Key get a fresh one; curl's retries reuse it.
+	case "$m $p" in GET* | "POST "*/exec | "POST "*/ssh-tokens | PUT* | "POST "*/ports | "DELETE "*/ports/* | "DELETE "*/activity-leases/* | "DELETE "*/ssh-tokens/* | "POST "*/wake) ;;
+	*) args+=(-H "Idempotency-Key: ibx-$(idem)") ;;
+	esac
+	code=$(printf '%s\n' "$AUTH" | curl "${args[@]}" "$API$p") || {
+		rc=$?
+		printf '{"error":{"code":"transport","message":"curl exit %s on %s %s","retryable":false}}\n' "$rc" "$m" "$p" >&2
+		return 1
+	}
+	case "$code" in
+	2??) cat "$tmp/resp" ;;
+	*) { cat "$tmp/resp"; echo; } >&2; return 1 ;;
+	esac
+}
+err_code() { jq -r '.error.code // empty' <"$1" 2>/dev/null || true; }
+
+all_machines() { # every sandbox of the account (GET /v1/machines is paged)
+	local page cursor='' acc='[]'
+	while :; do
+		page=$(api GET "/v1/machines?limit=200${cursor:+&cursor=$cursor}") || return 1
+		acc=$(jq -c --argjson a "$acc" '$a + .machines' <<<"$page") || return 1
+		cursor=$(jq -r '.nextCursor // empty' <<<"$page")
+		[[ $cursor =~ ^[A-Za-z0-9_=-]*$ ]] || return 1
+		[ -n "$cursor" ] || break
+	done
+	printf '%s\n' "$acc"
+}
+
+# jq helpers. age(now): seconds since the reservation was made; null when there is none; "invalid"
+# when ibx.claim.at cannot be parsed or lies in the future. free: no live reservation.
+JQ_DEFS='def age($now): (.metadata["ibx.claim.at"] // "") as $a | if $a == "" then null else
+	(try ($a | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch null) as $t |
+	if $t == null or ($now - $t) < -300 then "invalid" else $now - $t end end;
+	def free($now; $stale): age($now) as $g | $g == null or ($g != "invalid" and $g > $stale);
+	def inpool: (.metadata["ibx.pool"] // "") == "1";
+	def vaulton: if .vault == false then false else true end;
+	def clean: if type == "string" then gsub("[\u0000-\u001f\u007f-\u009f]"; " ") else . end;'
+
+resolve() { # [--pool] name-or-id -> id. With --pool, only pool sandboxes (agent commands).
+	local pool='' ms id
+	[ "$1" = --pool ] && { pool=1; shift; }
+	ms=$(all_machines) || die "could not list sandboxes"
+	id=$(jq -r --arg r "$1" '.[] | select(.id == $r or .name == $r) | .id' <<<"$ms") || die "bad sandbox list"
+	[ -n "$id" ] || die "no sandbox named $1 (ibx ls --all)"
+	[[ $id =~ ^m_[a-z2-7]{26}$ ]] || die "unexpected sandbox id from the API"
+	if [ -n "$pool" ] && [ "${IBX_ALLOW_ANY:-}" != 1 ] &&
+		[ "$(jq -r --arg i "$id" "$JQ_DEFS"' .[] | select(.id == $i) | inpool' <<<"$ms")" != true ]; then
+		die "$1 is not in the pool: agents only use pool sandboxes (ibx ls). Ask the user."
+	fi
+	printf '%s' "$id"
+}
+
+vault_items() { # id -> number of Vault items written into the sandbox (0 when the Vault is off)
+	local r
+	r=$(api GET "/v1/machines/$1/vault" 2>"$tmp/verr") || {
+		[ "$(err_code "$tmp/verr")" = not_found ] && { echo 0; return 0; } # a server without Vault
+		return 1
+	}
+	jq -r 'if .enabled == false then 0 else ([.items[]?] | length) end' <<<"$r"
+}
+
+wait_op() { # operation-id: waits up to 8 minutes
+	local op=$1 r end=$((SECONDS + 480))
+	[ -n "$op" ] || return 0
+	[[ $op =~ ^[A-Za-z0-9_-]+$ ]] || { warn "unexpected operation id"; return 1; }
+	while [ $SECONDS -lt $end ]; do
+		if ! r=$(api GET "/v1/operations/$op?wait=25s" 2>"$tmp/operr"); then
+			[ "$(err_code "$tmp/operr")" = not_found ] && { warn "operation $op not found"; return 1; }
+			sleep 3
+			continue
+		fi
+		case "$(jq -r .state <<<"$r")" in
+		succeeded) return 0 ;;
+		failed) warn "operation $op failed: $(jq -c .error <<<"$r")"; return 1 ;;
+		esac
+	done
+	warn "operation $op still running after 8 minutes"
+	return 1
+}
+
+# ensure_running ID: returns 0 once the sandbox runs (waking an idle-paused one, resuming a paused
+# one, starting a stopped one, waiting out an operation in progress), 1 if it cannot.
+ensure_running() {
+	local m op opid state action nm=$1 end=$((SECONDS + 600)) notready=
+	while [ $SECONDS -lt $end ]; do
+		m=$(api GET "/v1/machines/$1") || { sleep 3; continue; }
+		nm=$(jq -r "$JQ_DEFS"' .name // "" | clean' <<<"$m")
+		[ -n "$nm" ] || nm=$1
+		state=$(jq -r .state <<<"$m")
+		opid=$(jq -r '.operationId // empty' <<<"$m")
+		if [ "$state" = running ]; then
+			[ "$(jq -r '.runtime.ready // false' <<<"$m")" = true ] && return 0
+			: "${notready:=$SECONDS}"
+			# exec works before the runtime reports ready; do not block on it forever.
+			[ $((SECONDS - notready)) -lt 60 ] || { warn "$nm runs but its runtime is not ready; continuing"; return 0; }
+			sleep 3
+			continue
+		fi
+		if [ -n "$opid" ]; then wait_op "$opid" || return 1; continue; fi
+		case "$state" in
+		suspended | stopped)
+			action=start
+			[ "$state" = suspended ] && action=resume
+			[ "$state" = suspended ] && [ -n "$(jq -r '.autoSuspendedAt // empty' <<<"$m")" ] && action=wake # concurrent callers share it
+			if op=$(api POST "/v1/machines/$1/$action" 2>"$tmp/err"); then
+				# resume and start answer with an Operation (202); wake answers with the Machine (200).
+				if [ "$action" != wake ]; then wait_op "$(jq -r '.id // empty' <<<"$op")" || return 1; fi
+				m=$(api GET "/v1/machines/$1") || true
+				if [ "$(jq -r '.runtime.processesPreserved' <<<"$m" 2>/dev/null)" = false ]; then
+					warn "WARNING: $nm came back with a fresh boot: processes started before the pause are gone"
+				fi
+			elif [ "$(err_code "$tmp/err")" = operation_conflict ]; then
+				wait_op "$(jq -r '.error.operationId // empty' <"$tmp/err")" || return 1
+			else
+				cat "$tmp/err" >&2
+				return 1
+			fi
+			;;
+		creating | starting | resuming | stopping | suspending) sleep 3 ;;
+		*) warn "$nm is $state"; return 1 ;;
+		esac
+	done
+	warn "$nm did not start within 10 minutes"
+	return 1
+}
+
+set_meta() { # id jq-filter [jq args...]: read-modify-write of the sandbox metadata
+	local id=$1 filter=$2 m
+	shift 2
+	rm -f "$tmp/meta"
+	m=$(api GET "/v1/machines/$id") || return 1
+	jq "$@" "{metadata: ((.metadata // {}) | $filter)}" <<<"$m" >"$tmp/meta" || return 1
+	api PATCH "/v1/machines/$id" "$tmp/meta" >/dev/null || return 1
+}
+set_claim() { # id claim-object-json ({} clears): replaces only the ibx.claim.* keys
+	set_meta "$1" 'with_entries(select(.key | startswith("ibx.claim.") | not)) + $c' --argjson c "$2"
+}
+
+exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call it directly, not
+	# in $(...): then a SIGTERM while it waits for a slot ends ibx before it tries again.
+	local id=$1 t=$2 code starts=0 end=$((SECONDS + 600))
+	if [ $# -ge 4 ]; then
+		jq -n --arg c "$3" --argjson t "$t" --rawfile s "$4" '{cmd:$c, timeoutSeconds:$t, stdin:$s}' >"$tmp/exec"
+	else
+		jq -n --arg c "$3" --argjson t "$t" '{cmd:$c, timeoutSeconds:$t}' >"$tmp/exec"
+	fi
+	while :; do
+		if R=$(IBX_EXEC_MAXTIME=$((t + 90)) api POST "/v1/machines/$id/exec" "$tmp/exec" 2>"$tmp/err"); then
+			return 0
+		fi
+		code=$(err_code "$tmp/err")
+		case "$code" in
+		quota_exceeded) # at most 4 execs at once per account: wait for a slot
+			[ $SECONDS -lt $end ] || { cat "$tmp/err" >&2; die "exec did not run: 4 other execs kept the account busy for 10 minutes"; }
+			sleep $((5 + RANDOM % 5)) & wait $! ;;
+		machine_not_running) # it never started, so retrying is safe
+			starts=$((starts + 1))
+			[ $starts -le 3 ] || { cat "$tmp/err" >&2; die "exec did not run: ${LABEL:-the sandbox} keeps stopping"; }
+			ensure_running "$id" || die "exec did not run: could not start ${LABEL:-the sandbox}" ;;
+		bad_request | unauthenticated | api_key_expired | api_key_revoked | permission_denied | insufficient_scope | not_found | bad_path)
+			cat "$tmp/err" >&2; die "exec rejected (the command did not run)" ;;
+		host_unavailable)
+			if [ "$(jq -r '.error.retryable // false' <"$tmp/err")" = true ] && [ $SECONDS -lt $end ]; then sleep 5 & wait $!; continue; fi
+			cat "$tmp/err" >&2; die "exec failed (the command may or may not have run; check before retrying)" ;;
+		*) cat "$tmp/err" >&2; die "exec failed (the command may or may not have run; check before retrying)" ;;
+		esac
+	done
+}
+
+remote_cmd() { # args -> one bash command line: a single argument is a script, several are quoted
+	if [ $# -eq 1 ]; then printf '%s' "$1"; else printf '%q ' "$@"; fi
+}
+
+public_ports() { # id -> "port US name US url" lines (US = \x1f keeps empty fields)
+	local r
+	r=$(api GET "/v1/machines/$1/ports") || return 1
+	jq -r "$JQ_DEFS"' .ports[]? | [(.port|tostring), (.name // "" | clean), (.url | clean)] | join("\u001f")' <<<"$r"
+}
+
+unpublish() { # id port: also fine when it is already gone (a retried DELETE gets 404)
+	api DELETE "/v1/machines/$1/ports/$2" >/dev/null 2>"$tmp/perr" || [ "$(err_code "$tmp/perr")" = not_found ]
+}
+
+phys() { # path -> the physical path of the file it names, symlinks followed (no realpath on old macOS)
+	local p=$1 l n=0
+	while [ -L "$p" ] && [ $n -lt 40 ]; do
+		l=$(readlink -- "$p")
+		case "$l" in /*) p=$l ;; *) p=$(dirname -- "$p")/$l ;; esac
+		n=$((n + 1))
+	done
+	printf '%s/%s' "$(cd -P -- "$(dirname -- "$p")" && pwd -P)" "$(basename -- "$p")"
+}
+
+looks_secret() { # path -> 0 when the file looks like a credential
+	local p=$1 b
+	b=$(basename -- "$p" | tr '[:upper:]' '[:lower:]')
+	case "$b" in
+	.env | .env.* | *.env | *.pem | *.key | *.p12 | *.pfx | *.jks | *.kdbx | *.keystore | *.tfstate | *.tfvars | \
+		id_rsa* | id_dsa* | id_ecdsa* | id_ed25519* | .netrc | .npmrc | .pypirc | .pgpass | .git-credentials | \
+		credentials* | *secret* | *token* | api-key | *.ovpn) return 0 ;;
+	esac
+	case "/$p" in */.ssh/* | */.aws/* | */.gnupg/* | */.kube/* | */.docker/config.json | */gcloud/* | */.claude/* | */.codex/* | */instabox/*) return 0 ;; esac
+	return 1
+}
+
+table() { if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi; }
+
+cmd=$1
+shift
+if [ "$cmd" = pool ] && [ "${1:-}" = ls ]; then cmd='ls'; shift; fi
+case "$cmd" in
+ls)
+	all='' json=''
+	for a in "$@"; do case "$a" in --all) all=1 ;; --json) json=1 ;; *) die "usage: ibx ls [--all] [--json]" ;; esac; done
+	ms=$(all_machines) || die "could not list sandboxes"
+	rows=$(jq --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
+		[.[] | select($all == "1" or inpool) | age($now) as $age | {
+			name: (.name | clean), id, state, pool: inpool, vault: vaulton,
+			reservation: (if $age == null then "free"
+				elif $age == "invalid" then "invalid"
+				elif $age > $stale then "abandoned" else "held" end),
+			by: (.metadata["ibx.claim.by"] | clean), since: (.metadata["ibx.claim.at"] | clean),
+			purpose: (.metadata["ibx.claim.purpose"] | clean)}]' <<<"$ms")
+	if [ -n "$json" ]; then
+		printf '%s\n' "$rows"
+	elif [ "$(jq length <<<"$rows")" = 0 ]; then
+		warn "the pool is empty. The user can add sandboxes with: ibx pool add <box> (ibx ls --all lists every sandbox)"
+	else
+		jq -r '.[] | [.name, .state, (if .reservation == "free" then "free"
+			elif .reservation == "abandoned" then "free (abandoned reservation by \(.by // "?"))"
+			elif .reservation == "invalid" then "held? reservation date unreadable (\(.since)); only the user should release it"
+			else "held by \(.by // "?") since \(.since): \(.purpose // "")" end),
+			(if .pool then "" else "not in pool" end)] | @tsv' <<<"$rows" | table
+	fi
+	;;
+pool)
+	sub=${1:-}
+	shift || true
+	allow_vault='' boxes=()
+	for a in "$@"; do
+		case "$a" in
+		--allow-vault) [ "$sub" = add ] || die "--allow-vault only goes with ibx pool add"; allow_vault=1 ;;
+		-*) die "unknown option $a" ;;
+		*) boxes+=("$a") ;;
+		esac
+	done
+	set -- "${boxes[@]}"
+	case "$sub" in
+	add | rm)
+		[ $# -ge 1 ] || die "usage: ibx pool $sub [--allow-vault] <box>..."
+		for b in "$@"; do
+			id=$(resolve "$b")
+			if [ "$sub" = add ]; then
+				m=$(api GET "/v1/machines/$id") || die "could not read $b"
+				if [ "$(jq -r "$JQ_DEFS"' vaulton' <<<"$m")" = true ]; then
+					n=$(vault_items "$id") || die "could not read the Vault of $b"
+					if [ "$n" != 0 ] && [ -z "$allow_vault" ]; then
+						die "$b receives $n Vault secret(s) at every boot, and agents run untrusted code in pool sandboxes. Use a sandbox created with --no-vault, or ibx pool add --allow-vault $b to accept that"
+					fi
+					warn "note: $b has the Vault on ($n item(s) now). Secrets you add to the Vault later reach it; a sandbox created with --no-vault is safer"
+				fi
+				set_meta "$id" '. + {"ibx.pool": "1"}' || die "could not add $b"
+				echo "added $b to the pool"
+			else
+				set_meta "$id" 'del(.["ibx.pool"])' || die "could not remove $b"
+				echo "removed $b from the pool"
+			fi
+		done
+		;;
+	*) die "usage: ibx pool add [--allow-vault] <box>... | ibx pool rm <box>... | ibx pool ls" ;;
+	esac
+	;;
+claim)
+	purpose=${1:-}
+	[ -n "$purpose" ] || die 'usage: ibx claim "<purpose>"'
+	purpose=$(printf '%s' "$purpose" | tr '\t\n\r' '   ' | printable)
+	token=$(idem)
+	apierr=''
+	claimed_ids=()
+	unclaim() { # clears every reservation this run wrote, unless someone else holds it now
+		local i m
+		for i in "${claimed_ids[@]}"; do
+			[ -n "$i" ] || continue
+			m=$(api GET "/v1/machines/$i") || continue
+			[ "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" = "$token" ] && set_claim "$i" '{}'
+		done
+		return 0
+	}
+	cleanup_fns+=(unclaim)
+	for attempt in 1 2; do
+		ms=$(all_machines) || die "could not list sandboxes"
+		[ "$(jq "$JQ_DEFS"' [.[] | select(inpool)] | length' <<<"$ms")" != 0 ] ||
+			die "the pool is empty: ask the user to run  ibx pool add <box>"
+		cands='[.[] | select(inpool) | select(free($now; $stale))'
+		running=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' | select(.state == "running")] | .[].id' <<<"$ms" | shuffle)
+		others=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' |
+			select(.state | IN("suspended","stopped","starting","resuming","suspending","stopping"))] | .[].id' <<<"$ms" | shuffle)
+		for id in $running $others; do
+			[[ $id =~ ^m_[a-z2-7]{26}$ ]] || continue
+			# Short API calls here (8 s including curl's retries), so the confirmation window below
+			# outlasts another agent's PATCH.
+			IBX_MAXTIME=8
+			m=$(api GET "/v1/machines/$id") || { apierr=1; continue; }
+			[ "$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"' free($now; $stale)' <<<"$m")" = true ] || continue
+			name=$(jq -r "$JQ_DEFS"' .name | clean' <<<"$m")
+			if [ "$(jq -r "$JQ_DEFS"' vaulton' <<<"$m")" = true ] && [ "${IBX_ALLOW_VAULT:-}" != 1 ]; then
+				n=$(vault_items "$id") || { apierr=1; continue; }
+				[ "$n" = 0 ] || { warn "skipping $name: the Vault writes $n secret(s) into it"; continue; }
+			fi
+			claim=$(jq -cn --arg by "$AGENT" --arg at "$(now_iso)" --arg p "${purpose:0:500}" --arg t "$token" \
+				'{"ibx.claim.by":$by, "ibx.claim.at":$at, "ibx.claim.purpose":$p, "ibx.claim.token":$t}')
+			claimed_ids+=("$id")
+			set_claim "$id" "$claim" || { apierr=1; continue; }
+			# Metadata has no compare-and-swap and the last writer wins: wait out another agent's
+			# PATCH, then check that the reservation is still ours, twice.
+			ok=1
+			for wait in ${IBX_CLAIM_SETTLE:-20 5}; do # tests shorten it
+				sleep "$wait"
+				m=$(api GET "/v1/machines/$id") || { ok=''; apierr=1; break; }
+				[ "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" = "$token" ] || { ok=''; break; }
+			done
+			IBX_MAXTIME=''
+			[ -n "$ok" ] || continue
+			ensure_running "$id" || { warn "$name would not start; trying another"; set_claim "$id" '{}' || true; continue; }
+			claimed_ids=("${claimed_ids[@]/$id/}") # ours to keep: do not clear it on exit
+			# Keep it awake from now on; a keepalive timer renews this lease while it is reserved.
+			echo '{"ttlSeconds":3600}' >"$tmp/lease"
+			api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" >/dev/null 2>&1 ||
+				warn "could not set the activity lease on $name: it may pause after 30 idle minutes"
+			if ports=$(public_ports "$id") && [ -n "$ports" ]; then
+				warn "WARNING: $name still has public ports from before (no authentication):"
+				tr '\037' ' ' <<<"$ports" | sed 's/^/  /' >&2
+			fi
+			printf '%s\n' "$name"
+			exit 0
+		done
+		IBX_MAXTIME=''
+		if [ "$attempt" != 1 ] || ! jq -e "$JQ_DEFS"' any(.[] | select(inpool); .state | IN("starting","resuming","suspending","stopping","creating"))' <<<"$ms" >/dev/null; then
+			break
+		fi
+		sleep 20 # some were changing state: look once more
+	done
+	[ -z "$apierr" ] || die "could not claim a sandbox: API errors (see above)"
+	printf 'ibx: no free sandbox in the pool (ibx ls). Ask the user before using one someone else holds.\n' >&2
+	exit 75
+	;;
+renew)
+	[ $# -ge 1 ] || die "usage: ibx renew <box>"
+	id=$(resolve --pool "$1")
+	m=$(api GET "/v1/machines/$id") || die "could not read $1"
+	[ -n "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" ] || die "$1 has no reservation to renew (ibx claim)"
+	set_meta "$id" '. + {"ibx.claim.at": $at}' --arg at "$(now_iso)" || die "could not renew $1"
+	echo "renewed $1; it counts as abandoned after $(jq -nr --argjson s "$STALE_SECS" 'now + $s | floor | todate')"
+	;;
+release)
+	[ $# -ge 1 ] || die "usage: ibx release <box>"
+	id=$(resolve --pool "$1")
+	m=$(api GET "/v1/machines/$id") || die "could not read $1"
+	ports=$(public_ports "$id") || die "could not list the public ports of $1; nothing released, try again"
+	left=''
+	while IFS=$'\037' read -r port name url; do
+		[ -n "$port" ] || continue
+		if [[ $name == ibx:* ]]; then
+			if unpublish "$id" "$port"; then echo "unpublished port $port of $1"; else left+=" $url"; fi
+		else
+			warn "left port $port alone ($url): it was not published by ibx"
+		fi
+	done <<<"$ports"
+	[ -z "$left" ] || die "these URLs are STILL PUBLIC:$left (nothing released; ibx unport $1 PORT, then release again)"
+	api DELETE "/v1/machines/$id/activity-leases/$LEASE" >/dev/null 2>&1 || true
+	set_claim "$id" '{}' || die "could not clear the reservation of $1"
+	echo "released $1 (was: $(jq -r "$JQ_DEFS"' "\(.metadata["ibx.claim.purpose"] // "no reservation" | clean) (\(.metadata["ibx.claim.by"] // "-" | clean), since \(.metadata["ibx.claim.at"] // "-" | clean))"' <<<"$m"))"
+	;;
+exec)
+	[ $# -ge 1 ] || die "usage: ibx exec <box> [-t SECS] [-i] -- <cmd>"
+	box=$1
+	shift
+	t=300 stdin=''
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-t) t=${2:-}; shift 2 || shift ;;
+		-i) stdin=1; shift ;;
+		--) shift; break ;;
+		*) break ;;
+		esac
+	done
+	[[ $t =~ ^[0-9]+$ ]] || die "-t must be 1-600 seconds"
+	t=$((10#$t))
+	[ "$t" -ge 1 ] && [ "$t" -le 600 ] || die "-t must be 1-600 seconds"
+	[ $# -gt 0 ] || die "usage: ibx exec <box> [-t SECS] [-i] -- <cmd>"
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	if [ -n "$stdin" ]; then
+		head -c 1048577 >"$tmp/stdin"
+		[ "$(size_of "$tmp/stdin")" -le 1048576 ] || die "stdin is over 1 MiB: use ibx ssh"
+		exec_in "$id" "$t" "$(remote_cmd "$@")" "$tmp/stdin"
+	else
+		exec_in "$id" "$t" "$(remote_cmd "$@")"
+	fi
+	r=$R
+	jq -j '.stdout // ""' <<<"$r"
+	jq -j '.stderr // ""' <<<"$r" >&2
+	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && warn "output truncated (1 MiB per stream)"
+	if [ "$(jq -r '.timedOut // false' <<<"$r")" = true ]; then
+		warn "timed out after ${t}s; for long jobs run them detached: setsid -f CMD >LOG 2>&1"
+		exit 124
+	fi
+	rc=$(jq -r '.exitCode // 125' <<<"$r")
+	[ "$rc" = 143 ] && warn "the remote command was killed by SIGTERM (a pkill -f matching itself?)"
+	exit "$rc"
+	;;
+put)
+	force=''
+	[ "${1:-}" = --force ] && { force=1; shift; }
+	[ $# -eq 3 ] || die "usage: ibx put [--force] <box> <local> <remote>"
+	box=$1 src=$2 dst=${3#\~/} # remote paths are relative to HOME already
+	[ "$dst" != '~' ] && [ -n "$dst" ] || die "give a file path for the sandbox (relative to HOME)"
+	[ -f "$src" ] || die "no file $src"
+	[ -r "$src" ] || die "cannot read $src"
+	if [ -z "$force" ] && { looks_secret "$src" || looks_secret "$(phys "$src")"; }; then
+		die "$src looks like a credential; credentials never go to a sandbox (--force if it is really not one)"
+	fi
+	[ "$(size_of "$src")" -le 750000 ] || die "$src is over 750 KB: tar c FILES | ibx ssh $box 'tar x -C DIR'"
+	base64 <"$src" | tr -d '\n' >"$tmp/in"
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	q=$(printf %q "$dst")
+	# Runs in the sandbox (Debian, GNU coreutils).
+	exec_in "$id" 120 "[ ! -d $q ] || { echo 'destination is a directory: give the file name too' >&2; exit 3; }
+mkdir -p -- \"\$(dirname -- $q)\" && { base64 -d >$q.ibx-part || { rm -f -- $q.ibx-part; exit 1; }; } && mv -fT -- $q.ibx-part $q" "$tmp/in"
+	r=$R
+	[ "$(jq -r .exitCode <<<"$r")" = 0 ] || die "put failed: $(jq -r .stderr <<<"$r" | printable)"
+	echo "copied $src -> $box:$dst"
+	;;
+get)
+	[ $# -ge 2 ] || die "usage: ibx get <box> <remote> [local]"
+	box=$1 src=${2#\~/} dst=${3:-$(basename -- "$2")}
+	[ "$src" != '~' ] && [ -n "$src" ] || die "give a file path in the sandbox (relative to HOME)"
+	[ -d "$dst" ] && dst=${dst%/}/$(basename -- "$src")
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	q=$(printf %q "$src")
+	# Runs in the sandbox (Debian, GNU coreutils).
+	exec_in "$id" 120 "[ -f $q ] || { echo 'not a regular file' >&2; exit 3; }; s=\$(stat -L -c %s -- $q); [ \"\$s\" -le 750000 ] || { echo \"\$s bytes is over 750 KB: use ibx ssh BOX 'cat FILE' >LOCAL\" >&2; exit 4; }; head -c 750001 -- $q | base64 -w0"
+	r=$R
+	[ "$(jq -r .exitCode <<<"$r")" = 0 ] || die "get failed: $(jq -r .stderr <<<"$r" | printable)"
+	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && die "get failed: output truncated"
+	jq -r .stdout <<<"$r" | base64 --decode >"$tmp/out" || die "get failed: bad data"
+	[ "$(size_of "$tmp/out")" -le 750000 ] || die "get failed: the file grew while copying"
+	mv -f -- "$tmp/out" "$dst" || die "could not write $dst"
+	echo "copied $box:$src -> $dst"
+	;;
+ssh)
+	[ $# -ge 1 ] || die "usage: ibx ssh <box> [cmd...]"
+	box=$1
+	shift
+	id=$(resolve --pool "$box")
+	ensure_running "$id" || die "could not start $box"
+	info=$(api GET "/v1/machines/$id/connection-info") || die "could not read connection info"
+	host=$(jq -r .host <<<"$info")
+	port=$(jq -r .port <<<"$info")
+	hostkey=$(jq -r .hostTrust.publicKey <<<"$info")
+	[[ $host =~ ^[A-Za-z0-9.-]+$ && $port =~ ^[0-9]+$ && $hostkey =~ ^ssh-[a-z0-9-]+\ [A-Za-z0-9+/=]+$ ]] ||
+		die "unexpected connection info from the API"
+	if [ "$port" = 22 ]; then hp=$host; else hp="[$host]:$port"; fi
+	printf '@cert-authority %s %s\n' "$hp" "$hostkey" >"$tmp/kh"
+	jq -n --arg n "ibx $AGENT" '{name:$n, ttlSeconds:3600}' >"$tmp/tokreq"
+	tok=$(api POST "/v1/machines/$id/ssh-tokens" "$tmp/tokreq") || die "could not create an SSH token"
+	tid=$(jq -r .id <<<"$tok")
+	[[ $tid =~ ^[a-z0-9_]+$ ]] || die "unexpected token id"
+	revoke() { # a DELETE lost to a dropped connection can leave the token live: confirm revokedAt
+		local i r
+		for i in 1 2 3; do
+			printf '%s\n' "$AUTH" | curl -q -sS -o /dev/null -m 20 --retry 2 --retry-all-errors -X DELETE -H @- \
+				"$API/v1/machines/$id/ssh-tokens/$tid" 2>/dev/null || true
+			r=$(api GET "/v1/machines/$id/ssh-tokens" 2>/dev/null) || continue
+			[ "$(jq -r --arg t "$tid" '[.tokens[]? | select(.id == $t) | .revokedAt // empty] | length' <<<"$r")" = 1 ] && return 0
+			sleep 2
+		done
+		warn "WARNING: SSH token $tid may NOT be revoked; it expires within 1 hour"
+	}
+	cleanup_fns+=(revoke)
+	user=$(jq -r .token <<<"$tok")
+	[[ $user =~ ^ibssh_[a-z2-7]+$ ]] || die "unexpected token format"
+	# The token is the SSH user name: keep it in a 0600 config file (umask 077), out of argv and
+	# out of error output.
+	printf 'Host ibx\n  HostName %s\n  Port %s\n  User %s\n  UserKnownHostsFile "%s"\n  StrictHostKeyChecking yes\n  BatchMode yes\n  PubkeyAuthentication no\n  LogLevel ERROR\n  ConnectTimeout 20\n  ServerAliveInterval 30\n  ServerAliveCountMax 4\n' \
+		"$host" "$port" "$user" "$tmp/kh" >"$tmp/ssh_config"
+	unset tok user
+	sshargs=(-F "$tmp/ssh_config" ibx)
+	[ $# -gt 0 ] && sshargs+=(-- "$(remote_cmd "$@")")
+	# stderr goes through an unbuffered filter that redacts tokens; stdout passes straight through
+	# (fd 3). The pipeline ends before the token is revoked, so nothing is lost or reordered later.
+	set +e
+	{ ssh "${sshargs[@]}" 2>&1 1>&3 3>&- | LC_ALL=C awk '{ gsub(/ibssh_[a-z2-7]+/, "ibssh_***"); print; fflush() }' >&2 3>&-; } 3>&1
+	rc=${PIPESTATUS[0]}
+	set -e
+	exit "$rc"
+	;;
+port)
+	[ $# -ge 2 ] || die "usage: ibx port <box> <port> [name]"
+	[[ $2 =~ ^[0-9]+$ ]] || die "port must be a number"
+	id=$(resolve --pool "$1")
+	name=$(printf '%s' "${3:-port}" | tr '\t\n\r' '   ' | printable)
+	jq -n --argjson p "$((10#$2))" --arg n "ibx:${name:0:90}" '{port:$p, name:$n}' >"$tmp/port"
+	r=$(api POST "/v1/machines/$id/ports" "$tmp/port") || die "could not publish port $2"
+	jq -r "$JQ_DEFS"' .url | clean' <<<"$r"
+	warn "this URL has NO authentication: anyone with it reaches the service. ibx unport $1 $2 (or ibx release) when done."
+	;;
+unport)
+	[ $# -eq 2 ] || die "usage: ibx unport <box> <port>"
+	[[ $2 =~ ^[0-9]+$ ]] || die "port must be a number"
+	id=$(resolve --pool "$1")
+	unpublish "$id" "$((10#$2))" || { cat "$tmp/perr" >&2; die "could not unpublish port $2"; }
+	echo "unpublished port $2 of $1"
+	;;
+keepalive)
+	# instabox pauses a sandbox after 30 idle minutes and currently ignores autoSuspendAfterSeconds.
+	# An activity lease (1 h) keeps it awake; renewing it every 15 minutes from a timer keeps
+	# reserved pool sandboxes (or, with --all, every pool sandbox) running while that timer runs.
+	# Idle-paused ones are woken; manually paused and stopped ones are left alone.
+	all=''
+	for a in "$@"; do case "$a" in --all) all=1 ;; *) die "usage: ibx keepalive [--all]" ;; esac; done
+	ms=$(all_machines) || die "could not list sandboxes"
+	echo '{"ttlSeconds":3600}' >"$tmp/lease"
+	fail=0
+	while IFS=$'\037' read -r id name state auto; do
+		[ -n "$id" ] || continue
+		[[ $id =~ ^m_[a-z2-7]{26}$ ]] || continue
+		if [ "$state" = running ] || { [ "$state" = suspended ] && [ -n "$auto" ]; }; then
+			if r=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>"$tmp/err"); then
+				echo "$name: lease until $(jq -r .expiresAt <<<"$r")"
+			else
+				echo "$name: FAILED $(jq -c '.error | {code, message}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)"
+				fail=1
+			fi
+		else
+			echo "$name: $state, skipped"
+		fi
+	done < <(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
+		.[] | select(inpool) | select($all == "1" or (free($now; $stale) | not)) |
+		[.id, (.name | clean), .state, (.autoSuspendedAt // "")] | join("\u001f")' <<<"$ms")
+	exit $fail
+	;;
+doctor)
+	bad=0
+	ok() { printf 'ok    %s\n' "$*"; }
+	no() { printf 'FAIL  %s\n' "$*"; bad=1; }
+	note() { printf 'warn  %s\n' "$*"; }
+	ok "ibx $IBX_VERSION, bash $BASH_VERSION"
+	while IFS= read -r p; do
+		[ -n "$p" ] || continue
+		case "$p" in *"needed only by"*) note "$p" ;; *) no "$p" ;; esac
+	done < <(deps_ok)
+	[ "$bad" = 0 ] || { echo "fix the dependencies above first"; exit 125; }
+	if load_key; then
+		ok "API key found ($KEY_SOURCE)"
+		ENV_KEY=''
+		if me=$(api GET /v1/me 2>"$tmp/err"); then
+			ok "API reachable at $API as $(jq -r '.login // .userId' <<<"$me" | printable)"
+			ms=$(all_machines) || ms='[]'
+			n=$(jq "$JQ_DEFS"' [.[] | select(inpool)] | length' <<<"$ms")
+			total=$(jq length <<<"$ms")
+			if [ "$n" = 0 ]; then no "the pool is empty ($total sandboxes in the account): ibx pool add <box>"; else ok "pool: $n of $total sandboxes"; fi
+			while IFS=$'\037' read -r id name; do
+				[ -n "$id" ] || continue
+				if v=$(vault_items "$id" 2>/dev/null); then
+					if [ "$v" = 0 ]; then note "$name has the Vault on (empty now): secrets added to the Vault later reach it"
+					else no "$name receives $v Vault secret(s): claim skips it unless IBX_ALLOW_VAULT=1; recreate it with --no-vault"; fi
+				else
+					note "could not read the Vault of $name"
+				fi
+			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | select(vaulton) | [.id, (.name | clean)] | join("\u001f")' <<<"$ms")
+			if r=$(api GET /v1/usage 2>/dev/null); then ok "limits: $(jq -c '.limits | {maxMachines, machineSpec}' <<<"$r")"; fi
+		else
+			no "API call failed: $(jq -c '.error | {code, message}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)"
+		fi
+	else
+		no "no API key: set INSTABOX_API_KEY or write it to $KEYFILE (chmod 600)"
+	fi
+	if command -v systemctl >/dev/null && systemctl --user is-active -q ibx-keepalive.timer 2>/dev/null; then
+		ok "keepalive timer active (systemd)"
+	elif command -v launchctl >/dev/null && launchctl list 2>/dev/null | grep -q ibx-keepalive; then
+		ok "keepalive agent loaded (launchd)"
+	elif crontab -l 2>/dev/null | grep -q 'ibx keepalive'; then
+		ok "keepalive in crontab"
+	else
+		note "no keepalive timer: a reserved sandbox can pause after its 1-hour lease runs out (see references/keepalive.md)"
+	fi
+	exit $((bad ? 125 : 0))
+	;;
+*) usage >&2; exit 125 ;;
+esac
