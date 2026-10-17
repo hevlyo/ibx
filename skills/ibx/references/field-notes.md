@@ -51,6 +51,11 @@ terminal use. Its public URLs start answering 503.
   activity leases count as activity. Status reads and keepalives do not (spec: info.description,
   "Sandbox lifecycle").
 
+**Follow-up, 2026-10-16.** `PATCH /v1/machines/{id}` with
+`autoSuspendAfterSeconds: 0` still returned 200 and the value stayed 1800.
+`@insforge/instabox-sdk` 0.5.0 `setAutoSuspend()` sends exactly that PATCH, so it is affected
+too. The CLI's `auto-suspend` was not tested.
+
 **What to do.**
 - Do not rely on the setting or on CPU load. Use an activity lease. `ibx keepalive` run from a
   timer renews one (see [keepalive.md](keepalive.md)). Otherwise, touch the sandbox with an exec
@@ -242,6 +247,11 @@ shell and kills it. The same thing happens with `ibx ssh BOX 'pkill -f ...'`.
 - View-only desktop links are enforced on the server: viewer input was dropped. Links work
   without signing in until they expire, and `DELETE /v1/machines/{id}/desktop/stream` revokes
   all of them.
+- Login shells get `NODE_OPTIONS=--require /usr/local/lib/instabox/headed-browser.cjs`, set by
+  `/etc/profile.d/instabox-display.sh` (seen 2026-10-17 on `agent-browser`). Every Node process
+  that `ibx exec` starts preloads that script, which is there for headed browsers on the desktop.
+  For benchmarks, test runs that should match CI, or a browser that must stay headless, run with
+  `env -u NODE_OPTIONS` or `NODE_OPTIONS= node ...`.
 
 ## 12. Spec drift
 

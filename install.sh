@@ -20,7 +20,8 @@ Installs ibx for your coding agents:
 
 Options
   --agents LIST      comma-separated skills roots (default: claude,agents)
-                       claude    ~/.claude/skills    Claude Code
+                       claude    $CLAUDE_CONFIG_DIR/skills
+                                 (default ~/.claude/skills; Claude Code)
                        agents    ~/.agents/skills    Codex and other agents that read it
                        codex     $CODEX_HOME/skills  (default ~/.codex/skills; only for a Codex
                                                      that does not read ~/.agents/skills)
@@ -38,8 +39,12 @@ Options
   -n, --dry-run      print what would change, including the timer files, and change nothing
   -h, --help         this help
 
-It never replaces a directory or file it did not create: if one is in the way, it stops before
-changing anything and says which. It does not touch your API key, your sandboxes or the pool.
+It replaces copies and timer files it created, and symlinks to an ibx skill or helper, including
+recognized dangling links. If anything else is in the way, it stops before changing anything
+and says which. It does not touch your API key, your sandboxes or the pool.
+
+CLAUDE_CONFIG_DIR, CODEX_HOME and XDG_CONFIG_HOME must be absolute paths. A leading ~ or ~/
+is expanded to HOME; trailing slashes are removed.
 
 Exit status: 0 done; 1 something is in the way or a step failed; 2 bad usage.
 See README.md (Install, Setup) and skills/ibx/references/keepalive.md.
@@ -53,6 +58,26 @@ usage_err() { warn "$*"; warn "see ./install.sh --help"; exit 2; }
 
 case ${HOME:-} in /*) ;; *) die "HOME must be an absolute path" ;; esac
 
+normalize_config() { # value label -> NORMALIZED; shared rules with install.sh
+	local path=$1 label=$2
+	# shellcheck disable=SC2088 # expand only a literal leading ~ or ~/
+	case $path in
+	"~") path=${HOME:-} ;;
+	"~/"*) [ -n "${HOME:-}" ] || die "$label needs HOME to expand ~"; path=$HOME/${path#"~/"} ;;
+	esac
+	case $path in /*) ;; *) die "$label must be an absolute path (a leading ~ or ~/ is allowed)" ;; esac
+	while [ "$path" != / ] && [ "${path%/}" != "$path" ]; do path=${path%/}; done
+	NORMALIZED=$path
+}
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+	normalize_config "$CLAUDE_CONFIG_DIR" CLAUDE_CONFIG_DIR; CLAUDE_CONFIG_DIR=$NORMALIZED
+fi
+if [ -n "${CODEX_HOME:-}" ]; then
+	normalize_config "$CODEX_HOME" CODEX_HOME; CODEX_HOME=$NORMALIZED
+fi
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+	normalize_config "$XDG_CONFIG_HOME" XDG_CONFIG_HOME; XDG_CONFIG_HOME=$NORMALIZED
+fi
 SRC=$(cd -P "$(dirname "$0")" && pwd -P)
 SKILL_SRC=$SRC/skills/ibx
 HELPER_SRC=$SKILL_SRC/scripts/ibx
@@ -119,7 +144,8 @@ fi
 
 root_of() {
 	case $1 in
-	claude) printf '%s/.claude/skills' "$HOME" ;;
+	claude-default) printf '%s/.claude/skills' "$HOME" ;;
+	claude) printf '%s/skills' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ;;
 	agents) printf '%s/.agents/skills' "$HOME" ;;
 	codex) printf '%s/skills' "${CODEX_HOME:-$HOME/.codex}" ;;
 	opencode) printf '%s/opencode/skills' "${XDG_CONFIG_HOME:-$HOME/.config}" ;;
@@ -381,13 +407,39 @@ relink() { # TARGET LINK
 	ln -s "$1" "$2"
 }
 
+# Resolve existing ancestors without creating anything, including during --dry-run.
+physical_root() {
+	local path=$1 suffix='' part
+	while [ ! -d "$path" ]; do
+		part=$(basename "$path")
+		suffix=/$part$suffix
+		path=$(dirname "$path")
+	done
+	printf '%s%s\n' "$(cd -P "$path" && pwd -P)" "$suffix"
+}
+if [ "$action" = uninstall ] && [ -z "$agents_given" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+	list="$list claude-default"
+fi
+roots=() root_keys=() nroots=0
+for a in $list; do
+	root=$(root_of "$a")
+	key=$(physical_root "$root")
+	duplicate=
+	for ((i=0; i<nroots; i++)); do
+		[ "${root_keys[i]}" != "$key" ] || duplicate=1
+	done
+	[ -z "$duplicate" ] || continue
+	roots[nroots]=$root root_keys[nroots]=$key
+	nroots=$((nroots + 1))
+done
+
 # ---- uninstall -----------------------------------------------------------------------------
 did=
 if [ "$action" = uninstall ]; then
 	rc=0
 	[ -z "$dry" ] || say "Dry run: nothing is changed."
-	for a in $list; do
-		d=$(root_of "$a")/ibx
+	for ((i=0; i<nroots; i++)); do
+		d=${roots[i]}/ibx
 		classify_skill "$d"
 		case $STATE in
 		linked | ourlink) do_ remove "$(tilde "$d") (symlink)" rm "$d" ;;
@@ -441,15 +493,15 @@ conflicts=
 conflict() { conflicts="$conflicts
   $(tilde "$1"): $2"; }
 
-for a in $list; do
-	d=$(root_of "$a")/ibx
+for ((i=0; i<nroots; i++)); do
+	d=${roots[i]}/ibx
 	classify_skill "$d"
 	[ "$STATE" != conflict ] || conflict "$d" "$WHY"
 done
 
 # The ibx command and the timer run the helper from this clone, or with --copy from the first copy.
 first=
-for a in $list; do first=$(root_of "$a")/ibx; break; done
+[ "$nroots" = 0 ] || first=${roots[0]}/ibx
 if [ "$mode" = copy ] && [ -n "$first" ]; then target=$first/scripts/ibx; else target=$HELPER_SRC; fi
 if [ -n "$bin" ]; then
 	classify_bin "$bin/ibx" "$target"
@@ -496,8 +548,8 @@ if [ ! -x "$HELPER_SRC" ]; then
 	do_ make "$(tilde "$HELPER_SRC") executable" chmod +x "$HELPER_SRC"
 fi
 
-for a in $list; do
-	root=$(root_of "$a")
+for ((i=0; i<nroots; i++)); do
+	root=${roots[i]}
 	d=$root/ibx
 	classify_skill "$d"
 	if [ ! -d "$root" ]; then do_ make "$(tilde "$root")/" mkdir -p "$root"; fi

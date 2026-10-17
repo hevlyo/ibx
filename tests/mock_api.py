@@ -28,17 +28,20 @@ Test endpoints (no auth):
     seed: {count, states, pool, metadata, idle, vault}   replace the sandboxes (box-1..N);
         vault: {"box-2": 3, "box-3": 0} or "box-2:3,box-3:0" = the Vault on with N items
     set: {"box-1": {state, metadata, mergeMetadata, deleteMetadata, ports, leases, freshBoot,
-                    ready, vault, name, id}}   change one sandbox; state "idle" = paused when
+                    ready, vault, name, id, rawPorts}}   change one sandbox; state "idle" = paused when
         idle; ports: [{port, name, url}]; vault: N (on, N items), false (off) or null (no
-        "vault" field and no Vault route); name/id rename it (id: any string, even an invalid one)
+        "vault" field and no Vault route); name/id rename it (id: any string, even an invalid one).
+        rawPorts overrides GET /ports verbatim, for malformed provider responses.
     clearFaults: true
+    opDelay: SECONDS                   delay for new operations (reset restores --op-delay)
     faults: [{kind, method, match, count, status, code, message, retryable, operationId,
-              before, seconds}]
+              before, seconds, skip}]
         kind "drop": the reply is cut off mid-body (before: true closes the connection
         without a reply; the request is not processed then); "error": answer status/code
         instead; "delay": wait `seconds` before handling the request; "conflict": resume/start
         answer 409 operation_conflict naming an operation that is already in progress;
-        "failop": the next operation fails. match is a regular expression searched in the path.
+        "failop": the next operation fails. skip: leave the first N matching requests alone.
+        match is a regular expression searched in the path.
     dropGets K, quotaExecs K, dropExecs K, conflictResumes K, failOps K   shortcuts
     execResults: [{stdout, stderr, exitCode, timedOut, truncated, signal, delay}]
         delay: seconds the exec takes before it answers (a slow command, in both exec modes)
@@ -127,7 +130,7 @@ class State:
         self.lock = threading.RLock()
         self.cond = threading.Condition(self.lock)
         self.key = args.key
-        self.op_delay = args.op_delay
+        self.default_op_delay = self.op_delay = args.op_delay
         self.exec_real = args.exec == "real"
         self.max_execs = args.max_execs
         self.ssh_port = args.ssh_port or closed_port()
@@ -308,14 +311,20 @@ class State:
                 continue
             if f.get("match") and not re.search(f["match"], path):
                 continue
+            if f.get("skip", 0) > 0:
+                f["skip"] -= 1
+                continue
             f["count"] -= 1
             return dict(f)
         return None
 
     def control(self, c):
         if c.get("reset"):
+            self.op_delay = self.default_op_delay
             self.seed(**self.defaults)
             self.faults, self.exec_results, self.calls, self.idem = [], [], [], {}
+        if "opDelay" in c:
+            self.op_delay = float(c["opDelay"])
         if "seed" in c:
             s = c["seed"]
             self.seed(count=s.get("count", 3), states=s.get("states"), pool=s.get("pool"),
@@ -331,6 +340,8 @@ class State:
                 m["metadata"].pop(k, None)
             for p in ch.get("ports") or []:
                 self.publish(m, int(p["port"]), p.get("name"), p.get("url"))
+            if "rawPorts" in ch:
+                m["_raw_ports"] = copy.deepcopy(ch["rawPorts"])
             for lease in ch.get("leases") or []:
                 self.put_lease(m, lease, 3600)
             if "freshBoot" in ch:
@@ -703,7 +714,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.vault(m)
             if rest == ["ports"] and method == "GET":
                 return 200, {"enabled": True,
-                             "ports": sorted(m["_ports"].values(), key=lambda p: p["port"])}
+                             "ports": m.get("_raw_ports", sorted(m["_ports"].values(), key=lambda p: p["port"]))}
             if rest == ["ports"] and method == "POST":
                 b = json_body(raw, required=True)
                 if not isinstance(b.get("port"), int) or isinstance(b.get("port"), bool):

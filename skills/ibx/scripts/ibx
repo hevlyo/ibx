@@ -12,7 +12,7 @@ if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
 			[ -x "$b" ] && IBX_REEXEC=1 exec "$b" "$0" "$@"
 		done
 	fi
-	printf 'ibx: needs bash >= 4.4 (this is %s). macOS: brew install bash\n' "${BASH_VERSION:-not bash}" >&2
+	printf 'ibx: needs bash >= 4.4 (this is %s). macOS: brew install bash\n' "${BASH_VERSION:-not bash}" >&2 || true
 	exit 125
 fi
 set -euo pipefail
@@ -22,54 +22,63 @@ umask 077
 ENV_KEY=${INSTABOX_API_KEY:-}
 unset INSTABOX_API_KEY
 
-IBX_VERSION=0.1.0
+IBX_VERSION=0.2.0
+
+stderr() { "$@" >&2 || true; } # a closed stderr must not replace the intended exit status
 
 usage() {
 	cat <<'EOF'
 ibx - borrow a disposable instabox.sh sandbox from a shared pool
 
 Agents
-  ibx claim "<purpose>"                  reserve a free pool sandbox and print its name. Write the
-                                         name down: shell variables do not survive between calls.
-                                         The purpose is stored in the sandbox metadata: keep it generic
+  ibx claim [--json] "<purpose>"         reserve a free pool sandbox and print its name.
+                                         The purpose must be ONE quoted argument. Write the name
+                                         down: shell variables do not survive between calls.
+                                         Metadata is public to the account: keep the purpose generic
   ibx exec <box> [-t SECS] [-i] -- <cmd> run as the sandbox user with bash -lc (HOME /data/home).
-                                         Default 300 s, max 600; -i sends this stdin (up to 1 MiB).
-                                         One argument = a bash script; several = one command with
-                                         each argument quoted
+                                         Default 300 s, max 600; -i sends stdin (up to 1 MiB).
+                                         One argument = a bash script; several = one quoted command
   ibx put [--force] <box> <local> <remote>
-                                         copy a file in (up to 750 KB; relative paths are under HOME).
+                                         copy a file in (up to 750 KB; relative paths under HOME).
                                          Refuses files that look like credentials unless --force
   ibx get <box> <remote> [local]         copy a file out (same limit, text or binary)
-  ibx ssh <box> [cmd...]                 ssh through a 1-hour token revoked on exit; streams stdio:
+  ibx ssh <box> [--] [cmd...]          ssh through a 1-hour token revoked on exit; streams stdio:
                                            ibx ssh BOX 'bash -s' <script.sh
-                                           tar c dir | ibx ssh BOX 'tar x'    ibx ssh BOX 'tar c dir' | tar x
+                                           tar c dir | ibx ssh BOX 'tar x'
+                                           ibx ssh BOX 'tar c dir' | tar x
   ibx port <box> <port> [name]           publish an HTTP port at a public URL (NO authentication)
   ibx unport <box> <port>                unpublish it
-  ibx renew <box>                        refresh your reservation (jobs that run past 24 h)
-  ibx release <box>                      give it back: unpublishes ibx ports, drops the lease and
-                                         the reservation
-  ibx ls [--all] [--json]                pool sandboxes, state and who holds each (--all: every one)
+  ibx renew [--json] <box>               refresh your reservation (jobs that run past 24 h)
+  ibx release [--json] <box>             give it back: unpublish ibx ports, drop its lease and
+                                         reservation
+  ibx ls [--all] [--json]                pool sandboxes, state and holders (--all: every sandbox)
 
 Humans
-  ibx pool add [--allow-vault] <box>...  let agents claim these sandboxes (refuses ones that receive
-                                         Vault secrets unless --allow-vault)
+  ibx pool add [--allow-vault] <box>...  let agents claim these sandboxes (refuses Vault secrets
+                                         unless --allow-vault)
   ibx pool rm <box>...                   take them out of the pool
   ibx keepalive [--all]                  renew a 1-hour activity lease on reserved pool sandboxes
-                                         (--all: on every pool sandbox); run it from a timer
+                                         (--all: every pool sandbox); run it from a timer
   ibx doctor                             check dependencies, key, API access and the pool
   ibx --version | --help
 
-Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox; 125 ibx
-itself failed (API, network, usage); 255 ssh could not connect; 143 also when ibx itself got
-SIGTERM (it says so, and the remote command may still be running); keepalive exits 1 when any
-lease could not be renewed.
+Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox, cap reached
+or local claim lock busy; 125 ibx itself failed (API, network, usage); 255 ssh could not connect;
+130/143 when
+ibx receives SIGINT/SIGTERM. The remote command may still be running after interruption.
+keepalive exits 1 when any lease could not be renewed.
 
 Environment: INSTABOX_API_KEY (else the file IBX_KEY_FILE, default
 ${XDG_CONFIG_HOME:-~/.config}/instabox/api-key), INSTABOX_API_URL (https://api.instabox.sh;
 another host needs IBX_ALLOW_CUSTOM_API=1), IBX_AGENT_NAME (shown in reservations; default a
-pseudonymous id of this user and host), IBX_STALE_SECS (reservation age that counts as abandoned,
-86400), IBX_ALLOW_ANY=1 (agent commands on sandboxes outside the pool), IBX_ALLOW_VAULT=1 (claim
-sandboxes that receive Vault secrets).
+pseudonymous id of this user, host and known agent session), IBX_STALE_SECS (reservation age
+that counts as abandoned, 86400), IBX_ALLOW_ANY=1 (commands outside the pool), IBX_ALLOW_VAULT=1
+(claim sandboxes that receive Vault secrets), IBX_MAX_CLAIMS (live reservations per agent,
+default 3; 0 disables the cap), IBX_STATE_DIR (an atomic mkdir lock, default directory
+${XDG_STATE_HOME:-~/.local/state}/ibx).
+claim, renew and release accept --json anywhere after the command. JSON includes warnings;
+errors have error.code (no_free_sandbox, claim_limit, lock_busy, failed, interrupted) and
+error.message. lock_busy exits 75 after waiting up to 5 minutes for a usable local lock.
 EOF
 }
 
@@ -78,19 +87,166 @@ case "${1:-}" in
 --version | version) echo "ibx $IBX_VERSION"; exit 0 ;;
 esac
 
+if [ "$1" = exec ]; then
+	help_box='' help_timeout=
+	for a in "${@:2}"; do
+		case "$a" in -h | --help) usage; exit 0 ;; --) break ;; esac
+		if [ -n "$help_timeout" ]; then help_timeout=; continue; fi
+		if [ -z "$help_box" ]; then help_box=1; continue; fi
+		case "$a" in -i) ;; -t) help_timeout=1 ;; *) break ;; esac
+	done
+elif [ "$1" = ssh ]; then
+	for a in "${@:2}"; do
+		case "$a" in -h | --help) usage; exit 0 ;; *) break ;; esac
+	done
+else
+	for a in "${@:2}"; do case "$a" in -h | --help) usage; exit 0 ;; esac; done
+fi
+
 API=${INSTABOX_API_URL:-https://api.instabox.sh}
-KEYFILE=${IBX_KEY_FILE:-${INSTABOX_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/instabox/api-key}}
 STALE_SECS=${IBX_STALE_SECS:-86400}
 LEASE=ibx-keepalive
 IBX_MAXTIME=${IBX_MAXTIME:-} # set during claim: caps each API call, retries included
 LABEL=''                     # the sandbox name, for messages
-host_id=$(printf '%s@%s' "${USER:-}" "$(uname -n)" | cksum | cut -d' ' -f1)
+MAX_CLAIMS=${IBX_MAX_CLAIMS:-3}
+STATE_HOME=${XDG_STATE_HOME:-${HOME:+$HOME/.local/state}}
+STATE_DIR=${IBX_STATE_DIR:-${STATE_HOME:+$STATE_HOME/ibx}}
+while [[ $STATE_DIR != / && $STATE_DIR == */ ]]; do STATE_DIR=${STATE_DIR%/}; done
+AGENT_SOURCE='per host'
+session_id=
+if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
+	session_id=$CLAUDE_CODE_SESSION_ID AGENT_SOURCE=CLAUDE_CODE_SESSION_ID
+elif [ -n "${CODEX_THREAD_ID:-}" ]; then
+	session_id=$CODEX_THREAD_ID AGENT_SOURCE=CODEX_THREAD_ID
+fi
+LOCK_HOST=$(uname -n)
+LOCK_NS=$(readlink /proc/self/ns/pid 2>/dev/null) || LOCK_NS=
+LOCK_OWNER=$(printf '%s\t%s\t%s' "$$" "$LOCK_HOST" "$LOCK_NS")
+reap_lock_held=
+host_id=$(printf '%s@%s%s' "${USER:-}" "$LOCK_HOST" "${session_id:+:$session_id}" | cksum | cut -d' ' -f1)
 AGENT=${IBX_AGENT_NAME:-agent-$host_id}
+[ -z "${IBX_AGENT_NAME:-}" ] || AGENT_SOURCE=IBX_AGENT_NAME
 AGENT=${AGENT//[^A-Za-z0-9@._:-]/_}
 AGENT=${AGENT:0:64}
 
-die() { printf 'ibx: %s\n' "$*" >&2; exit 125; }
-warn() { printf 'ibx: %s\n' "$*" >&2; }
+JSON=
+case "$1" in
+claim | renew | release)
+	args=()
+	for a in "$@"; do
+		if [ "$a" = --json ]; then JSON=1; else args+=("$a"); fi
+	done
+	set -- "${args[@]}"
+	;;
+esac
+[ -z "$JSON" ] || exec {JSON_FD}>&1 # die can run inside a command substitution
+kept_claim=null
+sleep_pid=
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX") || {
+	stderr printf 'ibx: could not create temporary directory\n'
+	[ -z "$JSON" ] || printf '%s\n' '{"error":{"code":"failed","message":"could not create temporary directory"},"warnings":[]}' >&"$JSON_FD"
+	exit 125
+}
+: >"$tmp/warnings"
+cleanup_fns=()
+main_pid=$BASHPID
+cleanup() {
+	local rc=$?
+	set +e
+	[ "$BASHPID" = "$main_pid" ] || return 0
+	trap '' INT TERM
+	local f output
+	if [ -n "$sleep_pid" ]; then
+		kill "$sleep_pid" 2>/dev/null || true
+		wait "$sleep_pid" 2>/dev/null || true
+	fi
+	for f in "${cleanup_fns[@]}"; do "$f" || true; done
+	if [ "$rc" != 0 ] && [ ! -s "$tmp/result" ] && [ ! -s "$tmp/error" ]; then
+		json_error failed "exit $rc" "$kept_claim"
+	fi
+	if [ -n "$JSON" ]; then
+		output=$tmp/result
+		[ ! -s "$tmp/error" ] || output=$tmp/error
+		if command -v jq >/dev/null; then
+			if jq -c --slurpfile w "$tmp/warnings" '. + {warnings:$w}' "$output" >"$tmp/output"; then
+				cat "$tmp/output" >&"$JSON_FD"
+			else
+				printf '%s\n' '{"error":{"code":"failed","message":"could not serialize JSON"},"warnings":[]}' >&"$JSON_FD"
+			fi
+		else
+			printf '%s\n' '{"error":{"code":"failed","message":"jq is missing"},"warnings":[]}' >&"$JSON_FD"
+		fi
+	fi
+	rm -rf "$tmp"
+	return "$rc"
+}
+interrupted() {
+	local message="interrupted by SIG$1: a remote command it started may still be running"
+	if [ "$kept_claim" != null ]; then
+		message+="; sandbox still reserved: $(jq -r 'map(.name) | join(", ")' <<<"$kept_claim")"
+	fi
+	warn "$message"
+	json_error interrupted "$message" "$kept_claim"
+	exit "$2"
+}
+trap cleanup EXIT
+trap 'interrupted INT 130' INT
+trap 'interrupted TERM 143' TERM
+
+json_error() { # commit one complete object; only the main EXIT cleanup prints it
+	[ -n "$JSON" ] || return 0
+	local candidate=$tmp/error.$BASHPID.$RANDOM
+	[ ! -e "$tmp/error" ] || return 0
+	if command -v jq >/dev/null; then
+		jq -cn --arg c "$1" --arg m "$2" --argjson held "${3:-null}" '
+			def clean: gsub("[\u0000-\u001f\u007f-\u009f]"; " ");
+			{error:({code:$c, message:($m | clean)} +
+				(if $held == null then {} else {held:$held} end)), warnings:[]}' >"$candidate" ||
+			printf '%s\n' '{"error":{"code":"failed","message":"could not serialize JSON"},"warnings":[]}' >"$candidate"
+	else
+		printf '%s\n' '{"error":{"code":"failed","message":"jq is missing"},"warnings":[]}' >"$candidate"
+	fi
+	# Hard-link creation is atomic and refuses an existing destination, including another error.
+	ln "$candidate" "$tmp/error" 2>/dev/null || true
+}
+die() { stderr printf 'ibx: %s\n' "$*"; json_error failed "$*"; exit 125; }
+warn() {
+	stderr printf 'ibx: %s\n' "$*"
+	if [ -n "$JSON" ] && command -v jq >/dev/null; then
+		jq -cn --arg m "$*" '$m | gsub("[\u0000-\u001f\u007f-\u009f]"; " ")' >>"$tmp/warnings"
+	fi
+}
+
+sleep_for() { # wait is interruptible; cleanup reaps the child so it cannot hold stdout open
+	sleep "$1" &
+	sleep_pid=$!
+	wait "$sleep_pid"
+	sleep_pid=
+}
+
+normalize_config() { # value label -> NORMALIZED; shared rules with install.sh
+	local path=$1 label=$2
+	# shellcheck disable=SC2088 # expand only a literal leading ~ or ~/
+	case $path in
+	"~") path=${HOME:-} ;;
+	"~/"*) [ -n "${HOME:-}" ] || die "$label needs HOME to expand ~"; path=$HOME/${path#"~/"} ;;
+	esac
+	case $path in /*) ;; *) die "$label must be an absolute path (a leading ~ or ~/ is allowed)" ;; esac
+	while [ "$path" != / ] && [ "${path%/}" != "$path" ]; do path=${path%/}; done
+	NORMALIZED=$path
+}
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+	normalize_config "$CLAUDE_CONFIG_DIR" CLAUDE_CONFIG_DIR; CLAUDE_CONFIG_DIR=$NORMALIZED
+fi
+if [ -n "${CODEX_HOME:-}" ]; then
+	normalize_config "$CODEX_HOME" CODEX_HOME; CODEX_HOME=$NORMALIZED
+fi
+if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+	normalize_config "$XDG_CONFIG_HOME" XDG_CONFIG_HOME; XDG_CONFIG_HOME=$NORMALIZED
+fi
+CONFIG_DIR=${XDG_CONFIG_HOME:-${HOME:+$HOME/.config}}
+KEYFILE=${IBX_KEY_FILE:-${INSTABOX_KEY_FILE:-${CONFIG_DIR:+$CONFIG_DIR/instabox/api-key}}}
 
 # The key goes only to api.instabox.sh unless told otherwise; plain http only to a local test server.
 if [[ $API =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]+)?$ ]]; then
@@ -101,6 +257,9 @@ elif [[ $API =~ ^https://([A-Za-z0-9.-]+)(:[0-9]+)?$ ]]; then
 else
 	die "INSTABOX_API_URL must be https://host"
 fi
+[[ $MAX_CLAIMS =~ ^[0-9]+$ ]] || die "IBX_MAX_CLAIMS must be a non-negative integer"
+# jq accepts decimal numbers, including values too large for shell arithmetic.
+MAX_CLAIMS=$(printf '%s\n' "$MAX_CLAIMS" | sed 's/^0*//; s/^$/0/')
 [[ $STALE_SECS =~ ^[0-9]+$ ]] || die "IBX_STALE_SECS must be a number of seconds"
 
 deps_ok() { # prints problems, one per line
@@ -121,18 +280,6 @@ if [ "$1" != doctor ]; then
 	problems=$(deps_ok | grep -v 'needed only by' || true)
 	[ -z "$problems" ] || die "$problems"
 fi
-
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX")
-cleanup_fns=()
-cleanup() {
-	trap '' INT TERM
-	local f
-	for f in "${cleanup_fns[@]}"; do "$f" || true; done
-	rm -rf "$tmp"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'warn "interrupted by SIGTERM: a remote command it started may still be running"; exit 143' TERM
 
 # The key stays in this (unexported) variable and reaches curl through stdin (-H @-): it is never
 # in argv, in the environment of child processes, or in a file that a SIGKILL would leave behind.
@@ -171,7 +318,7 @@ printable() { LC_ALL=C tr -d '\000-\010\013-\037\177'; } # drop control chars fr
 # curl -q skips ~/.curlrc, which could otherwise turn on verbose output and print the key.
 api() {
 	local m=$1 p=$2 code rc
-	case "$p" in *..* | *'#'* | *[[:space:]]*) printf '{"error":{"code":"bad_path","message":"refusing path %s"}}\n' "$p" >&2; return 1 ;; esac
+	case "$p" in *..* | *'#'* | *[[:space:]]*) stderr printf '{"error":{"code":"bad_path","message":"refusing path %s"}}\n' "$p"; return 1 ;; esac
 	local args=(-q -sS -o "$tmp/resp" -w '%{http_code}' -X "$m" -H @- -H 'Content-Type: application/json')
 	[ $# -ge 3 ] && args+=(--data-binary @"$3")
 	case "$m $p" in
@@ -188,12 +335,12 @@ api() {
 	esac
 	code=$(printf '%s\n' "$AUTH" | curl "${args[@]}" "$API$p") || {
 		rc=$?
-		printf '{"error":{"code":"transport","message":"curl exit %s on %s %s","retryable":false}}\n' "$rc" "$m" "$p" >&2
+		stderr printf '{"error":{"code":"transport","message":"curl exit %s on %s %s","retryable":false}}\n' "$rc" "$m" "$p"
 		return 1
 	}
 	case "$code" in
 	2??) cat "$tmp/resp" ;;
-	*) { cat "$tmp/resp"; echo; } >&2; return 1 ;;
+	*) stderr cat "$tmp/resp"; stderr echo; return 1 ;;
 	esac
 }
 err_code() { jq -r '.error.code // empty' <"$1" 2>/dev/null || true; }
@@ -250,7 +397,7 @@ wait_op() { # operation-id: waits up to 8 minutes
 	while [ $SECONDS -lt $end ]; do
 		if ! r=$(api GET "/v1/operations/$op?wait=25s" 2>"$tmp/operr"); then
 			[ "$(err_code "$tmp/operr")" = not_found ] && { warn "operation $op not found"; return 1; }
-			sleep 3
+			sleep_for 3
 			continue
 		fi
 		case "$(jq -r .state <<<"$r")" in
@@ -267,7 +414,7 @@ wait_op() { # operation-id: waits up to 8 minutes
 ensure_running() {
 	local m op opid state action nm=$1 end=$((SECONDS + 600)) notready=
 	while [ $SECONDS -lt $end ]; do
-		m=$(api GET "/v1/machines/$1") || { sleep 3; continue; }
+		m=$(api GET "/v1/machines/$1") || { sleep_for 3; continue; }
 		nm=$(jq -r "$JQ_DEFS"' .name // "" | clean' <<<"$m")
 		[ -n "$nm" ] || nm=$1
 		state=$(jq -r .state <<<"$m")
@@ -277,7 +424,7 @@ ensure_running() {
 			: "${notready:=$SECONDS}"
 			# exec works before the runtime reports ready; do not block on it forever.
 			[ $((SECONDS - notready)) -lt 60 ] || { warn "$nm runs but its runtime is not ready; continuing"; return 0; }
-			sleep 3
+			sleep_for 3
 			continue
 		fi
 		if [ -n "$opid" ]; then wait_op "$opid" || return 1; continue; fi
@@ -296,11 +443,11 @@ ensure_running() {
 			elif [ "$(err_code "$tmp/err")" = operation_conflict ]; then
 				wait_op "$(jq -r '.error.operationId // empty' <"$tmp/err")" || return 1
 			else
-				cat "$tmp/err" >&2
+				stderr cat "$tmp/err"
 				return 1
 			fi
 			;;
-		creating | starting | resuming | stopping | suspending) sleep 3 ;;
+		creating | starting | resuming | stopping | suspending) sleep_for 3 ;;
 		*) warn "$nm is $state"; return 1 ;;
 		esac
 	done
@@ -313,11 +460,155 @@ set_meta() { # id jq-filter [jq args...]: read-modify-write of the sandbox metad
 	shift 2
 	rm -f "$tmp/meta"
 	m=$(api GET "/v1/machines/$id") || return 1
+	if [ -n "${CLAIM_WRITE_TOKEN:-}" ] && ! jq -e --arg t "$CLAIM_WRITE_TOKEN" \
+		--argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
+		inpool and (free($now; $stale) or .metadata["ibx.claim.token"] == $t)' <<<"$m" >/dev/null; then
+		return 2
+	fi
 	jq "$@" "{metadata: ((.metadata // {}) | $filter)}" <<<"$m" >"$tmp/meta" || return 1
 	api PATCH "/v1/machines/$id" "$tmp/meta" >/dev/null || return 1
 }
 set_claim() { # id claim-object-json ({} clears): replaces only the ibx.claim.* keys
 	set_meta "$1" 'with_entries(select(.key | startswith("ibx.claim.") | not)) + $c' --argjson c "$2"
+}
+
+state_dir_ok() {
+	local unsafe
+	[ -n "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] && mkdir -p "$STATE_DIR" 2>/dev/null &&
+		[ -O "$STATE_DIR" ] && [ -w "$STATE_DIR" ] || return 1
+	unsafe=$(find "$STATE_DIR" -prune \( -perm -020 -o -perm -002 \) 2>/dev/null) || return 1
+	[ -z "$unsafe" ]
+}
+claim_unlock() {
+	if [ "$claim_lock_kind" = mkdir ]; then
+		if [ "$(cat "$STATE_DIR/claim.lock/pid" 2>/dev/null)" = "$LOCK_OWNER" ]; then
+			rm -rf "$STATE_DIR/claim.lock" 2>/dev/null || true
+		else
+			rmdir "$STATE_DIR/claim.lock" 2>/dev/null || true
+		fi
+	fi
+	claim_lock_kind=
+}
+reap_unlock() {
+	if [ -n "$reap_lock_held" ] &&
+		[ "$(cat "$STATE_DIR/claim.reap/pid" 2>/dev/null)" = "$LOCK_OWNER" ]; then
+		rm -rf "$STATE_DIR/claim.reap" 2>/dev/null || true
+	elif [ -n "$reap_lock_held" ] && [ ! -e "$STATE_DIR/claim.reap/pid" ]; then
+		rmdir "$STATE_DIR/claim.reap" 2>/dev/null || true
+	fi
+	reap_lock_held=
+}
+lock_stale() { # legacy or foreign owner records are reclaimed by age, never by a local pid
+	local pid host namespace
+	IFS=$'\t' read -r pid host namespace 2>/dev/null <"$1/pid" || true
+	{ [[ ${pid:-} =~ ^[0-9]+$ ]] && [ "${host:-}" = "$LOCK_HOST" ] &&
+		[ "${namespace:-}" = "$LOCK_NS" ] && ! kill -0 "$pid" 2>/dev/null; } ||
+		{ [ ! -e "$1/pid" ] && [ -n "$(find "$1" -prune -mmin +1 2>/dev/null)" ]; } ||
+		[ -n "$(find "$1" -prune -mmin +2 2>/dev/null)" ]
+}
+guard_stale() { lock_stale "$1" || [ -n "$(find "$1" -prune -mmin +1 2>/dev/null)" ]; }
+reap_claim_lock() {
+	local lock=$STATE_DIR/claim.lock guard=$STATE_DIR/claim.reap stale owner moved old
+	reap_lock_held=1
+	if ! mkdir "$guard" 2>/dev/null; then
+		reap_lock_held=
+		if guard_stale "$guard"; then
+			owner=$(cat "$guard/pid" 2>/dev/null) || owner=
+			stale=$STATE_DIR/claim.stale.reap.$$.$RANDOM
+			if mv "$guard" "$stale" 2>/dev/null; then
+				moved=$(cat "$stale/pid" 2>/dev/null) || moved=
+				if [ "$moved" = "$owner" ] && guard_stale "$stale"; then
+					rm -rf "$stale" 2>/dev/null || true
+				elif [ ! -e "$guard" ] && [ ! -L "$guard" ]; then
+					mv "$stale" "$guard" 2>/dev/null || true
+				fi
+			fi
+		fi
+		return 0
+	fi
+	if ! { printf '%s\n' "$LOCK_OWNER" >"$guard/pid"; } 2>/dev/null; then
+		rmdir "$guard" 2>/dev/null || true
+		reap_lock_held=
+		return 0
+	fi
+	if [ -L "$lock" ] || { [ -e "$lock" ] && [ ! -d "$lock" ]; }; then
+		rm -f "$lock" 2>/dev/null || true
+	elif [ -d "$lock" ] && lock_stale "$lock"; then
+		owner=$(cat "$lock/pid" 2>/dev/null) || owner=
+		stale=$STATE_DIR/claim.stale.$$.$RANDOM
+		if mv "$lock" "$stale" 2>/dev/null; then
+			moved=$(cat "$stale/pid" 2>/dev/null) || moved=
+			if [ "$moved" = "$owner" ] && lock_stale "$stale"; then
+				rm -rf "$stale" 2>/dev/null || true
+			elif [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+				mv "$stale" "$lock" 2>/dev/null || true
+			fi
+		fi
+	fi
+	for old in "$STATE_DIR"/claim.stale.*; do
+		if [ -n "$(find "$old" -prune -mmin +2 2>/dev/null)" ] && lock_stale "$old"; then
+			rm -rf "$old" 2>/dev/null || true
+		fi
+	done
+	# Acquirers take the guard too, so restoring a moved owner cannot nest into a new lock.
+	if [ "${1:-}" = acquire ] && [ "$(cat "$guard/pid" 2>/dev/null)" = "$LOCK_OWNER" ]; then
+		claim_lock_kind='mkdir'
+		if ! mkdir "$lock" 2>/dev/null; then
+			claim_lock_kind=
+		elif { printf '%s\n' "$LOCK_OWNER" >"$lock/pid"; } 2>/dev/null; then
+			if [ "$(cat "$guard/pid" 2>/dev/null)" != "$LOCK_OWNER" ] ||
+				[ "$(cat "$lock/pid" 2>/dev/null)" != "$LOCK_OWNER" ]; then claim_unlock; fi
+		else
+			# A reaper may have moved it before the owner write; remove only an empty dir.
+			rmdir "$lock" 2>/dev/null || true
+			claim_lock_kind=
+		fi
+	fi
+	reap_unlock
+}
+
+claim_lock() { # main shell only; the guard covers filesystem changes, never API calls
+	local wait_secs=${IBX_TEST_CLAIM_LOCK_SECS:-300} end message # tests shorten it
+	[ -z "$claim_lock_disabled" ] || return 0
+	if ! state_dir_ok; then
+		warn "could not use the local claim lock in ${STATE_DIR:-an unknown state directory}; continuing with settle checks"
+		claim_lock_disabled=1
+		return 0
+	fi
+	[[ $wait_secs =~ ^[0-9]+$ ]] || die "IBX_TEST_CLAIM_LOCK_SECS must be a non-negative integer"
+	end=$((SECONDS + 10#$wait_secs))
+	while [ "$SECONDS" -lt "$end" ]; do
+		reap_claim_lock acquire
+		[ "$claim_lock_kind" != mkdir ] || return 0
+		sleep_for 0.1 || true
+	done
+	message='another ibx claim on this computer held the claim lock for 5 minutes; try again'
+	stderr printf 'ibx: %s\n' "$message"
+	json_error lock_busy "$message"
+	exit 75
+}
+
+held_claims() { # machines-json [agent] [excluded-token]: holders, excluding invalid dates when counting an agent
+	jq -c --arg by "${2:-}" --arg token "${3:-}" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
+		[.[] | select(inpool) | age($now) as $age |
+		select($age != null and ($age == "invalid" or $age <= $stale)) |
+		select($by == "" or $age != "invalid") |
+		select($by == "" or .metadata["ibx.claim.by"] == $by) |
+		select($token == "" or .metadata["ibx.claim.token"] != $token) |
+		{name:(.name | clean), by:(.metadata["ibx.claim.by"] | clean),
+		 since:(.metadata["ibx.claim.at"] | clean), purpose:(.metadata["ibx.claim.purpose"] | clean)}]' <<<"$1"
+}
+claim_limit() {
+	local held count message
+	[ "$MAX_CLAIMS" != 0 ] || return 0
+	held=$(held_claims "$1" "$AGENT" "${2:-}")
+	count=$(jq length <<<"$held")
+	if jq -en --argjson n "$count" --argjson cap "$MAX_CLAIMS" '$n >= $cap' >/dev/null; then
+		message="$AGENT already holds $count sandboxes ($(jq -r 'map(.name) | join(", ")' <<<"$held")), the most IBX_MAX_CLAIMS allows. Release one you no longer use, or ask the user."
+		stderr printf 'ibx: %s\n' "$message"
+		json_error claim_limit "$message" "$held"
+		exit 75
+	fi
 }
 
 exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call it directly, not
@@ -335,18 +626,18 @@ exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call i
 		code=$(err_code "$tmp/err")
 		case "$code" in
 		quota_exceeded) # at most 4 execs at once per account: wait for a slot
-			[ $SECONDS -lt $end ] || { cat "$tmp/err" >&2; die "exec did not run: 4 other execs kept the account busy for 10 minutes"; }
-			sleep $((5 + RANDOM % 5)) & wait $! ;;
+			[ $SECONDS -lt $end ] || { stderr cat "$tmp/err"; die "exec did not run: 4 other execs kept the account busy for 10 minutes"; }
+			sleep_for "$((5 + RANDOM % 5))" ;;
 		machine_not_running) # it never started, so retrying is safe
 			starts=$((starts + 1))
-			[ $starts -le 3 ] || { cat "$tmp/err" >&2; die "exec did not run: ${LABEL:-the sandbox} keeps stopping"; }
+			[ $starts -le 3 ] || { stderr cat "$tmp/err"; die "exec did not run: ${LABEL:-the sandbox} keeps stopping"; }
 			ensure_running "$id" || die "exec did not run: could not start ${LABEL:-the sandbox}" ;;
 		bad_request | unauthenticated | api_key_expired | api_key_revoked | permission_denied | insufficient_scope | not_found | bad_path)
-			cat "$tmp/err" >&2; die "exec rejected (the command did not run)" ;;
+			stderr cat "$tmp/err"; die "exec rejected (the command did not run)" ;;
 		host_unavailable)
-			if [ "$(jq -r '.error.retryable // false' <"$tmp/err")" = true ] && [ $SECONDS -lt $end ]; then sleep 5 & wait $!; continue; fi
-			cat "$tmp/err" >&2; die "exec failed (the command may or may not have run; check before retrying)" ;;
-		*) cat "$tmp/err" >&2; die "exec failed (the command may or may not have run; check before retrying)" ;;
+			if [ "$(jq -r '.error.retryable // false' <"$tmp/err")" = true ] && [ $SECONDS -lt $end ]; then sleep_for 5; continue; fi
+			stderr cat "$tmp/err"; die "exec failed (the command may or may not have run; check before retrying)" ;;
+		*) stderr cat "$tmp/err"; die "exec failed (the command may or may not have run; check before retrying)" ;;
 		esac
 	done
 }
@@ -358,7 +649,7 @@ remote_cmd() { # args -> one bash command line: a single argument is a script, s
 public_ports() { # id -> "port US name US url" lines (US = \x1f keeps empty fields)
 	local r
 	r=$(api GET "/v1/machines/$1/ports") || return 1
-	jq -r "$JQ_DEFS"' .ports[]? | [(.port|tostring), (.name // "" | clean), (.url | clean)] | join("\u001f")' <<<"$r"
+	jq -r "$JQ_DEFS"' .ports[]? | select(.port | type == "number") | [(.port|tostring), (.name // "" | clean), (.url | clean)] | join("\u001f")' <<<"$r"
 }
 
 unpublish() { # id port: also fine when it is already gone (a retried DELETE gets 404)
@@ -456,15 +747,19 @@ pool)
 	;;
 claim)
 	purpose=${1:-}
-	[ -n "$purpose" ] || die 'usage: ibx claim "<purpose>"'
+	[[ $purpose != -* ]] || die "unknown option $purpose; the purpose is one quoted argument"
+	[ $# -eq 1 ] && [ -n "$purpose" ] || die 'usage: ibx claim [--json] "<purpose>": the purpose must be ONE quoted argument'
 	purpose=$(printf '%s' "$purpose" | tr '\t\n\r' '   ' | printable)
 	token=$(idem)
 	apierr=''
 	claimed_ids=()
+	claim_lock_kind='' claim_lock_disabled=''
+	cleanup_fns+=(claim_unlock reap_unlock)
 	unclaim() { # clears every reservation this run wrote, unless someone else holds it now
 		local i m
 		for i in "${claimed_ids[@]}"; do
 			[ -n "$i" ] || continue
+			jq -e --arg id "$i" 'any(.[]?; .id == $id)' <<<"$kept_claim" >/dev/null && continue
 			m=$(api GET "/v1/machines/$i") || continue
 			[ "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" = "$token" ] && set_claim "$i" '{}'
 		done
@@ -475,6 +770,7 @@ claim)
 		ms=$(all_machines) || die "could not list sandboxes"
 		[ "$(jq "$JQ_DEFS"' [.[] | select(inpool)] | length' <<<"$ms")" != 0 ] ||
 			die "the pool is empty: ask the user to run  ibx pool add <box>"
+		claim_limit "$ms" "$token"
 		cands='[.[] | select(inpool) | select(free($now; $stale))'
 		running=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' | select(.state == "running")] | .[].id' <<<"$ms" | shuffle)
 		others=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' |
@@ -491,41 +787,82 @@ claim)
 				n=$(vault_items "$id") || { apierr=1; continue; }
 				[ "$n" = 0 ] || { warn "skipping $name: the Vault writes $n secret(s) into it"; continue; }
 			fi
+			claim_lock
+			fresh=$(all_machines) || { claim_unlock; apierr=1; continue; }
+			ms=$fresh
+			claim_limit "$fresh" "$token"
+			m=$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$fresh")
+			if [ -z "$m" ] || [ "$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" \
+				"$JQ_DEFS"' inpool and free($now; $stale)' <<<"$m")" != true ]; then
+				claim_unlock
+				continue
+			fi
+			name=$(jq -r "$JQ_DEFS"' .name | clean' <<<"$m")
 			claim=$(jq -cn --arg by "$AGENT" --arg at "$(now_iso)" --arg p "${purpose:0:500}" --arg t "$token" \
 				'{"ibx.claim.by":$by, "ibx.claim.at":$at, "ibx.claim.purpose":$p, "ibx.claim.token":$t}')
 			claimed_ids+=("$id")
-			set_claim "$id" "$claim" || { apierr=1; continue; }
+			write_rc=0
+			CLAIM_WRITE_TOKEN=$token set_claim "$id" "$claim" || write_rc=$?
+			claim_unlock
+			if [ "$write_rc" != 0 ]; then
+				[ "$write_rc" = 2 ] || apierr=1
+				continue
+			fi
 			# Metadata has no compare-and-swap and the last writer wins: wait out another agent's
 			# PATCH, then check that the reservation is still ours, twice.
 			ok=1
 			for wait in ${IBX_CLAIM_SETTLE:-20 5}; do # tests shorten it
-				sleep "$wait"
+				sleep_for "$wait"
 				m=$(api GET "/v1/machines/$id") || { ok=''; apierr=1; break; }
 				[ "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" = "$token" ] || { ok=''; break; }
 			done
 			IBX_MAXTIME=''
 			[ -n "$ok" ] || continue
 			ensure_running "$id" || { warn "$name would not start; trying another"; set_claim "$id" '{}' || true; continue; }
+			kept_claim=$(jq -cn --arg n "$name" --arg id "$id" '[{name:$n,id:$id}]')
 			claimed_ids=("${claimed_ids[@]/$id/}") # ours to keep: do not clear it on exit
 			# Keep it awake from now on; a keepalive timer renews this lease while it is reserved.
 			echo '{"ttlSeconds":3600}' >"$tmp/lease"
-			api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" >/dev/null 2>&1 ||
+			lease=null
+			if lease_reply=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>/dev/null); then
+				lease=$(jq -c "$JQ_DEFS"' .expiresAt | clean' <<<"$lease_reply")
+			else
 				warn "could not set the activity lease on $name: it may pause after 30 idle minutes"
-			if ports=$(public_ports "$id") && [ -n "$ports" ]; then
-				warn "WARNING: $name still has public ports from before (no authentication):"
-				tr '\037' ' ' <<<"$ports" | sed 's/^/  /' >&2
 			fi
-			printf '%s\n' "$name"
+			port_rows='[]'
+			if ! ports=$(public_ports "$id"); then
+				warn "could not list the public ports of $name; check with ibx release"
+				port_rows=null
+			elif [ -n "$ports" ]; then
+				warn "WARNING: $name still has public ports from before (no authentication):"
+				while IFS=$'\037' read -r port pname url; do
+					[[ $port =~ ^[0-9]+$ ]] || continue
+					if [ -n "$JSON" ]; then warn "  $port $pname $url"; else stderr printf '  %s %s %s\n' "$port" "$pname" "$url"; fi
+					port_rows=$(jq -c --argjson p "$port" --arg n "$pname" --arg u "$url" '. + [{port:$p,name:$n,url:$u}]' <<<"$port_rows")
+				done <<<"$ports"
+			fi
+			if [ -n "$JSON" ]; then
+				jq -cn --arg n "$name" --arg id "$id" --argjson c "$claim" --argjson l "$lease" \
+					--argjson p "$port_rows" '{name:$n,id:$id,by:$c["ibx.claim.by"],since:$c["ibx.claim.at"],
+					purpose:$c["ibx.claim.purpose"],leaseUntil:$l,publicPorts:$p}' >"$tmp/result"
+			else
+				printf '%s\n' "$name"
+			fi
 			exit 0
 		done
 		IBX_MAXTIME=''
 		if [ "$attempt" != 1 ] || ! jq -e "$JQ_DEFS"' any(.[] | select(inpool); .state | IN("starting","resuming","suspending","stopping","creating"))' <<<"$ms" >/dev/null; then
 			break
 		fi
-		sleep 20 # some were changing state: look once more
+		sleep_for 20 # some were changing state: look once more
 	done
 	[ -z "$apierr" ] || die "could not claim a sandbox: API errors (see above)"
-	printf 'ibx: no free sandbox in the pool (ibx ls). Ask the user before using one someone else holds.\n' >&2
+	claim_limit "$ms" "$token"
+	held=$(held_claims "$ms")
+	message='no free sandbox in the pool (ibx ls). Ask the user before using one someone else holds.'
+	stderr printf 'ibx: %s\n' "$message"
+	stderr jq -r '.[] | "  \(.name): held by \(.by) since \(.since): \(.purpose)"' <<<"$held"
+	json_error no_free_sandbox "$message" "$held"
 	exit 75
 	;;
 renew)
@@ -533,27 +870,46 @@ renew)
 	id=$(resolve --pool "$1")
 	m=$(api GET "/v1/machines/$id") || die "could not read $1"
 	[ -n "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" ] || die "$1 has no reservation to renew (ibx claim)"
-	set_meta "$id" '. + {"ibx.claim.at": $at}' --arg at "$(now_iso)" || die "could not renew $1"
-	echo "renewed $1; it counts as abandoned after $(jq -nr --argjson s "$STALE_SECS" 'now + $s | floor | todate')"
+	since=$(now_iso)
+	set_meta "$id" '. + {"ibx.claim.at": $at}' --arg at "$since" || die "could not renew $1"
+	abandoned=$(jq -nr --arg at "$since" --argjson s "$STALE_SECS" '$at | fromdateiso8601 + $s | todate')
+	if [ -n "$JSON" ]; then
+		jq -c --arg since "$since" --arg a "$abandoned" "$JQ_DEFS"'
+			{name:(.name | clean),id:(.id | clean),by:(.metadata["ibx.claim.by"] | clean),since:$since,abandonedAfter:$a}' <<<"$m" >"$tmp/result"
+	else
+		echo "renewed $1; it counts as abandoned after $abandoned"
+	fi
 	;;
 release)
 	[ $# -ge 1 ] || die "usage: ibx release <box>"
 	id=$(resolve --pool "$1")
 	m=$(api GET "/v1/machines/$id") || die "could not read $1"
 	ports=$(public_ports "$id") || die "could not list the public ports of $1; nothing released, try again"
-	left=''
+	left='' unpublished='[]' left_alone='[]'
 	while IFS=$'\037' read -r port name url; do
-		[ -n "$port" ] || continue
+		[[ $port =~ ^[0-9]+$ ]] || continue
 		if [[ $name == ibx:* ]]; then
-			if unpublish "$id" "$port"; then echo "unpublished port $port of $1"; else left+=" $url"; fi
+			if unpublish "$id" "$port"; then
+				unpublished=$(jq -c --argjson p "$port" '. + [$p]' <<<"$unpublished")
+				[ -n "$JSON" ] || echo "unpublished port $port of $1"
+			else left+=" $url"; fi
 		else
+			left_alone=$(jq -c --argjson p "$port" --arg n "$name" --arg u "$url" '. + [{port:$p,name:$n,url:$u}]' <<<"$left_alone")
 			warn "left port $port alone ($url): it was not published by ibx"
 		fi
 	done <<<"$ports"
 	[ -z "$left" ] || die "these URLs are STILL PUBLIC:$left (nothing released; ibx unport $1 PORT, then release again)"
 	api DELETE "/v1/machines/$id/activity-leases/$LEASE" >/dev/null 2>&1 || true
 	set_claim "$id" '{}' || die "could not clear the reservation of $1"
-	echo "released $1 (was: $(jq -r "$JQ_DEFS"' "\(.metadata["ibx.claim.purpose"] // "no reservation" | clean) (\(.metadata["ibx.claim.by"] // "-" | clean), since \(.metadata["ibx.claim.at"] // "-" | clean))"' <<<"$m"))"
+	if [ -n "$JSON" ]; then
+		jq -c --argjson u "$unpublished" --argjson l "$left_alone" "$JQ_DEFS"'
+			{name:(.name | clean),id:(.id | clean),unpublished:$u,leftAlone:$l,
+			was:(if (.metadata["ibx.claim.token"] // "") == "" then null else
+				{by:(.metadata["ibx.claim.by"] | clean),since:(.metadata["ibx.claim.at"] | clean),
+				purpose:(.metadata["ibx.claim.purpose"] | clean)} end)}' <<<"$m" >"$tmp/result"
+	else
+		echo "released $1 (was: $(jq -r "$JQ_DEFS"' "\(.metadata["ibx.claim.purpose"] // "no reservation" | clean) (\(.metadata["ibx.claim.by"] // "-" | clean), since \(.metadata["ibx.claim.at"] // "-" | clean))"' <<<"$m"))"
+	fi
 	;;
 exec)
 	[ $# -ge 1 ] || die "usage: ibx exec <box> [-t SECS] [-i] -- <cmd>"
@@ -583,7 +939,7 @@ exec)
 	fi
 	r=$R
 	jq -j '.stdout // ""' <<<"$r"
-	jq -j '.stderr // ""' <<<"$r" >&2
+	stderr jq -j '.stderr // ""' <<<"$r"
 	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && warn "output truncated (1 MiB per stream)"
 	if [ "$(jq -r '.timedOut // false' <<<"$r")" = true ]; then
 		warn "timed out after ${t}s; for long jobs run them detached: setsid -f CMD >LOG 2>&1"
@@ -638,6 +994,7 @@ ssh)
 	[ $# -ge 1 ] || die "usage: ibx ssh <box> [cmd...]"
 	box=$1
 	shift
+	[ "${1:-}" != -- ] || shift
 	id=$(resolve --pool "$box")
 	ensure_running "$id" || die "could not start $box"
 	info=$(api GET "/v1/machines/$id/connection-info") || die "could not read connection info"
@@ -695,7 +1052,7 @@ unport)
 	[ $# -eq 2 ] || die "usage: ibx unport <box> <port>"
 	[[ $2 =~ ^[0-9]+$ ]] || die "port must be a number"
 	id=$(resolve --pool "$1")
-	unpublish "$id" "$((10#$2))" || { cat "$tmp/perr" >&2; die "could not unpublish port $2"; }
+	unpublish "$id" "$((10#$2))" || { stderr cat "$tmp/perr"; die "could not unpublish port $2"; }
 	echo "unpublished port $2 of $1"
 	;;
 keepalive)
@@ -732,11 +1089,23 @@ doctor)
 	no() { printf 'FAIL  %s\n' "$*"; bad=1; }
 	note() { printf 'warn  %s\n' "$*"; }
 	ok "ibx $IBX_VERSION, bash $BASH_VERSION"
+	ok "agent: $AGENT ($AGENT_SOURCE); IBX_MAX_CLAIMS=$MAX_CLAIMS"
+	if ! state_dir_ok; then
+		note "state directory is not writable or safe for the local lock: ${STATE_DIR:-unknown}"
+	fi
 	while IFS= read -r p; do
 		[ -n "$p" ] || continue
 		case "$p" in *"needed only by"*) note "$p" ;; *) no "$p" ;; esac
 	done < <(deps_ok)
 	[ "$bad" = 0 ] || { echo "fix the dependencies above first"; exit 125; }
+	if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ ! -e "$CLAUDE_CONFIG_DIR/skills/ibx" ]; then
+		if ! jq -e '.plugins // {} | to_entries | any(.[];
+			(.key | split("@")[0]) == "ibx" and (.value | type == "array" and length > 0))' \
+			"$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json" >/dev/null 2>&1; then
+			config=$(printf %q "$CLAUDE_CONFIG_DIR")
+			note "Claude Code with CLAUDE_CONFIG_DIR=$config cannot see the ibx skill; run CLAUDE_CONFIG_DIR=$config ./install.sh --agents claude --no-bin, or link skills/ibx there"
+		fi
+	fi
 	if load_key; then
 		ok "API key found ($KEY_SOURCE)"
 		ENV_KEY=''
@@ -773,5 +1142,5 @@ doctor)
 	fi
 	exit $((bad ? 125 : 0))
 	;;
-*) usage >&2; exit 125 ;;
+*) stderr usage; exit 125 ;;
 esac

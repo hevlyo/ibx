@@ -136,8 +136,13 @@ untrusted code (section 8).
   anywhere.
 - Pool sandboxes are reused. The previous holder may have left files, packages, background
   processes, cron jobs or modified binaries, and the next holder sees what you leave.
-- Reservations (`ibx.claim.*` metadata) are advisory, with no compare-and-swap. They prevent
-  accidents between cooperating agents, not access.
+- Reservations (`ibx.claim.*` metadata) are advisory, with no compare-and-swap. An atomic mkdir lock
+  provides mutual exclusion between ibx processes of one user on one computer that share
+  `IBX_STATE_DIR`, by default `${XDG_STATE_HOME:-~/.local/state}/ibx`. A separate mkdir guard
+  serializes stale-lock recovery; owner records include the host and PID namespace so foreign
+  PIDs are reclaimed only by age. If the state directory is unusable, ibx warns and continues.
+  A busy lock in a usable directory waits up to five minutes, then exits 75 with `lock_busy`.
+  Other computers still rely on the settle wait and double token check. Other API clients ignore reservations entirely; reservations do not restrict access.
 
 ## 7. What ibx enforces
 
@@ -176,9 +181,10 @@ These are guards against accidents. None of them stops someone who holds the API
   control characters, so a crafted value cannot send escape sequences to your terminal.
 - **Metadata.** `ibx claim` stores the purpose (control characters removed, up to 500
   characters) and the agent name in the sandbox's metadata, and the agent name is also the name
-  of the SSH tokens ibx makes. The default agent name is `agent-<checksum of user@host>`:
-  pseudonymous, not anonymous, since anyone who guesses the user and host names can recompute
-  it. `IBX_AGENT_NAME` replaces it (characters outside `A-Za-z0-9@._:-` become `_`; at most 64).
+  of the SSH tokens ibx makes. The default agent name hashes user, host and the Claude Code or
+  Codex session ID when available, falling back to `agent-<checksum of user@host>`. It is
+  pseudonymous; anyone who guesses those inputs can recompute it. `IBX_AGENT_NAME` replaces it
+  (characters outside `A-Za-z0-9@._:-` become `_`; at most 64).
   Keep both generic: no client or employer names, no secrets.
 
 ## 8. Rules for agents
@@ -192,7 +198,8 @@ Unless the user explicitly asks otherwise, for that specific thing:
 2. **Never bring logged-in sessions** or session files.
 3. **Never bring third-party personal data**: customer records, user databases, mailboxes,
    chat exports, anything about people other than the user.
-4. **Do not bring proprietary code** unless the user explicitly asks. If they do, send only
+4. **Do not bring private code or data**, personal or the employer's, unless the user explicitly
+   asks. Public and open-source code is fine, sent the safe way described here. Send only
    versioned files, and look at them first, because `git archive` copies every one:
    `git ls-files | grep -Ei '(^|/)\.env|\.(pem|key|p12|pfx)$|id_rsa|id_ed25519|credential|secret'`.
    If anything matches, stop and ask, or archive only the paths you need
@@ -203,13 +210,18 @@ Unless the user explicitly asks otherwise, for that specific thing:
    it, another agent may take it once your reservation goes stale, and a failed resume can
    boot it fresh. Copy results back (`ibx get`, `ibx ssh BOX 'cat FILE' >FILE`) before you
    release it.
-6. Public data, open-source code and things you generate are fine.
+6. Public data, public and open-source code, and things you generate are fine. Send code using
+   the checks and transfer method in rule 4; private code needs the user's explicit request.
 7. **Before running untrusted code** (an unknown package, a downloaded binary), check that the
    sandbox holds nothing of value, names only:
    `ibx exec BOX -- "env | cut -d= -f1 | sort"` and `ibx exec BOX -- 'ls -A ~'`. If
    credential-looking names appear, stop and tell the user. Afterwards, tell the user that the
    sandbox ran untrusted code with sudo available and should be recreated before anyone trusts
    it again (section 10; [recipes.md](recipes.md#2-auditing-an-untrusted-npm-or-pip-package)).
+   This is for code you had reason to distrust: unknown or low-reputation packages and binaries,
+   code you were asked to vet, and anything that behaved oddly (unexpected network traffic,
+   processes, or changes outside the project). Routine builds and tests of well-known public
+   projects do not need the note; nothing of value lives in a pool sandbox anyway.
 8. **Publish a port only when the user asks**, and unpublish it as soon as they are done. Say
    plainly that the URL has no authentication.
 9. Keep the claim purpose and `IBX_AGENT_NAME` generic (section 7).

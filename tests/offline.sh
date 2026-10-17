@@ -29,9 +29,11 @@ OTHER_KEY=ibk_wrongwrongwrongwrongwrongwrongwrongwrongwrongwrong
 
 # ibx sees only the mock, a scratch HOME and TMPDIR, and no key file.
 export HOME=$S/home XDG_CONFIG_HOME=$S/home/.config TMPDIR=$S/tmp
+export IBX_STATE_DIR=$S/state XDG_STATE_HOME=$S/home/.local/state
 export IBX_KEY_FILE=$S/no-key-file IBX_AGENT_NAME=tester IBX_CLAIM_SETTLE='0.2 0.1'
 unset INSTABOX_KEY_FILE IBX_STALE_SECS IBX_MAXTIME IBX_EXEC_MAXTIME IBX_REEXEC CURL_HOME \
-	IBX_ALLOW_ANY IBX_ALLOW_VAULT IBX_ALLOW_CUSTOM_API CODEX_HOME
+	IBX_ALLOW_ANY IBX_ALLOW_VAULT IBX_ALLOW_CUSTOM_API CODEX_HOME IBX_MAX_CLAIMS CLAUDE_CONFIG_DIR \
+	CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID IBX_TEST_CLAIM_LOCK_SECS
 
 # The key reaches the mock through its environment, so no process has it in its arguments.
 TMPDIR=$S/mock MOCK_API_KEY=$KEY python3 "$MOCK" --port 0 --exec "$EXEC_MODE" >"$S/mock.port" 2>"$S/mock.log" &
@@ -87,9 +89,10 @@ LIMIT=40 # seconds before a run counts as hung
 # /dev/null). Sets RC; stdout and stderr are in $S/out and $S/err. A run still going after $LIMIT
 # seconds gets SIGTERM (TIMEDOUT=1).
 run() {
-	local envs=(env) pid wd in=/dev/null
+	local envs=(env) pid wd in=/dev/null closed=
 	while [ $# -gt 0 ]; do
 		case "$1" in
+		--closed-stderr) closed=1; shift ;;
 		-u) envs+=(-u "$2"); shift 2 ;;
 		-s) in=$2; shift 2 ;;
 		[A-Za-z_]*=*) envs+=("$1"); shift ;;
@@ -98,7 +101,12 @@ run() {
 	done
 	rm -f "$S/timedout"
 	RUN_LIMIT=$LIMIT
-	"${envs[@]}" "$IBX" "$@" >"$S/out" 2>"$S/err" <"$in" &
+	if [ -n "$closed" ]; then
+		: >"$S/err"
+		"${envs[@]}" "$IBX" "$@" >"$S/out" 2>&- <"$in" &
+	else
+		"${envs[@]}" "$IBX" "$@" >"$S/out" 2>"$S/err" <"$in" &
+	fi
 	pid=$!
 	(
 		sp=
@@ -188,6 +196,29 @@ t_cli() {
 	out_has "--help prints the usage" '^ibx - borrow'
 	run -u INSTABOX_API_KEY
 	rc_is "no arguments prints the usage" 0
+	local help_args
+	for help_args in 'claim --help' 'claim -h' 'release --help' 'exec --help' 'exec box-1 --help' 'exec box-1 -t 30 --help' 'pool add --help' 'ssh --help' 'ssh -h' 'put box-1 --help'; do
+		reset
+		# These fixed test arguments deliberately split into words.
+		# shellcheck disable=SC2086
+		run -u INSTABOX_API_KEY $help_args
+		rc_is "$help_args exits successfully without a key" 0
+		is "$help_args makes no API call" "$(ncalls)" 0
+		out_has "$help_args prints usage" '^ibx - borrow'
+	done
+	reset
+	run claim --frobnicate
+	rc_is "an unknown claim option fails" 125
+	err_has "unknown claim options explain the quoted purpose" 'unknown option --frobnicate; the purpose is one quoted argument'
+	is "an unknown claim option makes no API call" "$(ncalls)" 0
+	reset
+	run exec box-1 -- printf %s --help
+	rc_is "--help after exec's separator is a remote argument" 0
+	yes_ "the remote command retains --help" eval 'last_exec .cmd | grep -q -- --help'
+	reset
+	run exec box-1 printf %s --help
+	rc_is "--help after an implicit remote command stays remote" 0
+	yes_ "an implicit remote command retains --help" eval 'last_exec .cmd | grep -q -- --help'
 	local ver
 	ver=$(sed -n 's/^IBX_VERSION=//p' "$IBX")
 	run -u INSTABOX_API_KEY --version
@@ -258,6 +289,40 @@ t_doctor() {
 	run -u INSTABOX_API_KEY doctor
 	rc_is "doctor fails without a key" 125
 	out_has "doctor says the key is missing" '^FAIL +no API key'
+	reset
+	local config=$S/claude-doctor
+	run CLAUDE_CONFIG_DIR="$config" doctor
+	rc_is "a missing Claude skill is a warning, not a doctor failure" 0
+	out_has "doctor explains how to install for CLAUDE_CONFIG_DIR" '^warn +Claude Code with CLAUDE_CONFIG_DIR=.*cannot see the ibx skill; run CLAUDE_CONFIG_DIR=.* ./install.sh --agents claude --no-bin'
+	mkdir -p "$config/skills"
+	ln -s "$here/../skills/ibx" "$config/skills/ibx"
+	run CLAUDE_CONFIG_DIR="$config" doctor
+	out_lacks "doctor recognizes a skill linked into the custom config" 'cannot see the ibx skill'
+	rm "$config/skills/ibx"
+	mkdir -p "$config/plugins"
+	printf '%s\n' '{"version":2,"plugins":{"not-ibx@ibx":[{"installPath":"/plugins/ibx"}],"ibx@ibx":[]}}' >"$config/plugins/installed_plugins.json"
+	run CLAUDE_CONFIG_DIR="$config" doctor
+	out_has "doctor does not mistake an unrelated plugin or empty install list for ibx" 'cannot see the ibx skill'
+	printf '%s\n' '{"version":2,"plugins":{"ibx@ibx":[{"scope":"user","installPath":"/plugins/ibx"}]}}' >"$config/plugins/installed_plugins.json"
+	run CLAUDE_CONFIG_DIR="$config" doctor
+	out_lacks "doctor recognizes the recorded ibx plugin by its exact name" 'cannot see the ibx skill'
+	printf 'invalid JSON\n' >"$config/plugins/installed_plugins.json"
+	run CLAUDE_CONFIG_DIR="$config" doctor
+	out_has "unreadable plugin records do not hide the missing skill warning" 'cannot see the ibx skill'
+
+	mkdir -p "$HOME/.claude-normalized/skills"
+	ln -s "$here/../skills/ibx" "$HOME/.claude-normalized/skills/ibx"
+	run CLAUDE_CONFIG_DIR='~/.claude-normalized///' doctor
+	rc_is "doctor expands a literal tilde and strips config trailing slashes" 0
+	out_lacks "doctor finds the normalized Claude skill" 'cannot see the ibx skill'
+	local var
+	for var in CLAUDE_CONFIG_DIR CODEX_HOME XDG_CONFIG_HOME; do
+		reset
+		run "$var=relative-config" doctor
+		rc_is "doctor rejects relative $var" 125
+		err_has "doctor explains the $var path rule" "$var must be an absolute path"
+		is "invalid $var is rejected before API access" "$(ncalls)" 0
+	done
 }
 
 t_pool() {
@@ -416,6 +481,728 @@ t_claim() {
 	err_has "it says the API failed" 'could not claim a sandbox: API errors'
 	yes_ "after about 8 s, not the 15 s the call hangs ($((SECONDS - t0)) s)" [ $((SECONDS - t0)) -le 12 ]
 	is "nothing was reserved" "$(count PATCH .)" 0
+}
+
+# Batch outputs stay separate so every process's exit status and JSON can be checked.
+claim_batch() { # count identity(shared/distinct) lock(shared/separate) cap settle
+	local n=$1 identity=$2 lock=$3 cap=$4 settle=$5 i pid
+	local pids=()
+	rm -rf "$S/batch"
+	mkdir -p "$S/batch"
+	if [ "${6:-}" = dead ]; then
+		mkdir -p "$S/batch/state/claim.lock"
+		lock_owner 99999999 >"$S/batch/state/claim.lock/pid"
+	fi
+	for ((i=1; i<=n; i++)); do
+		local agent=batch-$i dir=$S/batch/state
+		[ "$identity" != shared ] || agent=batch-agent
+		[ "$lock" != separate ] || dir=$S/batch/state-$i
+		IBX_AGENT_NAME=$agent IBX_STATE_DIR=$dir IBX_MAX_CLAIMS=$cap \
+			IBX_CLAIM_SETTLE=$settle \
+			"$IBX" claim --json "parallel $i" >"$S/batch/$i.json" 2>"$S/batch/$i.err" </dev/null &
+		pids+=("$!")
+	done
+	i=0
+	for pid in "${pids[@]}"; do
+		i=$((i + 1))
+		wait "$pid"
+		printf '%s\n' "$?" >"$S/batch/$i.rc"
+	done
+	is "no claim.lock remains after the batch" "$(find "$S/batch" -name claim.lock | wc -l | tr -d ' ')" 0
+}
+batch_json() { jq -s "$1" "$S/batch/"*.json; }
+batch_rcs() { cat "$S/batch/"*.rc | sort -n | tr '\n' ' '; }
+
+t_claim_parallel() {
+	group "claim: local lock and cross-computer settle checks"
+	reset '"seed":{"count":6},"faults":[{"kind":"delay","method":"PATCH","seconds":0.12,"count":100}]'
+	claim_batch 8 distinct shared 3 '0.05 0'
+	is "8 parallel claims: six succeed, two exit 75" "$(batch_rcs)" '0 0 0 0 0 0 75 75 '
+	is "all six winners are distinct" "$(batch_json '[.[] | select(.name) | .name] | unique | length')" 6
+	is "both refusals are no_free_sandbox" "$(batch_json '[.[] | select(.error.code == "no_free_sandbox")] | length')" 2
+	yes_ "each stdout is exactly one JSON object" \
+		jq -se 'length == 8 and all(.[]; type == "object")' "$S/batch/"*.json
+	reset '"seed":{"count":6},"faults":[{"kind":"delay","method":"PATCH","seconds":0.2,"count":100}]'
+	claim_batch 8 distinct separate 3 '1 0.5'
+	is "separate state dirs: every run succeeds or exits 75" "$(cat "$S/batch/"*.rc | grep -vcE '^(0|75)$')" 0
+	yes_ "separate state dirs: at least one claim succeeds" [ "$(batch_json '[.[] | select(.name)] | length')" -gt 0 ]
+	is "separate state dirs: no two winners have the same sandbox" \
+		"$(batch_json '[.[] | select(.name) | .name] | length == (unique | length)')" true
+	local wins
+	wins=$(batch_json '[.[] | select(.name) | {name,by}]')
+	is "separate state dirs: winners match final reservations" \
+		"$(state | jq --argjson wins "$wins" '[.machines[] as $m | $wins[] | select(.name == $m.name and .by != $m.metadata["ibx.claim.by"])] | length')" 0
+}
+
+t_claim_cap() {
+	group "claim: per-agent cap"
+	reset '"seed":{"count":6}'
+	claim_batch 10 shared shared 1 '0.05 0' dead
+	is "dead lock recovery: ten claims under cap=1 have exactly one winner" "$(batch_rcs)" '0 75 75 75 75 75 75 75 75 75 '
+	is "dead lock recovery: nine claim_limit errors" "$(batch_json '[.[] | select(.error.code == "claim_limit")] | length')" 9
+	reset '"seed":{"count":6}'
+	claim_batch 4 shared shared 2 '0.05 0'
+	is "cap=2: two succeed, two exit 75" "$(batch_rcs)" '0 0 75 75 '
+	is "two structured claim_limit errors" "$(batch_json '[.[] | select(.error.code == "claim_limit")] | length')" 2
+	is "limit errors list both held sandboxes" \
+		"$(batch_json '[.[] | select(.error) | .error.held | length] | all(. == 2)')" true
+	run IBX_STATE_DIR="$S/batch/state" IBX_MAX_CLAIMS=0 claim --json x
+	rc_is "another claim can acquire the lock after claim_limit" 0
+	yes_ "no claim.lock remains after claim_limit" [ ! -e "$S/batch/state/claim.lock" ]
+	reset '"seed":{"count":6}'
+	claim_batch 4 shared shared 0 '0.05 0'
+	is "cap=0 permits all four claims" "$(batch_rcs)" '0 0 0 0 '
+	reset
+	run IBX_MAX_CLAIMS=bad claim --json x
+	rc_is "a nonnumeric cap fails" 125
+	is "invalid cap gets a single failed JSON error" "$(jq -sc 'length == 1 and .[0].error.code == "failed"' "$S/out")" true
+	run IBX_MAX_CLAIMS=-1 claim --json x
+	rc_is "a negative cap fails" 125
+	reset
+	hold box-1 90000 tester
+	ctl "{\"set\":{\"box-2\":{\"mergeMetadata\":$(claim_md invalid tester)}}}"
+	run IBX_MAX_CLAIMS=1 claim --json x
+	rc_is "abandoned and invalid reservations by this agent do not count" 0
+	reset
+	hold box-1 0 tester
+	ctl '{"set":{"box-1":{"deleteMetadata":["ibx.pool"]}}}'
+	run IBX_MAX_CLAIMS=1 claim --json x
+	rc_is "reservations outside the pool do not count" 0
+	reset
+	hold box-1 0 tester
+	run IBX_MAX_CLAIMS=1 claim --json x
+	rc_is "initial cap check refuses an extra claim" 75
+	is "initial cap check writes nothing" "$(count PATCH .)" 0
+	yes_ "initial cap refusal leaves no lock" [ ! -e "$IBX_STATE_DIR/claim.lock" ]
+	err_has "cap message explains how to free capacity" 'tester already holds 1 sandboxes.*box-1.*Release one'
+	reset '"seed":{"count":2},"faults":[{"kind":"error","method":"GET","match":"^/v1/machines/m_[a-z2-7]{26}$","skip":2,"count":4,"status":503,"code":"unavailable"}]'
+	run IBX_MAX_CLAIMS=1 claim --json x
+	rc_is "a failed settle read does not count this run's in-flight reservation against its cap" 0
+	is "the failed candidate is cleared and only the winner remains reserved" \
+		"$(state | jq '[.machines[] | select(.metadata["ibx.claim.by"] == "tester")] | length')" 1
+	yes_ "the recovered claim releases the lock" [ ! -e "$IBX_STATE_DIR/claim.lock" ]
+}
+
+t_claim_lock_busy() {
+	group "claim: a busy usable lock never falls back to an unlocked write"
+	local dir=$S/queued-state i pid by busy=0 wrote=0 pids=()
+	rm -rf "$dir" "$S/queued"
+	mkdir "$S/queued"
+	reset '"seed":{"count":20},"faults":[{"kind":"delay","method":"GET","match":"^/v1/machines$","seconds":1,"count":100}]'
+	for i in $(seq 16); do
+		by=queue-agent-$((i % 4))
+		IBX_AGENT_NAME=$by IBX_STATE_DIR=$dir IBX_MAX_CLAIMS=2 IBX_TEST_CLAIM_LOCK_SECS=2 \
+			IBX_CLAIM_SETTLE='0.05 0' "$IBX" claim --json "queued $i" \
+			>"$S/queued/$i.json" 2>"$S/queued/$i.err" </dev/null &
+		pids+=("$!")
+	done
+	for pid in "${pids[@]}"; do wait "$pid"; printf '%s\n' "$?" >>"$S/queued/rcs"; done
+	is "the queued claims all succeed or exit 75" "$(grep -vcE '^(0|75)$' "$S/queued/rcs")" 0
+	yes_ "the shortened lock deadline rejects overflow with lock_busy" \
+		jq -se 'any(.[]; .error.code == "lock_busy")' "$S/queued/"*.json
+	yes_ "every queued claim emits exactly one object" \
+		jq -se 'length == 16 and all(.[]; type == "object")' "$S/queued/"*.json
+	yes_ "no agent exceeds the cap while list calls are slow" \
+		jq -e '[.machines[] | .metadata["ibx.claim.by"] | select(. != null)] | group_by(.) | all(.[]; length <= 2)' < <(state)
+	for i in $(seq 16); do
+		if jq -e '.error.code == "lock_busy"' "$S/queued/$i.json" >/dev/null; then
+			busy=$((busy + 1))
+			wrote=$((wrote + $(calls | jq --arg p "queued $i" '[.calls[] | select(.method == "PATCH" and .body.metadata["ibx.claim.purpose"] == $p)] | length')))
+		fi
+	done
+	is "all $busy lock_busy refusals write no reservation" "$wrote" 0
+	yes_ "the slow batch releases the lock and guard" eval '[ ! -e "$dir/claim.lock" ] && [ ! -e "$dir/claim.reap" ]'
+	yes_ "a usable busy lock never warns about continuing unlocked" \
+		eval '! grep -q "continuing with settle checks" "$S/queued/"*.err'
+}
+
+t_claim_mkdir_signals() {
+	group "claim: signals after mkdir and before the owner write"
+	local dir=$S/mkdir-state bin=$S/mkdir-bin kind real_mkdir
+	mkdir "$bin"
+	real_mkdir=$(command -v mkdir)
+	cat >"$bin/mkdir" <<EOF
+#!/bin/sh
+if [ "\$1" = "\$IBX_SIGNAL_MKDIR" ] && [ ! -e "$S/mkdir-signaled" ]; then
+	'$real_mkdir' "\$@" || exit
+	: >"$S/mkdir-signaled"
+	kill -TERM "\$PPID"
+	exit 0
+fi
+exec '$real_mkdir' "\$@"
+EOF
+	chmod +x "$bin/mkdir"
+	for kind in claim.lock claim.reap; do
+		rm -rf "$dir" "$S/mkdir-signaled"
+		reset '"seed":{"count":1}'
+		run IBX_STATE_DIR="$dir" PATH="$bin:$PATH" IBX_SIGNAL_MKDIR="$dir/$kind" claim --json x
+		rc_is "TERM during mkdir $kind returns 143" 143
+		is "TERM during mkdir $kind emits one interrupted JSON error" \
+			"$(jq -sc 'length == 1 and .[0].error.code == "interrupted"' "$S/out")" true
+		yes_ "TERM during mkdir $kind leaves neither empty directory" eval '[ ! -e "$dir/claim.lock" ] && [ ! -e "$dir/claim.reap" ]'
+		is "TERM during mkdir $kind writes nothing" "$(count PATCH .)" 0
+		run IBX_STATE_DIR="$dir" claim --json x
+		rc_is "the next claim after TERM during mkdir $kind acquires immediately" 0
+	done
+}
+
+t_closed_stderr() {
+	group "diagnostics: a closed stderr preserves JSON, status and reservations"
+	reset
+	run --closed-stderr release --json nosuchbox
+	rc_is "die in resolve with stderr closed retains exit 125" 125
+	is "die in resolve with stderr closed emits its failed JSON error" \
+		"$(jq -sc 'length == 1 and .[0].error.code == "failed" and (.[0].error.message | contains("nosuchbox"))' "$S/out")" true
+	hold box-1 0 tester
+	run --closed-stderr IBX_MAX_CLAIMS=1 claim --json x
+	rc_is "claim_limit with stderr closed retains exit 75" 75
+	is "claim_limit with stderr closed retains its JSON code" "$(jq -r .error.code "$S/out")" claim_limit
+	is "the cap refusal leaves the existing reservation alone" "$(claim_keys box-1)" 4
+	hold box-2 0 other
+	hold box-3 0 other
+	run --closed-stderr claim --json x
+	rc_is "no_free_sandbox with stderr closed retains exit 75" 75
+	is "the holder listing cannot replace the no-free JSON error" \
+		"$(jq -sc 'length == 1 and .[0].error.code == "no_free_sandbox" and (.[0].error.held | length == 3)' "$S/out")" true
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":403,"code":"permission_denied"}]'
+	run --closed-stderr claim --json x
+	rc_is "a warning after keeping a claim with stderr closed still succeeds" 0
+	is "the caller learns the held box and its warning with stderr closed" \
+		"$(jq -sc 'length == 1 and .[0].name == "box-1" and (.[0].warnings | length == 1)' "$S/out")" true
+	is "the successful warned claim is still held" "$(claim_keys box-1)" 4
+}
+
+t_claim_names() {
+	group "claim: session agent names"
+	local a b c var
+	for var in CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID; do
+		reset
+		run -u IBX_AGENT_NAME "$var=session-a" claim --json x
+		a=$(jq -r .by "$S/out")
+		run -u IBX_AGENT_NAME "$var=session-b" claim --json x
+		b=$(jq -r .by "$S/out")
+		run -u IBX_AGENT_NAME "$var=session-a" claim --json x
+		c=$(jq -r .by "$S/out")
+		yes_ "$var: different sessions get different names" [ "$a" != "$b" ]
+		is "$var: the same session keeps its name" "$a" "$c"
+		reset
+		run "$var=session-a" claim --json x
+		is "$var: IBX_AGENT_NAME overrides the session" "$(jq -r .by "$S/out")" tester
+	done
+	run -u IBX_AGENT_NAME CLAUDE_CODE_SESSION_ID=session-a CODEX_THREAD_ID=session-b doctor
+	out_has "doctor identifies the Claude session source" '^ok +agent: agent-[0-9]+ \(CLAUDE_CODE_SESSION_ID\); IBX_MAX_CLAIMS=3'
+	run -u IBX_AGENT_NAME CODEX_THREAD_ID=session-b doctor
+	out_has "doctor identifies the Codex thread source" '^ok +agent: agent-[0-9]+ \(CODEX_THREAD_ID\); IBX_MAX_CLAIMS=3'
+	run -u IBX_AGENT_NAME doctor
+	out_has "doctor identifies the host fallback" '^ok +agent: agent-[0-9]+ \(per host\); IBX_MAX_CLAIMS=3'
+	run IBX_MAX_CLAIMS=2 doctor
+	out_has "doctor identifies the explicit name and cap" '^ok +agent: tester \(IBX_AGENT_NAME\); IBX_MAX_CLAIMS=2'
+}
+
+lock_owner() { printf '%s\t%s\t%s\n' "$1" "$(uname -n)" "$(readlink /proc/self/ns/pid 2>/dev/null || true)"; }
+
+t_claim_lock() {
+	group "claim: mkdir lock recovery and state directory safety"
+	local dir=$S/lock-test kind t0 dead
+	sleep 0 & dead=$!; wait "$dead"
+	for kind in old-layout dead-owner empty old-file symlink old-live stale-reap dead-reap; do
+		rm -rf "$dir"
+		mkdir -p "$dir"
+		case "$kind" in
+		old-layout)
+			mkdir -p "$dir/claim.lock/reap"; printf '99999999\n' >"$dir/claim.lock/pid"
+			touch -t 200001010000 "$dir/claim.lock"
+			;;
+		dead-owner) mkdir "$dir/claim.lock"; lock_owner "$dead" >"$dir/claim.lock/pid" ;;
+		empty)
+			mkdir "$dir/claim.lock"
+			TZ=UTC touch -t "$(jq -nr 'now - 150 | strftime("%Y%m%d%H%M.%S")')" "$dir/claim.lock"
+			;;
+		dead-reap) mkdir "$dir/claim.reap"; lock_owner "$dead" >"$dir/claim.reap/pid" ;;
+		stale-reap)
+			mkdir "$dir/claim.reap"
+			lock_owner 99999999 >"$dir/claim.reap/pid"
+			TZ=UTC touch -t "$(jq -nr 'now - 150 | strftime("%Y%m%d%H%M.%S")')" "$dir/claim.reap"
+			;;
+		old-file) printf 'old flock file\n' >"$dir/claim.lock" ;;
+		symlink) ln -s "$S/lock-target" "$dir/claim.lock" ;;
+		old-live)
+			mkdir "$dir/claim.lock"; lock_owner "$$" >"$dir/claim.lock/pid"
+			touch -t 200001010000 "$dir/claim.lock"
+			;;
+		esac
+		reset '"seed":{"count":1}'
+		t0=$SECONDS
+		run IBX_STATE_DIR="$dir" claim --json x
+		rc_is "$kind: recovers the lock and claims" 0
+		yes_ "$kind: recovers quickly ($((SECONDS - t0)) s)" [ $((SECONDS - t0)) -lt 30 ]
+		yes_ "$kind: no claim.reap remains" [ ! -e "$dir/claim.reap" ]
+		err_lacks "$kind: no lock warning" 'local claim lock'
+		yes_ "$kind: no claim.lock remains" eval '[ ! -e "$dir/claim.lock" ] && [ ! -L "$dir/claim.lock" ]'
+	done
+	mkdir -p "$dir/claim.stale.old"
+	touch -t 200001010000 "$dir/claim.stale.old"
+	reset
+	run IBX_STATE_DIR="$dir" claim --json x
+	yes_ "old claim.stale directories are removed" [ ! -e "$dir/claim.stale.old" ]
+	reset
+	run -u IBX_STATE_DIR claim --json x
+	rc_is "claim uses XDG_STATE_HOME when IBX_STATE_DIR is unset" 0
+	yes_ "the default state directory is created" [ -d "$XDG_STATE_HOME/ibx" ]
+	printf 'file\n' >"$S/no-state"
+	reset
+	run IBX_STATE_DIR="$S/no-state/state" claim --json x
+	rc_is "an unavailable state directory still permits a claim" 0
+	is "the lock failure warns exactly once" "$(grep -c 'local claim lock' "$S/err")" 1
+	is "lock warning is included in JSON" "$(jq '.warnings | length' "$S/out")" 1
+	run IBX_STATE_DIR="$S/no-state/state" doctor
+	out_has "doctor warns when the state directory is not writable" '^warn +state directory is not writable'
+	for kind in symlink group-writable world-writable; do
+		rm -rf "$dir"
+		case "$kind" in
+		symlink) mkdir -p "$S/state-target"; ln -s "$S/state-target" "$dir" ;;
+		group-writable) mkdir "$dir"; chmod 770 "$dir" ;;
+		world-writable) mkdir "$dir"; chmod 707 "$dir" ;;
+		esac
+		reset
+		run IBX_STATE_DIR="$dir" claim --json x
+		rc_is "$kind state directory: claim still succeeds" 0
+		is "$kind state directory: one lock warning" "$(grep -c 'local claim lock' "$S/err")" 1
+		yes_ "$kind state directory: no lock created" [ ! -e "$dir/claim.lock" ]
+	done
+	rm -rf "$dir"
+	reset
+	run -u HOME -u IBX_STATE_DIR -u XDG_STATE_HOME claim --json x
+	rc_is "unset HOME does not abort claim" 0
+	err_has "no state directory can be derived: lock is disabled with a warning" 'local claim lock.*unknown state directory'
+	reset
+	run -u HOME ls
+	rc_is "unset HOME does not abort other commands" 0
+}
+
+t_claim_reaper() {
+	group "claim: reapers preserve mutual exclusion and foreign owners"
+	local dir=$S/reaper-state bin=$S/reaper-bin worker=$S/lock-worker funcs=$S/lock-functions a b rc
+	mkdir -p "$dir" "$bin"
+	# Exercise the actual lock functions without API latency masking the interleaving.
+	python3 - "$IBX" "$funcs" <<'PYCODE'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+Path(sys.argv[2]).write_text('state_dir_ok() {' + source.split('state_dir_ok() {', 1)[1].split('\nheld_claims() {', 1)[0])
+PYCODE
+	cat >"$worker" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+STATE_DIR=$1
+LOCK_HOST=$(uname -n)
+LOCK_NS=$(readlink /proc/self/ns/pid 2>/dev/null) || LOCK_NS=
+LOCK_OWNER=$(printf '%s\t%s\t%s' "$$" "$LOCK_HOST" "$LOCK_NS")
+claim_lock_kind= claim_lock_disabled= reap_lock_held=
+sleep_for() { sleep "$1" & wait $!; }
+warn() { printf '%s\n' "$*" >&2; }
+# shellcheck disable=SC1090
+source "$2"
+trap 'claim_unlock; reap_unlock' EXIT
+trap 'exit 143' TERM
+if [ "$3" = stale ]; then lock_stale "$STATE_DIR/claim.lock"; exit; fi
+if [ "$3" = reap ]; then reap_claim_lock; exit; fi
+claim_lock
+if ! mkdir "$STATE_DIR/critical"; then touch "$STATE_DIR/violation"; exit 1; fi
+touch "$STATE_DIR/entered.$3"
+sleep 0.3 & wait $!
+rmdir "$STATE_DIR/critical"
+SH
+	cat >"$bin/mv" <<EOF
+#!/bin/sh
+if [ "\${DELAY_REAP:-}" = 1 ] && [ "\$1" = "$dir/claim.lock" ]; then
+	: >"$dir/ready"
+	while [ ! -e "$dir/go" ]; do sleep 0.05; done
+fi
+exec '$(command -v mv)' "\$@"
+EOF
+	chmod +x "$worker" "$bin/mv"
+	mkdir "$dir/claim.lock"
+	lock_owner 99999999 >"$dir/claim.lock/pid"
+	DELAY_REAP=1 PATH="$bin:$PATH" "$worker" "$dir" "$funcs" a >"$S/reaper-a.out" 2>"$S/reaper-a.err" & a=$!
+	for _ in $(seq 100); do [ -e "$dir/ready" ] && break; sleep 0.05; done
+	yes_ "the first reaper pauses before its rename" [ -e "$dir/ready" ]
+	"$worker" "$dir" "$funcs" b >"$S/reaper-b.out" 2>"$S/reaper-b.err" & b=$!
+	sleep 0.3
+	yes_ "another process cannot reap or enter while the first reaper is delayed" [ ! -e "$dir/entered.b" ]
+	: >"$dir/go"
+	wait "$a"; rc=$?
+	is "the delayed reaper eventually acquires" "$rc" 0
+	wait "$b"; rc=$?
+	is "the other process eventually acquires" "$rc" 0
+	yes_ "the delayed rename preserves mutual exclusion" [ ! -e "$dir/violation" ]
+	yes_ "both lock and reaper guard are released" eval '[ ! -e "$dir/claim.lock" ] && [ ! -e "$dir/claim.reap" ]'
+
+	# A client outside the guard can replace the lock; a mismatched live owner must survive.
+	rm -f "$dir/ready" "$dir/go"
+	mkdir "$dir/claim.lock"
+	lock_owner 99999999 >"$dir/claim.lock/pid"
+	DELAY_REAP=1 PATH="$bin:$PATH" "$worker" "$dir" "$funcs" reap >"$S/reaper-a.out" 2>"$S/reaper-a.err" & a=$!
+	for _ in $(seq 100); do [ -e "$dir/ready" ] && break; sleep 0.05; done
+	rm -rf "$dir/claim.lock"
+	mkdir "$dir/claim.lock"
+	lock_owner "$$" >"$dir/claim.lock/pid"
+	: >"$dir/go"
+	wait "$a"
+	is "a moved lock with a different live owner is restored" "$(cat "$dir/claim.lock/pid")" "$(lock_owner "$$")"
+	yes_ "mismatch recovery releases the guard" [ ! -e "$dir/claim.reap" ]
+	printf '99999999\t%s\tforeign-namespace\n' "$(uname -n)" >"$dir/claim.lock/pid"
+	"$worker" "$dir" "$funcs" stale; rc=$?
+	is "a foreign namespace's dead-looking pid does not make a fresh lock stale" "$rc" 1
+	printf '99999999\tforeign-host\t%s\n' "$(readlink /proc/self/ns/pid 2>/dev/null || true)" >"$dir/claim.lock/pid"
+	"$worker" "$dir" "$funcs" stale; rc=$?
+	is "a foreign host's dead-looking pid does not make a fresh lock stale" "$rc" 1
+	rm -rf "$dir/claim.lock"
+}
+
+signal_claim() { # arguments for ibx claim; reset SIGINT, which bash ignores in background jobs
+	python3 -c 'import os,signal,sys; signal.signal(signal.SIGINT,signal.SIG_DFL); os.execv(sys.argv[1],sys.argv[1:])' \
+		"$IBX" claim "$@" >"$S/out" 2>"$S/err" </dev/null &
+	SIGNAL_PID=$!
+}
+t_claim_signals() {
+	group "claim: interruption JSON and lock release"
+	local sig expected phase dir=$S/signal-state t0 sleepbin=$S/signal-sleep
+	mkdir "$sleepbin"
+	# Stretch short waits so scheduler jitter cannot look like a deferred signal.
+	cat >"$sleepbin/sleep" <<EOF
+#!/bin/sh
+if [ "\${IBX_SLEEP_EXPECT:-}" = "\$1" ]; then
+	: >"\$IBX_SLEEP_MARKER"
+	exec '$(command -v sleep)' 20
+fi
+exec '$(command -v sleep)' "\$@"
+EOF
+	chmod +x "$sleepbin/sleep"
+	for sig in TERM INT; do
+		expected=143
+		[ "$sig" != INT ] || expected=130
+		for phase in waiting patch settle relook notready opwait kept; do
+			rm -rf "$dir"
+			reset '"seed":{"count":1}'
+			case "$phase" in
+			waiting) mkdir -p "$dir/claim.lock"; lock_owner "$$" >"$dir/claim.lock/pid" ;;
+			relook) ctl '{"opDelay":120,"set":{"box-1":{"state":"creating"}}}' ;;
+			notready) ctl '{"set":{"box-1":{"ready":false}}}' ;;
+			opwait) ctl '{"set":{"box-1":{"state":"suspended"}},"faults":[{"kind":"error","method":"GET","match":"/v1/operations/","status":403,"code":"permission_denied","count":100}]}' ;;
+			patch) ctl '{"faults":[{"kind":"delay","method":"PATCH","seconds":2}]}' ;;
+			kept) ctl '{"faults":[{"kind":"delay","method":"PUT","match":"/activity-leases/","seconds":2}]}' ;;
+			esac
+			rm -f "$S/sleep-ready"
+			local expect=
+			case $phase in settle | relook) expect=20 ;; notready | opwait) expect=3 ;; esac
+			IBX_STATE_DIR=$dir PATH="$sleepbin:$PATH" IBX_SLEEP_EXPECT=$expect IBX_SLEEP_MARKER=$S/sleep-ready \
+				IBX_CLAIM_SETTLE="$(if [ "$phase" = settle ]; then echo '20 5'; else echo '0.2 0.1'; fi)" signal_claim --json x
+			for _ in $(seq 600); do
+				case "$phase" in
+				waiting) [ "$(count GET '^/v1/machines/m_[a-z2-7]{26}$')" -gt 0 ] && break ;;
+				settle | relook | notready | opwait) [ -e "$S/sleep-ready" ] && break ;;
+				patch) [ "$(count PATCH .)" -gt 0 ] && break ;;
+				kept) [ "$(count PUT '/activity-leases/')" -gt 0 ] && break ;;
+				esac
+				sleep 0.05
+			done
+			sleep 0.15
+			t0=$SECONDS
+			kill -"$sig" "$SIGNAL_PID"
+			wait "$SIGNAL_PID"
+			RC=$? TIMEDOUT=
+			rc_is "$sig during $phase: usual exit status" "$expected"
+			is "$sig during $phase: exactly one interrupted JSON object" \
+				"$(jq -sc 'length == 1 and .[0].error.code == "interrupted"' "$S/out")" true
+			if [ "$phase" = settle ] || [ "$phase" = relook ] || [ "$phase" = notready ] || [ "$phase" = opwait ]; then
+				yes_ "$sig during $phase: entered the intended sleep" [ -e "$S/sleep-ready" ]
+				yes_ "$sig during $phase: interrupts a 20-second sleep promptly ($((SECONDS - t0)) s)" [ $((SECONDS - t0)) -lt 10 ]
+			fi
+			if [ "$phase" = waiting ]; then
+				yes_ "$sig while waiting: responds at once" [ $((SECONDS - t0)) -lt 3 ]
+				is "$sig while waiting: the other owner remains" "$(cat "$dir/claim.lock/pid")" "$(lock_owner "$$")"
+				rm -rf "$dir/claim.lock"
+			else
+				yes_ "$sig during $phase: no claim.lock remains" [ ! -e "$dir/claim.lock" ]
+			fi
+			if [ "$phase" = kept ]; then
+				is "$sig after keep: the caller learns the reserved box" "$(jq -c '.error.held | map({name,id})' "$S/out")" \
+					"$(state | jq -c '[.machines[] | {name,id}]')"
+				is "$sig after keep: the reservation is still held" "$(claim_keys box-1)" 4
+			else
+				is "$sig during $phase: no reservation remains" "$(claim_keys box-1)" 0
+			fi
+		done
+	done
+	reset '"seed":{"count":1},"faults":[{"kind":"delay","method":"PUT","match":"/activity-leases/","seconds":2}]'
+	IBX_STATE_DIR=$dir signal_claim x
+	for _ in $(seq 600); do [ "$(count PUT '/activity-leases/')" -gt 0 ] && break; sleep 0.05; done
+	yes_ "plain claim reaches the keep stage before interruption" [ "$(count PUT '/activity-leases/')" -gt 0 ]
+	kill -TERM "$SIGNAL_PID"
+	wait "$SIGNAL_PID"
+	RC=$? TIMEDOUT=
+	rc_is "plain claim interrupted after keep: exit 143" 143
+	err_has "plain interruption names the sandbox to release" 'sandbox still reserved: box-1'
+	yes_ "plain interruption leaves no claim.lock" [ ! -e "$dir/claim.lock" ]
+	local failbin=$S/fail-jq real_jq
+	mkdir -p "$failbin"
+	real_jq=$(command -v jq)
+	cat >"$failbin/jq" <<EOF
+#!/bin/sh
+case "\$*" in *'.expiresAt | clean'*) exit 17 ;; esac
+exec '$real_jq' "\$@"
+EOF
+	chmod +x "$failbin/jq"
+	reset '"seed":{"count":1}'
+	run PATH="$failbin:$PATH" claim --json x
+	rc_is "an unhandled command failure keeps its status" 17
+	is "cleanup backstop emits exactly one failed JSON object" \
+		"$(jq -sc 'length == 1 and .[0].error.code == "failed" and .[0].error.message == "exit 17"' "$S/out")" true
+	is "a failed backstop with a kept claim tells the caller which box to release" \
+		"$(jq -c '.error.held | map(.name)' "$S/out")" '["box-1"]'
+	yes_ "the cleanup backstop leaves no claim.lock" [ ! -e "$IBX_STATE_DIR/claim.lock" ]
+
+}
+
+t_claim_signal_commit() {
+	group "claim: atomic keep and JSON emission during interruption"
+	local copy=$S/commit-ibx marker=$S/commit-ready original=$IBX pid rc bin=$S/json-write-bin real_jq
+	# Pause immediately after the keep assignment, before the claimed_ids update.
+	python3 - "$IBX" "$copy" <<'PYCODE'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+source = source.replace('\t\t\tclaimed_ids=("${claimed_ids[@]/$id/}")', '\t\t\t: >"$IBX_COMMIT_MARKER"\n\t\t\tsleep_for 20\n\t\t\tclaimed_ids=("${claimed_ids[@]/$id/}")', 1)
+Path(sys.argv[2]).write_text(source)
+PYCODE
+	chmod +x "$copy"
+	reset '"seed":{"count":1}'
+	IBX=$copy IBX_COMMIT_MARKER=$marker signal_claim --json x
+	for _ in $(seq 100); do [ -e "$marker" ] && break; sleep 0.05; done
+	yes_ "the claim pauses at its keep commit point" [ -e "$marker" ]
+	kill -TERM "$SIGNAL_PID"
+	wait "$SIGNAL_PID"; RC=$? TIMEDOUT=
+	rc_is "interruption at the keep commit point exits 143" 143
+	is "interruption at the keep commit point reports one held box" "$(jq -sc 'length == 1 and .[0].error.code == "interrupted" and .[0].error.held[0].name == "box-1"' "$S/out")" true
+	is "cleanup preserves the box reported as kept" "$(claim_keys box-1)" 4
+	yes_ "the commit-point interruption leaves no lock" [ ! -e "$IBX_STATE_DIR/claim.lock" ]
+
+	reset '"seed":{"count":1}'
+	python3 - "$original" "$BASE" "$S/out" "$S/err" <<'PYCODE'
+import json, os, signal, subprocess, sys, time, urllib.request
+proc = subprocess.Popen([sys.argv[1], 'claim', '--json', 'pipe interruption'],
+                        env=dict(os.environ, IBX_CLAIM_SETTLE='20 5'),
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+try:
+    for _ in range(200):
+        with urllib.request.urlopen(sys.argv[2] + '/_calls') as reply:
+            calls = json.load(reply)['calls']
+        if any(call['method'] == 'PATCH' for call in calls):
+            break
+        time.sleep(0.05)
+    time.sleep(0.15)
+    proc.send_signal(signal.SIGTERM)
+    out, err = proc.communicate(timeout=3)
+    status = 0 if proc.returncode == 143 else 1
+except subprocess.TimeoutExpired:
+    proc.kill()
+    out, err = proc.communicate(timeout=25)
+    status = 1
+finally:
+    from pathlib import Path
+    Path(sys.argv[3]).write_bytes(out)
+    Path(sys.argv[4]).write_bytes(err)
+sys.exit(status)
+PYCODE
+	RC=$? TIMEDOUT=
+	rc_is "interrupted settle closes stdout pipes promptly, including the sleep child's copy" 0
+	is "pipe interruption returns one JSON error" "$(jq -sc 'length == 1 and .[0].error.code == "interrupted"' "$S/out")" true
+	is "pipe interruption releases the reservation" "$(claim_keys box-1)" 0
+
+	# Interrupt while a failed error object is only partially written to its candidate file.
+	mkdir "$bin"
+	real_jq=$(command -v jq)
+	cat >"$bin/jq" <<EOF
+#!/bin/sh
+case "\$*" in *'--arg c failed'*)
+	printf '{'
+	: >"$S/json-write-ready"
+	sleep 0.5
+	exit 17
+	;;
+esac
+exec '$real_jq' "\$@"
+EOF
+	chmod +x "$bin/jq"
+	PATH="$bin:$PATH" "$original" claim --json --unknown >"$S/out" 2>"$S/err" </dev/null & pid=$!
+	for _ in $(seq 100); do [ -e "$S/json-write-ready" ] && break; sleep 0.05; done
+	kill -TERM "$pid"
+	wait "$pid"; RC=$? TIMEDOUT=
+	rc_is "interruption while writing a JSON error exits 143" 143
+	is "a partial candidate never suppresses the interrupted JSON object" "$(jq -sc 'length == 1 and .[0].error.code == "interrupted"' "$S/out")" true
+	# A cleanup serialization failure must preserve the original status and still remove tmp.
+	cat >"$bin/jq" <<EOF
+#!/bin/sh
+case "\$*" in *'. + {warnings:'*) exit 19 ;; esac
+exec '$real_jq' "\$@"
+EOF
+	run PATH="$bin:$PATH" release --json nosuchbox
+	rc_is "cleanup serialization failure preserves the original exit status" 125
+	is "cleanup serialization failure returns one fixed error object" "$(jq -sc 'length == 1 and .[0].error.code == "failed"' "$S/out")" true
+	is "cleanup removes temporary directories even after a failing command" "$(find "$TMPDIR" -maxdepth 1 -name 'ibx.*' | wc -l | tr -d ' ')" 0
+	# No API-backed command should run under the altered test copy after this group.
+	IBX=$original
+}
+
+t_claim_fresh() {
+	group "claim: recheck the GET used for the metadata write"
+	reset '"seed":{"count":1},"faults":[{"kind":"delay","method":"GET","match":"^/v1/machines/m_[a-z2-7]{26}$","skip":1,"seconds":2}]'
+	local pid
+	"$IBX" claim --json x >"$S/out" 2>"$S/err" </dev/null &
+	pid=$!
+	for _ in $(seq 100); do
+		[ "$(count GET '^/v1/machines/m_[a-z2-7]{26}$')" -ge 2 ] && break
+		sleep 0.05
+	done
+	hold box-1 0 another-computer
+	wait "$pid"
+	RC=$? TIMEDOUT=
+	rc_is "claim skips a candidate reserved during its final GET" 75
+	is "the other computer's reservation is kept" "$(box box-1 '.metadata["ibx.claim.by"]')" another-computer
+	is "the final GET guard prevents the PATCH" "$(count PATCH .)" 0
+}
+
+t_claim_json() {
+	group "claim, renew and release JSON"
+	reset '"seed":{"count":1},"set":{"box-1":{"ports":[{"port":8080,"name":"ibx:old"},{"port":8081,"name":"manual"}]}}'
+	run claim x --json
+	rc_is "claim accepts --json after the purpose" 0
+	is "claim JSON keys" "$(jq -c 'keys' "$S/out")" '["by","id","leaseUntil","name","publicPorts","purpose","since","warnings"]'
+	is "claim JSON includes public ports" "$(jq -c '[.publicPorts[].port]' "$S/out")" '[8080,8081]'
+	yes_ "claim JSON includes lease expiry and warnings" jq -e '.leaseUntil | type == "string"' "$S/out"
+	is "claim JSON collects each port warning" "$(jq '.warnings | length' "$S/out")" 3
+	run renew --json box-1
+	rc_is "renew --json succeeds" 0
+	is "renew JSON keys" "$(jq -c 'keys' "$S/out")" '["abandonedAfter","by","id","name","since","warnings"]'
+	is "renew JSON since matches the written timestamp" "$(jq -r .since "$S/out")" "$(box box-1 '.metadata["ibx.claim.at"]')"
+	is "renew has no warnings" "$(jq -c .warnings "$S/out")" '[]'
+	run release box-1 --json
+	rc_is "release accepts --json after the box" 0
+	is "release JSON keys" "$(jq -c 'keys' "$S/out")" '["id","leftAlone","name","unpublished","warnings","was"]'
+	is "release JSON lists unpublished and untouched ports" "$(jq -c '[.unpublished, [.leftAlone[].port], .was.by]' "$S/out")" '[[8080],[8081],"tester"]'
+	is "release JSON collects its warning" "$(jq '.warnings | length' "$S/out")" 1
+	run release --json box-1
+	is "release JSON was is null without a reservation" "$(jq -c .was "$S/out")" null
+	run release --json nosuchbox
+	rc_is "a die inside resolve exits 125" 125
+	is "a die inside resolve emits exactly one JSON object to original stdout" \
+		"$(jq -sc 'length == 1 and .[0].error.code == "failed" and (.[0].warnings == [])' "$S/out")" true
+	err_has "a die inside resolve keeps the usual stderr" 'no sandbox named nosuchbox'
+	reset
+	hold box-1 10 someone
+	hold box-2 10 someone-else
+	hold box-3 10 third
+	run claim --json x
+	rc_is "no free sandbox JSON exits 75" 75
+	is "no free sandbox JSON has one object and holders" \
+		"$(jq -sc 'length == 1 and .[0].error.code == "no_free_sandbox" and (.[0].error.held | length == 3)' "$S/out")" true
+	err_has "no free sandbox stderr lists holders and purpose" 'box-1: held by someone since .*: earlier job'
+	reset '"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":403,"code":"permission_denied"}]'
+	run claim --json x
+	rc_is "a failed lease still returns a successful claim" 0
+	is "a failed lease has a null expiry" "$(jq -c .leaseUntil "$S/out")" null
+	is "the lease warning is included" "$(jq '.warnings | length' "$S/out")" 1
+	ctl "$(jq -cn --arg at "$(ago 10)" '{reset:true,seed:{count:1},set:{"box-1":{
+		name:"evil\u001b[2Jbox",mergeMetadata:{"ibx.claim.by":"other\u0007", "ibx.claim.at":$at,
+		"ibx.claim.purpose":"job\u001b[31m", "ibx.claim.token":"other-token"},
+		ports:[{port:8081,name:"manual\u0007",url:"https://a.mock.invalid/\u001b[2J"}]}}}')"
+	local id
+	id=$(state | jq -r '.machines[0].id')
+	run claim --json x
+	rc_is "hostile holder strings still give exit 75" 75
+	is "JSON holders are cleaned" "$(jq -c '.error.held[0] | [.name,.by,.purpose]' "$S/out")" '["evil [2Jbox","other ","job [31m"]'
+	yes_ "the holder message has no terminal controls" eval '! has_ctl "$S/out" "$S/err"'
+	run renew "$id" --json
+	is "renew JSON cleans API strings" "$(jq -c '[.name,.by]' "$S/out")" '["evil [2Jbox","other "]'
+	run release --json "$id"
+	is "release JSON cleans previous holder and public ports" \
+		"$(jq -c '[.name,.was.by,.leftAlone[0].name,.leftAlone[0].url]' "$S/out")" \
+		'["evil [2Jbox","other ","manual ","https://a.mock.invalid/ [2J"]'
+	run claim --json x
+	is "claim JSON cleans the API name and public port fields" \
+		"$(jq -c '[.name,.publicPorts[0].name,.publicPorts[0].url]' "$S/out")" \
+		'["evil [2Jbox","manual ","https://a.mock.invalid/ [2J"]'
+
+	reset
+	printf '%s\n' "$KEY" >"$S/json-key"
+	chmod 644 "$S/json-key"
+	run -u INSTABOX_API_KEY IBX_KEY_FILE="$S/json-key" release --json nosuchbox
+	is "warnings before a resolve error survive subshells" "$(jq '.warnings | length' "$S/out")" 1
+}
+
+t_claim_errors() {
+	group "claim: dependency errors, final listing and malformed ports"
+	local nojq=$S/nojq dep spy=$S/fd-spy real_curl
+	mkdir -p "$nojq"
+	for dep in bash uname readlink cksum cut mktemp sed grep curl awk rm ln cat; do
+		ln -s "$(command -v "$dep")" "$nojq/$dep"
+	done
+	run PATH="$nojq" claim --json x
+	rc_is "missing jq preserves die's exit 125 in JSON mode" 125
+	err_has "missing jq reports the dependency" 'jq is missing'
+	err_lacks "missing jq does not try to emit JSON through a missing program" 'jq: command not found'
+	is "missing jq still emits one fixed JSON error" "$(jq -sc 'length == 1 and .[0].error.code == "failed" and .[0].error.message == "jq is missing"' "$S/out")" true
+	local failtmp=$S/fail-mktemp
+	mkdir "$failtmp"
+	printf '#!/bin/sh\nexit 1\n' >"$failtmp/mktemp"
+	chmod +x "$failtmp/mktemp"
+	run PATH="$failtmp:$PATH" claim --json x
+	rc_is "mktemp failure exits 125" 125
+	is "mktemp failure still emits exactly one JSON error" "$(jq -sc 'length == 1 and .[0].error.code == "failed"' "$S/out")" true
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/ports$","status":403,"code":"permission_denied"}]'
+	run claim --json x
+	rc_is "a failed public ports listing still returns the claim" 0
+	is "failed public ports listing is explicit in JSON" "$(jq -c '.publicPorts' "$S/out")" null
+	yes_ "failed public ports listing includes the recovery warning" jq -e '.warnings | any(test("could not list the public ports of box-1; check with ibx release"))' "$S/out"
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"^/v1/machines$","skip":1,"count":4,"status":503,"code":"unavailable"}]'
+	hold box-1 0 someone
+	run claim --json x
+	rc_is "no free sandbox does not depend on a redundant final listing" 75
+	is "no free sandbox uses its existing listing" "$(count GET '^/v1/machines$')" 1
+	is "no free sandbox still emits one structured refusal" \
+		"$(jq -sc 'length == 1 and .[0].error.code == "no_free_sandbox"' "$S/out")" true
+	reset '"seed":{"count":1},"set":{"box-1":{"rawPorts":[{"port":"8080","name":"ibx:string","url":"bad-string"},{"port":"bad\u001b[2J","name":"ibx:escape","url":"bad-escape"},{"port":-5,"name":"ibx:negative","url":"bad-negative"},{"port":8080.5,"name":"ibx:fraction","url":"bad-fraction"},{"port":8081,"name":"manual","url":"https://valid.mock.invalid"}]}}'
+	run claim --json x
+	rc_is "claim ignores malformed public port numbers" 0
+	is "only the numeric integer public port is reported" "$(jq -c '[.publicPorts[].port]' "$S/out")" '[8081]'
+	err_lacks "malformed public ports are not printed" 'bad-string|bad-escape|bad-negative|bad-fraction'
+	run release --json box-1
+	rc_is "release ignores malformed public port numbers" 0
+	is "release reports only the valid manual port" "$(jq -c '[.leftAlone[].port]' "$S/out")" '[8081]'
+	is "no malformed port reaches an API path" "$(count DELETE '/ports/')" 0
+	run claim one two
+	rc_is "an unquoted multiword purpose is rejected" 125
+	err_has "claim explains that its purpose is ONE quoted argument" 'purpose must be ONE quoted argument'
+	if [ -d /proc/self/fd ]; then
+		mkdir -p "$spy"
+		real_curl=$(command -v curl)
+		cat >"$spy/curl" <<EOF
+#!/bin/sh
+for fd in /proc/\$\$/fd/*; do
+	[ "\$(readlink "\$fd" 2>/dev/null)" != "$S/out" ] || printf '%s\n' "\$fd" >>"$S/extra-stdout"
+done
+exec '$real_curl' "\$@"
+EOF
+		chmod +x "$spy/curl"
+		reset
+		: >"$S/extra-stdout"
+		run PATH="$spy:$PATH" ls
+		yes_ "plain commands do not leak a copy of stdout to curl" [ ! -s "$S/extra-stdout" ]
+		run PATH="$spy:$PATH" release --json nosuchbox
+		yes_ "JSON commands retain the original stdout for subshell errors" [ -s "$S/extra-stdout" ]
+	fi
 }
 
 t_claim_states() {
@@ -755,6 +1542,58 @@ t_exec() {
 		rc_is "$code: exec fails with 125" 125
 		err_has "$code: it says the command did not run" 'exec rejected \(the command did not run\)'
 		is "$code: and does not retry" "$(count POST '/exec$')" 1
+	done
+}
+
+t_exec_wait_signals() {
+	group "exec: interrupted retry sleeps close stdout pipes"
+	local bin=$S/exec-sleep kind marker=$S/exec-sleep-ready real_sleep
+	mkdir "$bin"
+	real_sleep=$(command -v sleep)
+	cat >"$bin/sleep" <<EOF
+#!/bin/sh
+printf '%s\\n' "\$\$" >"\$IBX_EXEC_SLEEP_MARKER"
+exec '$real_sleep' 20
+EOF
+	chmod +x "$bin/sleep"
+	for kind in quota host; do
+		rm -f "$marker"
+		case $kind in
+		quota) reset '"quotaExecs":100' ;;
+		host) reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":503,"code":"host_unavailable","retryable":true,"count":100}]' ;;
+		esac
+		PATH="$bin:$PATH" IBX_EXEC_SLEEP_MARKER=$marker python3 - "$IBX" "$marker" "$S/out" "$S/err" <<'PYCODE'
+from pathlib import Path
+import os, signal, subprocess, sys, time
+proc = subprocess.Popen([sys.argv[1], 'exec', 'box-1', '--', 'true'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+for _ in range(600):
+    if Path(sys.argv[2]).exists():
+        break
+    time.sleep(0.05)
+ready = Path(sys.argv[2]).exists()
+proc.send_signal(signal.SIGTERM)
+try:
+    out, err = proc.communicate(timeout=10)
+    status = 0 if ready and proc.returncode == 143 else 1
+except subprocess.TimeoutExpired:
+    proc.kill()
+    out, err = proc.communicate(timeout=25)
+    status = 1
+Path(sys.argv[3]).write_bytes(out)
+Path(sys.argv[4]).write_bytes(err)
+if ready:
+    try:
+        os.kill(int(Path(sys.argv[2]).read_text()), 0)
+        status = 1
+    except ProcessLookupError:
+        pass
+sys.exit(status)
+PYCODE
+		RC=$? TIMEDOUT=
+		rc_is "$kind: interrupt closes the pipes and reaps the sleep promptly" 0
+		err_has "$kind: the caller sees the interruption warning" 'interrupted by SIGTERM'
+		is "$kind: no exec is retried after interruption" "$(count POST '/exec$')" 1
 	done
 }
 
@@ -1155,6 +1994,23 @@ t_ssh() {
 		skip "ssh is not installed"
 		return 0
 	fi
+	local fake=$S/fake-ssh
+	mkdir "$fake"
+	cat >"$fake/ssh" <<'SH'
+#!/bin/sh
+printf '%s\n' "$@" >"$SSH_ARGS_FILE"
+SH
+	chmod +x "$fake/ssh"
+	local remote
+	for remote in '-- grep --help' 'grep --help' 'grep -h'; do
+		reset
+		# shellcheck disable=SC2086 # fixed arguments deliberately split into words
+		run PATH="$fake:$PATH" SSH_ARGS_FILE="$S/ssh-args" ssh box-1 $remote
+		rc_is "ssh box-1 $remote reaches ssh successfully" 0
+		yes_ "ssh preserves the remote flag in $remote" grep -Eq -- '^grep (--help|-h) ?$' "$S/ssh-args"
+		is "ssh $remote creates a token" "$(count POST '/ssh-tokens$')" 1
+		is "ssh $remote revokes its token" "$(box box-1 '[.tokens[] | .revoked]')" '[true]'
+	done
 	reset '"set":{"box-2":{"state":"suspended"}}'
 	run ssh box-1 'echo hi'
 	rc_is "ssh that cannot connect exits 255" 255
@@ -1167,6 +2023,7 @@ t_ssh() {
 	rc_is "ssh without a sandbox is a usage error" 125
 }
 
+# shellcheck disable=SC2088 # literal tildes exercise installer expansion
 t_install() {
 	group "install.sh (a scratch HOME and a fake systemctl; never the real ones)"
 	local ih=$S/ihome fb=$S/fakebin ab=$S/absbin sh=bash repo unit timer skills
@@ -1182,7 +2039,10 @@ t_install() {
 	timer=$ih/.config/systemd/user/ibx-keepalive.timer
 	skills=$ih/.claude/skills
 	inst() { # install.sh ARGS, in the scratch HOME and from it, with a relative PATH entry first
-		(cd "$ih" && env -u XDG_CONFIG_HOME -u IBX_KEY_FILE -u INSTABOX_KEY_FILE -u CODEX_HOME \
+		local envs=(env -u XDG_CONFIG_HOME -u IBX_KEY_FILE -u INSTABOX_KEY_FILE -u CODEX_HOME)
+		[ -z "${INSTALL_CODEX_HOME:-}" ] || envs+=("CODEX_HOME=$INSTALL_CODEX_HOME")
+		[ -z "${INSTALL_XDG_CONFIG_HOME:-}" ] || envs+=("XDG_CONFIG_HOME=$INSTALL_XDG_CONFIG_HOME")
+		(cd "$ih" && "${envs[@]}" \
 			HOME="$ih" PATH="relbin:$ab:$fb:$PATH" IBX_INSTALL_OS="${INST_OS:-Linux}" "$sh" "$repo/install.sh" "$@") \
 			>"$S/out" 2>"$S/err" </dev/null
 		RC=$? TIMEDOUT=
@@ -1244,6 +2104,75 @@ t_install() {
 	yes_ "removes what it installed" eval '[ ! -e "$skills/ibx" ] && [ ! -L "$ih/bin/ibx" ] && [ ! -e "$unit" ] && [ ! -e "$timer" ]'
 	yes_ "and leaves the planted symlinks alone" eval '[ -L "$unit.ibx-new" ] && [ "$(cat "$S/precious")" = precious ]'
 	yes_ "(the fake systemctl disabled the timer)" grep -qx -- '--user disable --now ibx-keepalive.timer' "$S/systemctl.log"
+	local config=$ih/.claude-proxy
+	CLAUDE_CONFIG_DIR=$config inst --dry-run --agents claude --no-bin
+	rc_is "custom Claude config dry run" 0
+	out_has "dry run targets CLAUDE_CONFIG_DIR" 'would link +~/.claude-proxy/skills/ibx'
+	yes_ "custom Claude dry run changes nothing" [ ! -e "$config" ]
+	mkdir -p "$config/skills"
+	ln -s "$repo/skills/ibx" "$config/skills/ibx"
+	CLAUDE_CONFIG_DIR=$config inst --agents claude --no-bin
+	rc_is "a hand-made symlink in CLAUDE_CONFIG_DIR is accepted" 0
+	out_has "the existing custom-config link is already installed" '^up to date +~/.claude-proxy/skills/ibx'
+	CLAUDE_CONFIG_DIR=$config inst --uninstall --dry-run --agents claude --no-bin
+	rc_is "custom Claude uninstall dry run" 0
+	out_has "uninstall dry run targets CLAUDE_CONFIG_DIR" 'would remove +~/.claude-proxy/skills/ibx'
+	yes_ "uninstall dry run preserves the hand-made symlink" [ -L "$config/skills/ibx" ]
+	CLAUDE_CONFIG_DIR=$config inst --uninstall --agents claude --no-bin
+	rc_is "custom Claude uninstall accepts the hand-made symlink" 0
+	yes_ "custom Claude uninstall removes its link" [ ! -L "$config/skills/ibx" ]
+	CLAUDE_CONFIG_DIR=$config inst --agents claude --no-bin
+	rc_is "install creates a custom Claude skill link" 0
+	is "the custom Claude link targets this clone" "$(readlink "$config/skills/ibx")" "$repo/skills/ibx"
+	yes_ "custom Claude install does not create a default Claude link" [ ! -L "$skills/ibx" ]
+	ln -s "$repo/skills/ibx" "$skills/ibx"
+	CLAUDE_CONFIG_DIR=$config inst --uninstall --no-bin
+	rc_is "uninstall without an explicit agent list follows CLAUDE_CONFIG_DIR" 0
+	yes_ "uninstall without an agent list removes the custom link" [ ! -L "$config/skills/ibx" ]
+	yes_ "uninstall with a custom config also removes the default Claude link" [ ! -L "$skills/ibx" ]
+	CLAUDE_CONFIG_DIR='~/.claude-copy///' inst --copy --agents claude --bin "$ih/bin" --keepalive
+	rc_is "copy install expands a literal tilde in CLAUDE_CONFIG_DIR" 0
+	is "the command points at an absolute copied helper" "$(readlink "$ih/bin/ibx")" "$ih/.claude-copy/skills/ibx/scripts/ibx"
+	yes_ "the copied command target exists" [ -x "$ih/bin/ibx" ]
+	yes_ "the timer uses the command whose target is absolute" grep -qx "ExecStart=$ih/bin/ibx keepalive" "$unit"
+	CLAUDE_CONFIG_DIR='~/.claude-copy/' inst --copy --agents claude --bin "$ih/bin" --keepalive
+	rc_is "rerunning the normalized copy install succeeds" 0
+	yes_ "the copied command still resolves after rerunning" [ -x "$ih/bin/ibx" ]
+	CLAUDE_CONFIG_DIR='~/.claude-copy/' inst --copy --agents claude --no-bin --keepalive
+	rc_is "copy install without a bin link uses the normalized helper directly" 0
+	yes_ "without a bin link the timer uses the absolute copied helper" grep -qx "ExecStart=$ih/.claude-copy/skills/ibx/scripts/ibx keepalive" "$unit"
+	CLAUDE_CONFIG_DIR='~/.claude-copy' inst --uninstall --bin "$ih/bin"
+	INSTALL_CODEX_HOME='~/.codex-copy///' INSTALL_XDG_CONFIG_HOME='~/.config-copy///' inst --copy --agents codex,opencode --no-bin
+	rc_is "Codex and XDG config roots also expand a literal tilde" 0
+	yes_ "both normalized config roots contain the copied skill" eval '[ -f "$ih/.codex-copy/skills/ibx/SKILL.md" ] && [ -f "$ih/.config-copy/opencode/skills/ibx/SKILL.md" ]'
+	INSTALL_CODEX_HOME='~/.codex-copy' INSTALL_XDG_CONFIG_HOME='~/.config-copy' inst --uninstall --no-bin
+	local var
+	for var in CLAUDE_CONFIG_DIR INSTALL_CODEX_HOME INSTALL_XDG_CONFIG_HOME; do
+		case $var in
+		CLAUDE_CONFIG_DIR) CLAUDE_CONFIG_DIR=relative-config inst --copy --agents all --no-bin ;;
+		INSTALL_CODEX_HOME) INSTALL_CODEX_HOME=relative-config inst --copy --agents all --no-bin ;;
+		INSTALL_XDG_CONFIG_HOME) INSTALL_XDG_CONFIG_HOME=relative-config inst --copy --agents all --no-bin ;;
+		esac
+		rc_is "installer rejects relative $var" 1
+		err_has "relative $var explains the absolute path rule" 'must be an absolute path'
+		yes_ "relative $var creates no dangling destination" [ ! -e "$ih/relative-config" ]
+	done
+	mkdir -p "$ih/.shared-config/skills"
+	ln -s "$ih/.shared-config" "$ih/.alias-config"
+	CLAUDE_CONFIG_DIR="$ih/.shared-config" INSTALL_CODEX_HOME="$ih/.alias-config" inst --dry-run --agents claude,codex --no-bin
+	rc_is "dry run accepts config roots that resolve to the same place" 0
+	is "dry run lists a shared skill link exactly once" "$(grep -c '^would link ' "$S/out")" 1
+	CLAUDE_CONFIG_DIR="$ih/.shared-config" INSTALL_CODEX_HOME="$ih/.alias-config" inst --copy --agents claude,codex --no-bin
+	rc_is "copy install deduplicates physically identical roots" 0
+	is "the shared skill is copied exactly once" "$(grep -c '^copied ' "$S/out")" 1
+	CLAUDE_CONFIG_DIR="$ih/.shared-config" INSTALL_CODEX_HOME="$ih/.alias-config" inst --uninstall --dry-run --agents claude,codex --no-bin
+	is "uninstall dry run lists the shared copy exactly once" "$(grep -c '^would remove ' "$S/out")" 1
+	CLAUDE_CONFIG_DIR="$ih/.shared-config" INSTALL_CODEX_HOME="$ih/.alias-config" inst --uninstall --agents claude,codex --no-bin
+	rc_is "uninstall removes a shared root once" 0
+	yes_ "the shared copy is removed" [ ! -e "$ih/.shared-config/skills/ibx" ]
+	inst --help
+	out_has "installer help documents CLAUDE_CONFIG_DIR" 'CLAUDE_CONFIG_DIR/skills'
+
 }
 
 t_cleanup() {
@@ -1253,7 +2182,7 @@ t_cleanup() {
 
 start=$(date +%s)
 echo "ibx offline tests: $IBX against $BASE (exec: $EXEC_MODE)"
-for t in cli doctor pool ls claim claim_states renew release port keepalive exec exec_stdin sigterm retry files \
+for t in cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
 	put_guard poolonly vault hostile secrets ssh install cleanup; do
 	want "$t" && "t_$t"
 done

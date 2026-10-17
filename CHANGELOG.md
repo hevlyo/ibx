@@ -5,6 +5,58 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). The version is the one `ibx --version` prints.
 The Claude Code plugin manifests carry no version on purpose: plugin users get every commit.
 
+## 0.2.0 - 2026-10-17
+
+### Added
+
+- An atomic mkdir lock on every OS. Processes sharing a safe, user-owned state directory
+  serialize reservation writes and cap checks. A reaper guard protects stale-lock recovery,
+  and owner records include the host and PID namespace. Stale locks are reclaimed by atomic rename;
+  unsafe or unavailable state directories warn and leave the settle checks in place.
+- `IBX_MAX_CLAIMS`, default 3, limits live pool reservations per agent; 0 disables the cap.
+- Per-session default agent names in Claude Code (`CLAUDE_CODE_SESSION_ID`) and Codex
+  (`CODEX_THREAD_ID`), with the previous per-host name as fallback.
+- `--json` anywhere after `claim`, `renew` and `release`, including warnings and structured
+  errors. `interrupted` errors exit 130 for SIGINT or 143 for SIGTERM, and name any sandbox
+  already kept by the claim. Other error codes are `no_free_sandbox`, `claim_limit`, `lock_busy`
+  and `failed`. `lock_busy` exits 75 after waiting up to five minutes for a usable local lock.
+  `failed` usually exits 125, but an unexpected command failure keeps its own status. It can
+  include `held` when a claim already kept a sandbox; the caller must release that sandbox.
+- The installer follows `CLAUDE_CONFIG_DIR` for Claude Code skills. `doctor` warns when that
+  config directory cannot see ibx through a skill or installed plugin.
+- Exit 75 lists holders, reservation times and purposes when no sandbox is free, and the
+  agent's reservations when its cap is reached.
+- `doctor` reports the agent name, its source and cap, and warns about an unwritable state
+  directory.
+- Per-command `-h` and `--help` print usage before API access.
+- A field note describes the sandbox's `NODE_OPTIONS` preload.
+
+### Changed
+
+- The skill tells agents to use a sandbox on their own, without being asked, for unvetted code,
+  builds, tests, benchmarks and Docker of public code, headless browsers and video rendering,
+  large public datasets, and long jobs. Public code is explicitly fine; private code still
+  needs the user's request. Recreate-the-sandbox advice is limited to code with a reason for
+  distrust.
+- README rewritten.
+- Claims wait up to five minutes for a busy local lock, then exit 75 with `lock_busy` and make
+  no reservation. Only unusable state directories fall back to the settle checks. Signals
+  during lock-directory creation clean up empty directories, and dead guard owners are
+  reclaimed immediately when host and PID namespace match.
+- Diagnostic writes tolerate a closed stderr. Exec retry sleeps are reaped during cleanup.
+- Remote `exec` arguments stay untouched after `--` or the remote command, and remote `ssh`
+  arguments after the box. Claim purposes starting with `-` are rejected.
+- Config roots in `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_CONFIG_HOME` expand a leading
+  tilde, require an absolute path and strip trailing slashes. Installs deduplicate shared roots;
+  uninstall also checks the default Claude root when a custom root is set.
+- Claim waits respond promptly to SIGINT and SIGTERM. JSON output is emitted once at cleanup,
+  including dependency and temporary-directory failures. Failed public-port listings return
+  `publicPorts: null` with a warning.
+- `claim` rechecks that a sandbox is free in the same GET used to build its reservation PATCH.
+- A claim's purpose must be one quoted argument; extra arguments are now rejected.
+- The default agent name is now per session, so reservations from 0.1.0 show a different holder
+  name.
+
 ## 0.1.0 - 2026-10-15
 
 First public release. instabox is in beta; everything below was checked against its API on
