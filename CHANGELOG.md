@@ -3,7 +3,47 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). The version is the one `ibx --version` prints.
-The Claude Code plugin manifests carry no version on purpose: plugin users get every commit.
+The Claude Code plugin manifests carry no version. Plugin users get every commit.
+
+## 0.3.0 - 2026-10-27
+
+### Added
+
+- Opt-in `ibx exec --stream` SSE output, uncapped and incremental. Stream errors retain partial
+  output, kill the command on disconnect, and never repeat partly-run work. Buffered exec stays
+  the default and the 600-second timeout still applies.
+- Fail-closed Org Secret selection, application-state and guest-residue checks in claim,
+  pool add and doctor. The user-only IBX_ALLOW_SECRETS permits proxy Secrets, never env Secrets.
+- Claim and list output include pausesAt and cooldownUntil. Claim prefers larger run budgets.
+- Private `ibx forward` localhost tunnels share SSH host pinning and one-hour token cleanup.
+- Doctor shows the concrete org plan, free-hour usage and limits, run budgets, unsafe Secrets,
+  public ports on unreserved boxes, and long-lived SSH tokens.
+- JSON errors distinguish auth and account_blocked, with cleaned server hints and scopes.
+- Dated platform research and decisions in docs/research/2026-10-27-instabox-changes.md.
+
+### Changed
+
+- Keepalive skips known or raced max-run cooldowns successfully while renewing other boxes.
+  It preserves --all semantics. Leases do not prevent the free 480-minute max-run pause.
+- User exec never retries host_unavailable, even when retryable. Cooldown and quota refusals
+  remain safe to wait out. New and older credential codes are recognized.
+- Official streaming file routes replace base64 exec for put/get. Put accepts up to 5 GiB and
+  verifies SHA-256; get stages output with IBX_GET_MAX, default 2G. Only route-not-found on an
+  older server enables the previous 750 KB transport, with a warning. Upload follows symlinks.
+- Release removes all ports created during the reservation, whatever their names, using stable
+  ibx.claim.start. Renew changes only the activity timestamp. Older non-ibx ports remain warned.
+- Billing blocks stop claim after the first affected candidate. Interrupts promptly close exec
+  connections; the message explains partly-run work and surviving setsid children.
+- Exec reports invalidUtf8, actual signals and diskWarning without changing the remote status.
+- Key-bearing shell variables explicitly clear inherited export attributes before starting any
+  child process, including streaming curl.
+- Vault file residue is unsafe; an uninspectable Vault stays refused with clearer 403 advice.
+- Docs cover independent Vault and Org Secrets, 32 shared concurrent requests, eight-hour
+  checkpoints, plan-specific idle settings, current CLI/SDK features and org key boundaries.
+  The obsolete ignored-idle-setting bug reports are removed. Public-URL wake behavior remains
+  explicitly unverified because the prose docs and spec conflict.
+- Offline mock and live-test definitions track the current API. Live tests select enough run
+  budget and verify leases only for their own boxes.
 
 ## 0.2.0 - 2026-10-17
 

@@ -1,12 +1,10 @@
 # Keepalive: keeping reserved sandboxes awake
 
-instabox pauses a sandbox after 30 idle minutes, and the setting that should change that is
-ignored today. `ibx keepalive`, run every 15 minutes from a timer on the user's computer, holds
-an activity lease on reserved pool sandboxes so they stay up while agents work. Facts verified
-2026-10-15. The API is in beta and changes fast; check
-`GET https://api.instabox.sh/v1/openapi.json` and prefer what you observe.
+The free plan fixes idle pause at 1800 seconds. Activity leases prevent idle pauses but do not
+prevent the free plan's 480-minute max-run pause and cooldown. Facts checked on 2026-10-27.
+`ibx keepalive` renews leases every timer tick; it never changes lifecycle settings.
 
-**Agents:** installing a timer changes the user's computer. Do not do it yourself. If
+**Agents.** installing a timer changes the user's computer. Do not do it yourself. If
 sandboxes keep pausing under you, point the user to this file (`ibx doctor` reports whether a
 timer is installed).
 
@@ -25,15 +23,14 @@ timer is installed).
 
 ## 1. Why
 
-- Every sandbox pauses after 1800 s without activity. `PATCH /v1/machines/{id}` with
-  `autoSuspendAfterSeconds` 0 or 7200 returns 200, but the value stays 1800 (verified
-  2026-10-15; [field-notes.md](field-notes.md#1-idle-pause-and-the-ignored-autosuspendafterseconds)).
-- Light CPU load does not count as activity. A detached job, a server or a download can sit in
-  a sandbox that pauses under it.
-- A pause keeps processes, so jobs resume when someone wakes the sandbox. Public URLs, however,
-  answer 503 while it is paused, and nothing wakes it on their behalf.
-- Activity leases do keep a sandbox awake: one renewed every 15 minutes kept an idle sandbox up
-  for more than an hour.
+- Free sandboxes reject `autoSuspendAfterSeconds` other than 1800 with 403. Paid plans allow
+  300-1800 in steps of 300, or 0 when always-on is allowed. Only admin-granted manual lifecycle
+  accounts use the 120-86400 range. See [field-notes.md](field-notes.md#1-idle-pause-and-plan-rules).
+- Detached work can outlive idle activity. Renewed leases prevent those idle pauses.
+- Free boxes still pause every 480 continuous minutes. Wakes are refused until `cooldownUntil`.
+  Observed cooldowns were 5-17 minutes; the spec default is 10. Checkpoint long jobs.
+- The prose docs say public URL visits wake an idle-paused box; the spec still says 503. This
+  remains unverified here. Manual pauses and stops still answer 503.
 
 ## 2. How activity leases work
 
@@ -66,15 +63,17 @@ ibx keepalive --all    # every pool sandbox
 - **Running** sandboxes get the lease, and so do sandboxes **paused for idleness** (which wakes
   them). Sandboxes paused or stopped by hand, or in the middle of an operation, are skipped.
 - Output is one line per sandbox: `NAME: lease until TIME`, `NAME: suspended, skipped`, or
-  `NAME: FAILED {code, message}`.
-- Exit status: 0 when every lease was renewed, 1 when at least one failed, 125 when ibx itself
+  `NAME: FAILED {code, message, retryAfterSeconds}`. A max-run pause prints
+  `NAME: max-run cooldown until TIME, skipped`; it sends no lease request if known in advance.
+  A raced `409 machine_cooldown` is also a successful skip, so other boxes still get leases.
+- Exit status: 0 when every eligible lease was renewed or a cooldown was skipped, 1 when at least one failed, 125 when ibx itself
   failed (no key, API unreachable, missing dependencies).
 - It needs a key with `machines:read` and `machines:write`. A timer does not see the variables
   of your shell, so keep the key in the default file,
   `${XDG_CONFIG_HOME:-~/.config}/instabox/api-key` (mode 600), or point `IBX_KEY_FILE` at it.
-  A timer may not see `XDG_CONFIG_HOME` either: if you set it, use `IBX_KEY_FILE`. **Never
+  A timer may not see `XDG_CONFIG_HOME` either. If you set it, use `IBX_KEY_FILE`. **Never
   write the key itself into a unit file, plist or crontab.**
-- The timer only renews: `ibx claim` sets the same lease (1 hour) as soon as it holds a
+- The timer only renews. `ibx claim` sets the same lease (1 hour) as soon as it holds a
   sandbox, so a fresh reservation is covered until the next run. `ibx release` deletes the
   lease, so a released sandbox pauses 30 idle minutes later.
 
@@ -82,15 +81,18 @@ ibx keepalive --all    # every pool sandbox
 
 | | `ibx keepalive` (default) | `ibx keepalive --all` |
 |---|---|---|
-| Keeps awake | sandboxes an agent holds | every pool sandbox, around the clock |
-| Free sandboxes | pause after 30 idle minutes; `ibx claim` resumes them (about 1 s) | stay running |
-| Forgotten reservations | stop being kept awake after `IBX_STALE_SECS` | kept awake forever |
-| Leftover processes on free sandboxes | frozen while paused | keep running |
-| Cost | running time only while agents work | running time of the whole pool, all the time |
+| Keeps awake | sandboxes an agent holds | every pool sandbox, except forced pauses |
+| Free sandboxes | pause after 30 idle minutes; `ibx claim` resumes them (about 1 s) | cycle through max-run pauses |
+| Forgotten reservations | stop being kept awake after `IBX_STALE_SECS` | renewed between max-run pauses |
+| Leftover processes on free sandboxes | frozen while paused | run between forced pauses |
+| Cost | running time only while agents work | running time of the whole pool between forced pauses |
 
 Prefer the default. Use `--all` only when free pool sandboxes must keep serving something.
-instabox is in beta: if it starts charging for running time, `--all` multiplies that cost by
-the pool size, so check current pricing first.
+Free running hours count toward the org's included-usage limit when one is enforced; limit 0
+means no cap. An included-usage suspension was observed on 2026-10-18. With `--all`, free boxes
+cycle through 8 hours running, cooldown, then up to 15 minutes until the next timer tick.
+Paid 4 vCPU/8 GiB boxes cost about $0.034/hour, roughly $124/month for five running all month.
+`doctor` shows the org plan, usage and run budgets. The user decides whether to use `--all`.
 
 ## 5. Install on Linux: systemd user timer
 
@@ -215,8 +217,9 @@ ibx keepalive                  # run once by hand: one line per reserved sandbox
 | cron | `tail -n 30 ~/.cache/ibx-keepalive.log` | run `ibx keepalive` |
 
 A healthy run prints `NAME: lease until ...` about one hour ahead for every reserved sandbox.
-`FAILED` lines carry the API error code: `insufficient_scope` means the key lacks
-`machines:write`, and `api_key_expired` means the user needs a new key.
+`FAILED` lines carry the API error code. `missing_scope` means the key lacks
+`machines:write` (`insufficient_scope` on older servers), and `expired_key` or `revoked_key` means the user needs a new key (`api_key_expired` on older servers). `machine_cooldown` is expected.
+A key expiry date cannot be read by ibx; note it when creating the key. Expiry stops keepalive.
 
 ## 9. What to expect
 

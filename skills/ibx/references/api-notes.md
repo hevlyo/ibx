@@ -1,9 +1,9 @@
 # API notes: the instabox routes ibx and agents use
 
 This is a compact reference, checked against `GET https://api.instabox.sh/v1/openapi.json` on
-2026-10-15. The API is in beta and changes fast. When in doubt, read the live spec (public, no
+2026-10-27. The API is in beta and changes fast. When in doubt, read the live spec (public, no
 key) and prefer what you observe; [field-notes.md](field-notes.md) lists where the two differ.
-**Agents should prefer `ibx`**: it handles the key, retries, idempotency and waiting. Call the
+Agents should prefer `ibx`. It handles the key, retries, idempotency and waiting. Call the
 API directly only for something ibx does not do.
 
 Read a route from the spec with
@@ -28,7 +28,7 @@ Read a route from the spec with
   carry the same key (spec: info.description, "API keys").
 - Every non-2xx reply has the envelope
   `{"error": {"code", "message", "requestId", "retryable", "operationId"}}`.
-- Lifecycle changes are asynchronous: `202` plus an Operation. Accepted does not mean ready
+- Lifecycle changes are asynchronous, returning `202` plus an Operation. Accepted does not mean ready
   (section 5).
 - IDs: sandbox `m_` + 26 base32 characters, snapshot `sn_` (older ones `im_`), SSH grant `cn_`,
   key `key_`. Most routes take only the sandbox ID. `GET /v1/machines/{id}`, exec and the
@@ -97,25 +97,23 @@ spec.
 
 ## 4. Errors that matter
 
-| Code | HTTP | Meaning | What to do |
-|---|---|---|---|
-| `unauthenticated` | 401 | missing or unknown key | run `ibx doctor`; ask the user |
-| `api_key_expired` / `api_key_revoked` | 401 | the key expired or was revoked | ask the user for a new key; never look for another |
-| `insufficient_scope` | 403 | the key lacks the route's scope | tell the user which scope (ibx needs machines:read + machines:write) |
-| `permission_denied` | 403 | not the owner, an admin-only route, or a key on a sign-in-only route | stop |
-| `invite_required` | 403 | the account has not redeemed an invite | the user must activate it |
-| `not_found` | 404 | no such sandbox (deleted ones too), or someone else's | list again |
-| `bad_request` | 400 | invalid input, or a missing Idempotency-Key | fix the request |
-| `spec_not_allowed` | 400 | a size field was set | leave `vcpus`, `memMiB`, disk sizes out |
-| `quota_exceeded` | 429 | a limit: sandboxes, storage, snapshots, keys, execs, terminals, ports, Vault | execs: wait and retry (retryable); otherwise free something or ask the user |
-| `machine_not_running` | 409 | the sandbox is not running | start, resume or wake it, then retry |
-| `operation_conflict` | 409 | another operation is active (`operationId`), or the transition is not allowed | wait on `operationId`, then retry |
-| `idempotency_conflict` | 409 | a key was reused for a different request | use a fresh key |
-| `host_unavailable` | 503 | the sandbox cannot be reached | if `retryable`, retry in a few seconds; for exec with `retryable: false` the command **may have run** |
-| `no_capacity` | 503 or a failed operation | no host has room | retry later; a create from a template that fails before it gets a host deletes itself and does not count toward the limit |
-| `internal` | 500 | server error | retry only calls that are safe to repeat |
+| Status and code | ibx behavior |
+|---|---|
+| 401 missing_key, malformed_key, invalid_key, expired_key, revoked_key, session_expired | `auth`, exit 125; ask the user to fix this key |
+| 403 missing_scope | `auth`, with requiredScopes and hint; exec did not run |
+| Older unauthenticated, api_key_expired, api_key_revoked, insufficient_scope | supported as auth errors |
+| 402 credit_exhausted, spend_limit_reached, subscription_required, payment_method_required, payment_failed | `account_blocked`; stop claim, exec or SSH, ask the user |
+| 409 machine_cooldown | no command started; wait within the 10-minute budget, else name the cooldown |
+| 409 max_run_disabled | no command started; refuse |
+| 429 quota_exceeded | nothing started; wait up to 10 minutes |
+| 503 host_unavailable, even retryable | never repeat user exec; a restarting API may have killed it partly run |
+| delete_confirmation_required | deletion needs X-Confirm-Delete; ibx never deletes sandboxes |
+| 413 too_large, 507 no_space, 409 not_a_file | file limit, disk full, or destination directory |
 
-The HTTP status for each code is fixed (spec: schemas.Error, components.responses).
+Errors can carry `hint`, `docs`, `reason`, `requiredScopes`, `retryAfterSeconds` and a
+`Retry-After` header. ibx prints cleaned messages and keeps credential and account errors in
+its single JSON error object. `auth`, `account_blocked` and `failed` normally exit 125;
+`failed` retains an unexpected command status. Check `error.held` and release any box it names.
 
 ## 5. Operations and long-poll
 
@@ -123,8 +121,8 @@ The HTTP status for each code is fixed (spec: schemas.Error, components.response
   Loop on `GET /v1/operations/{id}?wait=25s` until `state` is `succeeded` or `failed`.
 - `wait` is capped at 30 s. The reply comes as soon as the state or `phase` changes, so loop
   on it rather than sleeping between calls (spec: GET /v1/operations/{id}).
-- `trigger` tells you instabox started the operation itself: `idle`, `request` (wake on use),
-  `timeout`, `archive`, `drain`, `user_delete`, `admin_delete`.
+- `trigger` tells you instabox started the operation itself, with values including `idle`, `request` (wake on use),
+  `max_run`, `memory_pressure`, `wake`, `credit`, `archive`, `drain`, `user_delete`, `admin_delete`.
 - One operation runs at a time per sandbox. Repeating the same change returns the running
   operation, and a change that is already in effect returns an operation that has already
   succeeded.
@@ -134,13 +132,13 @@ The HTTP status for each code is fixed (spec: schemas.Error, components.response
 
 `GET /v1/machines` returns `{"machines": [...], "nextCursor": string|null}`.
 
-- `limit` sets the page size. `cursor` takes the previous `nextCursor` (opaque: URL-encode
+- `limit` sets the page size. `cursor` takes the previous `nextCursor` (opaque, so URL-encode
   it). The last page has `nextCursor: null`.
 - `metadata=key:value` filters on an exact metadata value (split at the first `:`). It can be
   repeated, and every term must match. For example `metadata=ibx.pool:1` lists pool sandboxes.
 - Deleted sandboxes are not listed.
 - ibx metadata keys: `ibx.pool` (`"1"` = in the pool), `ibx.claim.by`, `ibx.claim.at`
-  (RFC 3339), `ibx.claim.purpose`, `ibx.claim.token`. A reservation older than
+  (renewed RFC 3339), `ibx.claim.start` (stable start), `ibx.claim.purpose`, `ibx.claim.token`. A reservation older than
   `IBX_STALE_SECS` (default 86400) counts as abandoned. Metadata has no compare-and-swap, and
   the last PATCH wins.
 
@@ -149,22 +147,22 @@ The HTTP status for each code is fixed (spec: schemas.Error, components.response
 | What | Limit | Source |
 |---|---|---|
 | exec timeout | 1-600 s, default 60 (ibx: 300) | schemas.ExecRequest |
-| Concurrent execs | 4 per user, `GET /files` included | POST .../exec |
+| Concurrent requests | 32 per user shared by exec, files, desktop, forwarding and Secret refresh; not in usage | POST .../exec |
 | exec `cmd` / `stdin` / output | 64 KiB / 1 MiB / 1 MiB per stream | schemas.ExecRequest, ExecResult |
 | exec `envs` | 256 variables | schemas.ExecRequest |
 | `GET /files` | path up to 4096 bytes; text up to 256 KiB; binary gives empty `content`; up to 5000 directory entries | GET .../files |
-| `ibx put` / `ibx get` | 750,000 bytes (the base64 has to fit in 1 MiB) | the ibx helper |
+| `ibx put` / `ibx get` | 5 GiB upload / default 2G download; older-server fallback 750 KB | the ibx helper |
 | Metadata | 32 keys of 1-64 chars `[A-Za-z0-9_.-]`, values up to 512 chars, 8 KiB as JSON | schemas.Metadata |
 | Vault | 100 items and 256 KiB of values per user (server defaults); one value up to 64 KiB | schemas.VaultLimits, PutVaultItemRequest |
-| SSH token TTL | default 7 days, max 30 days | schemas.CreateSSHTokenRequest |
+| SSH token TTL | default 7 days, max 30 days, or noExpiry; ibx uses 1 hour | schemas.CreateSSHTokenRequest |
 | SSH certificate TTL | default 1 h, max 24 h | schemas.CreateConnectionRequest |
 | Desktop link TTL | default 1 h, 60 s to 24 h | schemas.DesktopStreamRequest |
 | Activity lease | 30-3600 s (0 or absent: 300); 128 active per sandbox | PUT .../activity-leases/{leaseID} |
-| Sandbox timeout | `timeoutSeconds` 60-86400 | schemas.TimeoutSeconds |
-| Idle pause | documented 120-86400 or 0; **ignored, stays 1800** (observed) | schemas.AutoSuspendAfterSeconds |
+| Max-run | free 480 minutes fixed, paid -1 allowed; 0 disables wakes | schemas.MaxRunMinutes |
+| Idle pause | free fixed 1800; paid 300-1800 in steps of 300, 0 with alwaysOn; manualLifecycle 120-86400 | schemas.AutoSuspendAfterSeconds |
 | Public ports | 16 per sandbox; ports 1024-65535; 5901 and 6768 reserved | POST .../ports, PublishPortRequest |
-| Sandboxes | 5 in any state | GET /v1/usage |
-| Snapshots / stored data | 10 / 200 GB (observed `limits`) | GET /v1/usage |
+| Sandboxes | free default 1; this account grandfathered at 5; read maxMachines | GET /v1/usage |
+| Snapshots / stored data | free default 5 / 200 GB; read live limits | GET /v1/usage |
 | API keys | 20 active; expiry 1-365 days or never | info.description, CreateAPIKeyRequest |
 | Terminals | 8 open per user | GET .../terminal |
 | Long-poll `wait` | 30 s at most | GET /v1/operations/{id} |
@@ -179,7 +177,7 @@ snapshots). A `:write` or `:delete` scope includes `:read` of the same resource
 | Scope | Allows |
 |---|---|
 | `machines:read` | list and read sandboxes, connection info, metrics, ports, token metadata, operations, templates, usage |
-| `machines:write` | create, PATCH (metadata), start/stop/pause/resume/wake, **exec and `GET /files` as root on every sandbox of the account**, SSH tokens and certificates, ports, leases, desktop |
+| `machines:write` | create, PATCH (metadata), start/stop/pause/resume/wake, **exec and `GET /files` as root on every sandbox of the org**, SSH tokens and certificates, ports, leases, desktop |
 | `machines:delete` | delete sandboxes |
 | `images:read` / `write` / `delete` | read, create, delete snapshots |
 
@@ -191,7 +189,7 @@ snapshots). A `:write` or `:delete` scope includes `:read` of the same resource
 
 ## 9. curl patterns that survive TLS drops
 
-The API sometimes drops TLS mid-reply (curl 55/56). These patterns do what ibx does: the key
+The API sometimes drops TLS mid-reply (curl 55/56). These patterns follow ibx. The key
 stays in an unexported shell variable and reaches curl through a pipe (`-H @-`), so it is in
 no argv, no child's environment and no file; `-q` makes curl ignore `~/.curlrc`; only safe
 calls are retried; and the body goes to a file, so a retry replaces a partial body instead of
@@ -200,7 +198,8 @@ adding to it. They need curl 7.71+ and jq 1.6+.
 ```bash
 umask 077
 API=https://api.instabox.sh
-# Unexported: child processes never see it. Never echo it.
+# Clear an inherited export attribute before assigning the key. Never echo it.
+export -n IBK
 IBK=$(tr -d '[:space:]' <"${XDG_CONFIG_HOME:-$HOME/.config}/instabox/api-key")
 
 # call METHOD PATH [curl args...]: prints the body; returns 1 on a non-2xx reply or transport error.
@@ -266,3 +265,36 @@ Notes:
   uses 8 s while it claims a sandbox).
 - Use `-o FILE`, not stdout. curl cannot take back bytes it already printed before a drop.
 - Never write the key into a header file, a script or a command line; never `export` it.
+
+## 10. Routes added to ibx in 0.3.0
+
+| Route | Scope | Detail |
+|---|---|---|
+| GET /v1/machines/{id}/secrets | machines:read | selections, effective metadata and application state, never values |
+| PATCH /v1/machines/{id}/secrets | machines:write | clear both proxy and env selections; ibx never changes them |
+| GET /v1/orgs/{id}/secrets | machines:read | org Secret metadata; doctor audits names and risk |
+| PUT /v1/machines/{id}/files | machines:write or machines:exec | raw bytes, atomic, parents=true; follows the target symlink, unlike the old mv fallback |
+| GET /v1/machines/{id}/files/content | machines:write or machines:exec | raw bytes and Content-Length; ibx stages before replacing local output |
+| GET /v1/ports | machines:read | all public ports with machineId and createdAt |
+| GET /v1/machines/{id}/logs | machines:read | never wakes the box |
+| GET /v1/orgs/{id} | authenticated org member/key | tier, limits and usage; the org-list route is insufficient |
+
+The lease route is documented in OpenAPI, not in the prose documentation. Watch the spec for
+changes. Whole-map metadata PATCH, SDK setMetadata and dashboard labels replace pool and claim
+keys. Other tools must preserve them. ibx uses read-modify-write but has no server-side CAS.
+
+Claim JSON adds pausesAt and cooldownUntil, each a timestamp or null. Release preserves the
+unpublished array of port numbers and adds unpublishReasons, an array of {port, reason}.
+A port created during the reservation has reason "created during the reservation" even if
+its name starts with ibx:. Older ibx ports have reason "published by ibx". The ls secrets flag
+is true for selected or uninspectable Secrets and false only after a clean inspection;
+diagnostic audits ignore the proxy override.
+
+## 11. Opt-in exec streaming
+
+`ibx exec BOX --stream -- CMD` sends `Accept: text/event-stream`. The parser ignores ping
+comments, forwards stdout/stderr data, and takes status and diagnostic fields from the exit
+event. Pre-start JSON refusals use the same classification as buffered exec. An error event,
+transport loss or missing exit event is terminal, with partial output retained and no retry.
+The server kills the process group when the stream closes. Timeouts stay at 1-600 seconds;
+streaming changes output delivery, not long-job lifecycle. Put/get never use SSE.

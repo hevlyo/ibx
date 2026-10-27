@@ -51,6 +51,9 @@ Start: mock_api.py --port 0 prints the chosen port on stdout, then serves until 
   --vault box-2:3 --vault box-3:0 (or box-2:3,box-3:0) seeds the Vault; --help for the rest.
 """
 
+from pathlib import Path
+import codecs
+import selectors
 import argparse
 import copy
 import hashlib
@@ -102,15 +105,16 @@ def fake_ca_key():
 
 
 class ApiError(Exception):
-    def __init__(self, status, code, message, retryable=False, operation_id=None):
+    def __init__(self, status, code, message, retryable=False, operation_id=None, **details):
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
         self.retryable, self.operation_id = retryable, operation_id
+        self.details = details
 
     def body(self):
         return {"error": {"code": self.code, "message": self.message,
                           "requestId": rid("req_", 16), "retryable": self.retryable,
-                          "operationId": self.operation_id}}
+                          "operationId": self.operation_id, **self.details}}
 
 
 def not_found(what="no such resource"):
@@ -146,6 +150,11 @@ class State:
         self.calls = []
         self.idem = {}
         self.running_execs = 0
+        self.org_secrets = []
+        self.org_secrets_enabled = True
+        self.files_enabled = True
+        self.file_bad_hash = False
+        self.org = {"id": "org_mock", "tier": "free", "limits": {"freeSandboxHours": 0, "startsPerMinute": 3}, "usage": {"freeSandboxHours": 12}}
         startup = {"dropGets": args.drop_gets, "quotaExecs": args.quota_execs,
                    "dropExecs": args.drop_execs, "conflictResumes": args.conflict_resumes,
                    "failOps": args.fail_ops}
@@ -176,11 +185,12 @@ class State:
                  "spec": {"vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20},
                  "storage": {"sizeGiB": 20, "mountPath": "/data", "persistent": True,
                              "synced": True},
-                 "runtime": {"ready": True}, "timeoutAt": None, "onTimeout": "pause",
+                 "runtime": {"ready": True}, "free": True, "maxRunMinutes": 480,
+                 "runStartedAt": now, "cooldownUntil": None, "orgId": "org_mock",
                  "autoSuspendAfterSeconds": 1800, "metadata": md, "vault": False,
-                 "guestUser": "dev", "createdAt": now, "updatedAt": now,
+                 "guestUser": "user", "createdAt": now, "updatedAt": now,
                  "_home": home, "_ports": {}, "_leases": {}, "_tokens": {}, "_fresh": False,
-                 "_vault": []}
+                 "_vault": [], "_secrets": {"secrets": [], "envSecrets": [], "items": [], "version": 0}}
             if name in vault:
                 self.set_vault(m, vault[name])
             self.machines[mid] = m
@@ -244,6 +254,8 @@ class State:
         m["state"] = transitional or {"running": "starting" if typ == "start" else "resuming",
                                       "stopped": "stopping", "suspended": "suspending"}[final]
         m["desiredState"] = final
+        if typ in ("start", "resume") and trigger is None:
+            m["_leases"] = {}
         m["operationId"] = op["id"]
         m["runtime"] = {"ready": False}
         self.touch(m)
@@ -275,6 +287,9 @@ class State:
                 m["state"] = m["desiredState"] = op["_final"]
                 m.pop("autoSuspendedAt", None)
                 m["runtime"] = {"ready": op["_final"] == "running"}
+                if op["_final"] == "running":
+                    m["runStartedAt"] = iso()
+                    m["cooldownUntil"] = None
                 if op["type"] in ("start", "resume") and op["_from"] in ("suspended", "suspending"):
                     m["runtime"]["processesPreserved"] = not m["_fresh"]
                     m["_fresh"] = False
@@ -321,8 +336,22 @@ class State:
     def control(self, c):
         if c.get("reset"):
             self.op_delay = self.default_op_delay
+            self.org_secrets = []
+            self.org_secrets_enabled = True
+            self.files_enabled = True
+            self.file_bad_hash = False
             self.seed(**self.defaults)
             self.faults, self.exec_results, self.calls, self.idem = [], [], [], {}
+        if "orgSecrets" in c:
+            self.org_secrets = c["orgSecrets"]
+        if "orgSecretsEnabled" in c:
+            self.org_secrets_enabled = c["orgSecretsEnabled"]
+        if "fileBadHash" in c:
+            self.file_bad_hash = c["fileBadHash"]
+        if "filesEnabled" in c:
+            self.files_enabled = c["filesEnabled"]
+        if "org" in c:
+            self.org.update(c["org"])
         if "opDelay" in c:
             self.op_delay = float(c["opDelay"])
         if "seed" in c:
@@ -333,6 +362,17 @@ class State:
             m = self.find(ref)
             if "state" in ch:
                 self.set_state(m, ch["state"])
+            for key in ("maxRunMinutes", "runStartedAt", "cooldownUntil", "free"):
+                if key in ch:
+                    m[key] = ch[key]
+            if "secrets" in ch:
+                m["_secrets"] = ch["secrets"]
+            if "rawVault" in ch:
+                m["_raw_vault"] = ch["rawVault"]
+            if "applied" in ch:
+                m["_applied"] = ch["applied"]
+            if "tokens" in ch:
+                m["_tokens"] = {t["id"]: dict(t, _revoked=bool(t.get("revokedAt"))) for t in ch["tokens"]}
             if "metadata" in ch:
                 m["metadata"] = dict(ch["metadata"])
             m["metadata"].update(ch.get("mergeMetadata") or {})
@@ -340,6 +380,8 @@ class State:
                 m["metadata"].pop(k, None)
             for p in ch.get("ports") or []:
                 self.publish(m, int(p["port"]), p.get("name"), p.get("url"))
+            if ch.get("clearRawPorts"):
+                m.pop("_raw_ports", None)
             if "rawPorts" in ch:
                 m["_raw_ports"] = copy.deepcopy(ch["rawPorts"])
             for lease in ch.get("leases") or []:
@@ -369,7 +411,7 @@ class State:
             "dropGets": {"kind": "drop", "method": "GET"},
             "quotaExecs": {"kind": "error", "method": "POST", "match": "/exec$", "status": 429,
                            "code": "quota_exceeded", "retryable": True,
-                           "message": "too many execs at once (4 of 4)"},
+                           "message": "concurrent-request limit reached"},
             "dropExecs": {"kind": "drop", "method": "POST", "match": "/exec$"},
             "conflictResumes": {"kind": "conflict", "method": "POST", "match": "/(resume|start)$"},
             "failOps": {"kind": "failop"},
@@ -427,7 +469,7 @@ class State:
 
     def record(self, method, path, query, headers, body):
         call = {"seq": len(self.calls) + 1, "t": time.time(), "method": method, "path": path,
-                "query": query, "idempotencyKey": headers.get("Idempotency-Key"),
+                "query": query, "idempotencyKey": headers.get("Idempotency-Key"), "accept": headers.get("Accept"),
                 "status": None, "dropped": False, "body": None}
         if body:
             try:
@@ -497,7 +539,7 @@ def json_body(raw, required=False):
     return b
 
 
-def run_real(home, cmd, stdin, timeout, cwd, envs):
+def run_real(home, cmd, stdin, timeout, cwd, envs, streamed=False):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "USER": "dev",
            "LOGNAME": "dev", "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
     env.update(envs)
@@ -521,15 +563,21 @@ def run_real(home, cmd, stdin, timeout, cwd, envs):
         except subprocess.TimeoutExpired:  # something detached still holds the pipes
             p.kill()
             out, err = b"", b""
-    r = {"stdout": out[:MIB].decode("utf-8", "replace"),
-         "stderr": err[:MIB].decode("utf-8", "replace"),
-         "truncated": len(out) > MIB or len(err) > MIB, "timedOut": timed_out}
+    limit = None if streamed else MIB
+    r = {"stdout": out[:limit].decode("utf-8", "replace"),
+         "stderr": err[:limit].decode("utf-8", "replace"),
+         "truncated": not streamed and (len(out) > MIB or len(err) > MIB), "timedOut": timed_out}
+    try:
+        out[:limit].decode("utf-8")
+        err[:limit].decode("utf-8")
+    except UnicodeDecodeError:
+        r["invalidUtf8"] = True
     if timed_out:
         r["exitCode"] = 124
     elif p.returncode < 0:
         r["exitCode"] = 128 - p.returncode
         try:
-            r["signal"] = signal.Signals(-p.returncode).name
+            r["signal"] = signal.Signals(-p.returncode).name.removeprefix("SIG")
         except ValueError:
             pass
     else:
@@ -578,10 +626,12 @@ class Handler(BaseHTTPRequestHandler):
         self.dispatch("DELETE")
 
     def reply(self, status, obj, drop=False):
-        data = b"" if obj is None else (json.dumps(obj) + "\n").encode()
+        data = obj if isinstance(obj, bytes) else (b"" if obj is None else (json.dumps(obj) + "\n").encode())
         self.send_response(status)
         if obj is not None:
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", "application/octet-stream" if isinstance(obj, bytes) else "application/json")
+            if isinstance(obj, dict) and (obj.get("error") or {}).get("retryAfterSeconds"):
+                self.send_header("Retry-After", str(obj["error"]["retryAfterSeconds"]))
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
         self.end_headers()
@@ -616,8 +666,10 @@ class Handler(BaseHTTPRequestHandler):
             with S.lock:
                 S.tick()
                 auth = self.headers.get("Authorization", "")
-                if auth != "Bearer " + S.key:
-                    raise ApiError(401, "unauthenticated", "missing or unknown API key")
+                port_auth = auth == "Port mock-port" and re.fullmatch(r"/v1/machines/" + next(iter(S.machines), "none") + r"/ports(?:/[0-9]+)?", path)
+                if auth != "Bearer " + S.key and not port_auth:
+                    code = "missing_key" if not auth else ("malformed_key" if not auth.startswith("Bearer ibk_") else "invalid_key")
+                    raise ApiError(401, code, "API key refused", reason=code, hint="ask the user for a valid key", docs="https://docs.mock.invalid/auth")
                 fault = S.take_fault(method, path)
             if fault and fault["kind"] == "delay":
                 time.sleep(float(fault.get("seconds", 1)))
@@ -628,18 +680,153 @@ class Handler(BaseHTTPRequestHandler):
             if fault and fault["kind"] == "error":
                 raise ApiError(int(fault.get("status", 500)), fault.get("code", "internal"),
                                fault.get("message", "mock: injected error"),
-                               truthy(fault.get("retryable", False)), fault.get("operationId"))
+                               truthy(fault.get("retryable", False)), fault.get("operationId"),
+                               **{k: fault[k] for k in ("retryAfterSeconds", "hint", "requiredScopes", "reason") if k in fault})
             status, obj = self.route(method, path, parse_qs(u.query), raw, call)
         except ApiError as e:
             status, obj = e.status, e.body()
         except Exception as e:  # a bug in the mock: say so instead of hanging the client
             status, obj = 500, ApiError(500, "internal", "mock bug: %r" % e).body()
+        if status == 0:  # real SSE already wrote the response and owns its process lifecycle
+            with S.lock:
+                call["status"] = 200
+            return
         drop = bool(fault and fault["kind"] == "drop")
         with S.lock:
             call["status"], call["dropped"] = status, drop
         if drop and obj is None:
             return self.cut()
+        if status == 200 and method == "POST" and path.endswith("/exec") and "text/event-stream" in self.headers.get("Accept", ""):
+            return self.reply_sse(obj, drop)
         self.reply(status, obj, drop)
+
+    def sse_headers(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def sse_event(self, name, value):
+        self.wfile.write(("event: " + name + "\ndata: " + json.dumps(value, ensure_ascii=False) + "\n\n").encode())
+        self.wfile.flush()
+
+    def reply_sse(self, result, drop=False):
+        self.sse_headers()
+        self.wfile.write(b": ping\n\n")
+        for name in ("stdout", "stderr"):
+            text = result.get(name, "")
+            for start in range(0, len(text), 65536):
+                self.sse_event(name, {"data": text[start:start + 65536]})
+        time.sleep(float(result.get("streamDelay", 0)))
+        if result.get("streamError"):
+            self.sse_event("error", {"error": {"code": "host_unavailable", "message": "mock stream disconnected", "retryable": True}})
+        elif not (drop or result.get("streamDrop")):
+            self.sse_event("exit", dict(result, stdout="", stderr="", truncated=False))
+        self.close_connection = True
+
+    def reply_real_stream(self, home, cmd, stdin, timeout, cwd, envs):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": home, "USER": "dev",
+               "LOGNAME": "dev", "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
+        env.update(envs)
+        wd = os.path.join(home, cwd) if cwd else home
+        self.sse_headers()
+        if not os.path.isdir(wd):
+            self.sse_event("stderr", {"data": "cwd does not exist\n"})
+            self.sse_event("exit", {"stdout": "", "stderr": "", "exitCode": 1, "timedOut": False, "truncated": False})
+            self.close_connection = True
+            return
+        proc = subprocess.Popen(["bash", "-c", cmd], cwd=wd, env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        pending = stdin.encode()
+        offset = 0
+        selector = selectors.DefaultSelector()
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        if pending:
+            os.set_blocking(proc.stdin.fileno(), False)
+            selector.register(proc.stdin, selectors.EVENT_WRITE, "stdin")
+        else:
+            proc.stdin.close()
+        # Watch the socket even while the command is silent, so disconnect kills promptly.
+        selector.register(self.connection, selectors.EVENT_READ, "connection")
+        decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in ("stdout", "stderr")}
+        validators = {name: codecs.getincrementaldecoder("utf-8")("strict") for name in decoders}
+        exited_at = None
+        invalid = finished = False
+        timed_out = threading.Event()
+        def kill_group():
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        def expire():
+            if proc.poll() is None:
+                timed_out.set()
+                kill_group()
+        # A blocked network writer must never postpone the command deadline.
+        watchdog = threading.Timer(timeout, expire)
+        watchdog.daemon = True
+        try:
+            watchdog.start()
+            self.connection.settimeout(timeout + 1)
+            while True:
+                now = time.monotonic()
+                if proc.poll() is not None:
+                    exited_at = exited_at or now
+                    outputs = [key for key in selector.get_map().values() if key.data in ("stdout", "stderr")]
+                    if not outputs or now - exited_at >= 1:
+                        break
+                for key, _ in selector.select(timeout=0.05):
+                    name, stream = key.data, key.fileobj
+                    if name == "connection":
+                        if not self.connection.recv(1, socket.MSG_PEEK):
+                            return
+                        continue
+                    if name == "stdin":
+                        try:
+                            offset += os.write(stream.fileno(), pending[offset:offset + 65536])
+                        except BrokenPipeError:
+                            offset = len(pending)
+                        if offset >= len(pending):
+                            selector.unregister(stream)
+                            stream.close()
+                        continue
+                    try:
+                        data = os.read(stream.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    try:
+                        validators[name].decode(data, final=not data)
+                    except UnicodeDecodeError:
+                        invalid = True
+                        validators[name].reset()
+                    text = decoders[name].decode(data, final=not data)
+                    if text:
+                        self.sse_event(name, {"data": text})
+                    if not data:
+                        selector.unregister(stream)
+                        stream.close()
+            result = {"stdout": "", "stderr": "", "timedOut": timed_out.is_set(), "truncated": False,
+                      "exitCode": 124 if timed_out.is_set() else (128 - proc.returncode if proc.returncode < 0 else proc.returncode)}
+            if invalid:
+                result["invalidUtf8"] = True
+            if proc.returncode < 0 and not timed_out.is_set():
+                result["signal"] = signal.Signals(-proc.returncode).name.removeprefix("SIG")
+            self.sse_event("exit", result)
+            finished = True
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
+        finally:
+            watchdog.cancel()
+            # Disconnect/timeout kills the group; normal parent exit preserves background work.
+            if not finished:
+                kill_group()
+            proc.wait(timeout=5)
+            selector.close()
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                stream.close()
+            self.close_connection = True
 
     def test_endpoint(self, method, path, raw):
         S = self.S
@@ -674,13 +861,19 @@ class Handler(BaseHTTPRequestHandler):
         with S.lock:
             if parts == ["me"] and method == "GET":
                 return 200, {"userId": 1, "login": "mock-user", "name": "Mock User",
-                             "activated": True, "admin": False}
+                             "activated": True, "admin": False, "orgId": "org_mock"}
+            if parts == ["orgs", "org_mock"] and method == "GET":
+                return 200, S.org
+            if parts == ["orgs", "org_mock", "secrets"] and method == "GET":
+                return 200, {"items": S.org_secrets}
+            if parts == ["ports"] and method == "GET":
+                return 200, {"ports": [dict(p, machineId=m["id"]) for m in S.machines.values() for p in m["_ports"].values()]}
             if parts == ["usage"] and method == "GET":
                 return 200, {"computedAt": iso(), "logicalBytes": 0, "storedBytes": 0,
                              "exclusiveBytes": 0, "machines": len(S.machines), "snapshots": 0,
                              "images": 0,
-                             "limits": {"maxMachines": 5, "maxSnapshots": 10, "maxStoredGiB": 200,
-                                        "maxImages": 10,
+                             "limits": {"maxMachines": 5, "maxSnapshots": 5, "maxStoredGiB": 200,
+                                        "maxImages": 10, "orgSecrets": S.org_secrets_enabled,
                                         "machineSpec": {"vcpus": 4, "memMiB": 8192,
                                                         "persistentDiskGiB": 20}}}
             if parts == ["machines"] and method == "GET":
@@ -710,6 +903,16 @@ class Handler(BaseHTTPRequestHandler):
                                        lambda: self.lifecycle(m, rest[0], path, raw))
             if rest == ["wake"] and method == "POST":
                 return self.wake(m)
+            if rest == ["secrets"] and method in ("GET", "PATCH"):
+                if not S.org_secrets_enabled:
+                    raise not_found("route not found")
+                if method == "PATCH":
+                    m["_secrets"].update(json_body(raw, required=True))
+                return 200, m["_secrets"]
+            if rest in (["files"], ["files", "content"]):
+                if not S.files_enabled:
+                    raise not_found("route not found")
+                return self.files(m, method, query, raw)
             if rest == ["vault"] and method == "GET":
                 return self.vault(m)
             if rest == ["ports"] and method == "GET":
@@ -740,6 +943,8 @@ class Handler(BaseHTTPRequestHandler):
                              "hostTrust": {"type": "ca", "publicKey": S.ca_key,
                                            "principals": [m["id"]]},
                              "capabilities": ["pty", "exec", "port-forwarding"]}
+            if rest == ["ssh-tokens"] and method == "GET":
+                return 200, {"tokens": [{k: v for k, v in t.items() if k in ("id", "name", "createdAt", "expiresAt", "revokedAt")} for t in m["_tokens"].values()]}
             if rest == ["ssh-tokens"] and method == "POST":
                 return self.ssh_token(m, raw)
             if len(rest) == 2 and rest[0] == "ssh-tokens" and method == "DELETE":
@@ -747,6 +952,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not t:
                     raise not_found("token %s not found" % rest[1])
                 t["_revoked"] = True
+                t["revokedAt"] = iso()
                 return 204, None
         raise ApiError(405, "method_not_allowed", "%s is not allowed on %s" % (method, path))
 
@@ -782,9 +988,7 @@ class Handler(BaseHTTPRequestHandler):
         for k in b:
             if k in ("rootDiskGiB", "persistentDiskGiB"):
                 raise ApiError(400, "spec_not_allowed", "sandbox sizes are fixed")
-            if k not in ("metadata", "timeoutSeconds", "onTimeout", "autoSuspendAfterSeconds",
-                         "vault"):
-                raise bad_request("unknown field %s" % k)
+
         md = b.get("metadata")
         if md is not None:
             if not isinstance(md, dict):
@@ -801,14 +1005,56 @@ class Handler(BaseHTTPRequestHandler):
             m["metadata"] = dict(md)  # replaces: {} clears it
         if "autoSuspendAfterSeconds" in b:
             m["autoSuspendAfterSeconds"] = b["autoSuspendAfterSeconds"]
-        if "onTimeout" in b:
-            m["onTimeout"] = b["onTimeout"]
+
         m["updatedAt"] = iso()  # metadata changes do not bump revision
         return 200, self.S.public(m)
+
+    def check_cooldown(self, m):
+        if m.get("maxRunMinutes") == 0:
+            raise ApiError(409, "max_run_disabled", "max-run is disabled")
+        until = m.get("cooldownUntil")
+        if until:
+            seconds = (datetime.fromisoformat(until.replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()
+            if seconds > 0:
+                raise ApiError(409, "machine_cooldown", "max-run cooldown", retryAfterSeconds=max(1, int(seconds + 1)))
+
+    def files(self, m, method, query, raw):
+        self.check_cooldown(m)
+        if m["state"] != "running":
+            raise ApiError(409, "machine_not_running", "not running")
+        path = (query.get("path") or [""])[0]
+        if not path.startswith("/"):
+            raise bad_request("absolute path required")
+        relative = path.removeprefix("/data/home/") if path.startswith("/data/home/") else path.lstrip("/")
+        target = os.path.realpath(os.path.join(m["_home"], relative))
+        if not target.startswith(m["_home"] + os.sep):
+            raise ApiError(403, "permission_denied", "outside mock home")
+        if os.path.isdir(target):
+            raise ApiError(409, "not_a_file", "destination is a directory")
+        if method == "PUT":
+            if len(raw) > 5 * 1024**3:
+                raise ApiError(413, "too_large", "file exceeds 5 GiB")
+            if not os.path.isdir(os.path.dirname(target)):
+                if query.get("parents") != ["true"]:
+                    raise ApiError(404, "missing_parent", "parent missing")
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+            created = not os.path.exists(target)
+            with open(target + ".upload", "wb") as stream:
+                stream.write(raw)
+            os.replace(target + ".upload", target)
+            return (201 if created else 200), {"path": path, "size": len(raw), "created": created,
+                    "mode": "0644", "sha256": "0" * 64 if self.S.file_bad_hash else hashlib.sha256(raw).hexdigest()}
+        if method == "GET":
+            try:
+                return 200, Path(target).read_bytes()
+            except FileNotFoundError:
+                raise not_found("file not found")
+        raise bad_request("unsupported file request")
 
     def lifecycle(self, m, action, path, raw=b""):
         S = self.S
         b = json_body(raw)
+        self.check_cooldown(m)
         if m["operationId"]:
             raise ApiError(409, "operation_conflict", "another operation is in progress",
                            operation_id=m["operationId"])
@@ -827,17 +1073,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def vault(self, m):
         """GET /vault: what the Vault writes into this sandbox (404: a server without Vault)."""
+        if "_raw_vault" in m:
+            return 200, m["_raw_vault"]
         if "vault" not in m:
             raise not_found("this server has no Vault")
         on = m["vault"] is not False
-        items = [{"name": n, "kind": "env", "selector": "", "updatedAt": m["createdAt"]}
+        items = [{"name": n, "kind": "env", "path": None}
                  for n in m["_vault"]] if on else []
         return 200, {"machineId": m["id"], "enabled": on, "items": items,
-                     "applied": on and m["state"] == "running"}
+                     "applied": m.get("_applied", {"at": iso(), "env": [], "files": []} if on else None)}
 
     def wake(self, m):
         """POST /wake: 200 with the running Machine, after waking an idle-paused one."""
         S = self.S
+        self.check_cooldown(m)
         if m["state"] == "running" and not m["operationId"]:
             return 200, S.public(m)
         if m["state"] == "suspended" and m.get("autoSuspendedAt") and not m["operationId"]:
@@ -857,6 +1106,7 @@ class Handler(BaseHTTPRequestHandler):
         raise ApiError(409, "operation_conflict", "still resuming", operation_id=op["id"])
 
     def lease(self, m, lease, raw):
+        self.check_cooldown(m)
         b = json_body(raw)
         ttl = b.get("ttlSeconds") or 300
         if not isinstance(ttl, int) or not 30 <= ttl <= 3600:
@@ -883,7 +1133,7 @@ class Handler(BaseHTTPRequestHandler):
         t = {"id": rid("cn_"), "name": name, "machineId": m["id"], "host": "127.0.0.1",
              "port": self.S.ssh_port, "token": tok,
              "command": "ssh -p %d %s@127.0.0.1" % (self.S.ssh_port, tok),
-             "expiresAt": iso(datetime.now(timezone.utc) + timedelta(seconds=ttl)),
+             "createdAt": iso(), "expiresAt": iso(datetime.now(timezone.utc) + timedelta(seconds=ttl)),
              "hostKeyFingerprint": "SHA256:" + b64encode(hashlib.sha256(
                  self.S.ca_key.encode()).digest()).decode().rstrip("="),
              "_revoked": False}
@@ -910,6 +1160,9 @@ class Handler(BaseHTTPRequestHandler):
             raise bad_request("envs: names [A-Za-z_][A-Za-z0-9_]*, string values")
         with S.lock:
             m = S.find(mref)
+            self.check_cooldown(m)
+            if m["state"] == "suspended" and m.get("autoSuspendedAt"):
+                self.wake(m)
             if m["state"] != "running" or m["operationId"]:
                 raise ApiError(409, "machine_not_running", "the sandbox is %s" % m["state"])
             if S.running_execs >= S.max_execs:
@@ -926,7 +1179,10 @@ class Handler(BaseHTTPRequestHandler):
                      "truncated": False}
                 r.update(queued)
             elif S.exec_real:
-                r = run_real(home, cmd, stdin, t, cwd, envs)
+                if "text/event-stream" in self.headers.get("Accept", ""):
+                    self.reply_real_stream(home, cmd, stdin, t, cwd, envs)
+                    return 0, None
+                r = run_real(home, cmd, stdin, t, cwd, envs, "text/event-stream" in self.headers.get("Accept", ""))
             else:
                 r = run_canned(cmd, t)
         finally:
@@ -954,7 +1210,7 @@ def main():
     ap.add_argument("--op-delay", type=float, default=0.3, help="seconds an operation takes")
     ap.add_argument("--exec", choices=("real", "canned"),
                     default="real" if os.environ.get("MOCK_EXEC") == "real" else "canned")
-    ap.add_argument("--max-execs", type=int, default=4, help="concurrent execs (429 beyond)")
+    ap.add_argument("--max-execs", type=int, default=32, help="concurrent execs (429 beyond)")
     ap.add_argument("--ssh-port", type=int, default=0, help="port in connection-info "
                     "(default: a closed local port, so ssh fails fast)")
     ap.add_argument("--drop-gets", type=int, default=0, metavar="K")

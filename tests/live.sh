@@ -27,9 +27,9 @@ done
 
 L=$(mktemp -d "${TMPDIR:-/tmp}/ibx-live.XXXXXX")
 export IBX_AGENT_NAME=ibx-live-$$
-unset IBX_ALLOW_ANY IBX_ALLOW_VAULT
+unset IBX_ALLOW_ANY IBX_ALLOW_VAULT IBX_ALLOW_SECRETS
 W=ibx-live-$$ # work directory in the sandboxes, under HOME
-A='' B='' URL=''
+A='' B='' URL='' FORWARD_PID=''
 
 passed=0 failed=0
 ok() { passed=$((passed + 1)); printf 'PASS %s\n' "$*"; }
@@ -48,12 +48,23 @@ mine() { # name -> 0 if this run still holds that sandbox
 		jq -e --arg n "$1" --arg by "$IBX_AGENT_NAME" 'any(.[]; .name == $n and .by == $by)' >/dev/null
 }
 
+live_budget_rows() { # JSON list -> only boxes with at least 30 minutes before a forced pause
+	jq 'def ts: sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601;
+		[.[] | select(.pool and (.maxRunMinutes != 0)) |
+		 select((.cooldownUntil == null or (.cooldownUntil | ts) <= now) and
+		 (.pausesAt == null or (.pausesAt | ts) - now >= 1800))]'
+}
+live_claim_budget() { # A B: validate the actual claims, not just other available candidates
+	live_budget_rows | jq -e --arg a "$1" --arg b "$2" '[.[] | select(.name == $a or .name == $b)] | length == 2' >/dev/null
+}
+
 tidy() { # name: stop the test server and remove the work directory (only while we hold it)
 	ibx exec "$1" -- "pkill -f '[h]ttp.server 8098'; rm -rf ~/$W" >/dev/null 2>&1
 }
 cleanup() {
 	trap '' INT TERM
 	local b
+	if [ -n "$FORWARD_PID" ]; then kill -TERM "$FORWARD_PID" 2>/dev/null || true; wait "$FORWARD_PID" || true; fi
 	for b in "$A" "$B"; do
 		mine "$b" || continue # released already (maybe someone else holds it now): hands off
 		tidy "$b"
@@ -77,10 +88,10 @@ check "doctor (it fails when the Vault writes secrets into a pool sandbox)" 0 "$
 yes_ "doctor reached the API" grep -q '^ok    API reachable' "$L/doctor" || show "$L/doctor"
 ibx ls --all --json >"$L/ls-all"
 yes_ "ls --json: every row has a boolean vault field" jq -e 'all(.[]; .vault | type == "boolean")' "$L/ls-all"
-free=$(jq '[.[] | select(.pool and (.reservation == "free" or .reservation == "abandoned"))] | length' "$L/ls-all")
+free=$(live_budget_rows <"$L/ls-all" | jq '[.[] | select(.reservation == "free" or .reservation == "abandoned")] | length')
 if [ "${free:-0}" -lt 2 ]; then
-	bad "the pool needs two free sandboxes (it has ${free:-?}): ibx ls, ibx pool add <box>"
-	exit 1
+	echo "SKIP live run needs two free pool boxes with at least 30 minutes of run budget"
+	exit 0
 fi
 outside=$(jq -r '[.[] | select(.pool | not) | .name][0] // empty' "$L/ls-all")
 if [ -n "$outside" ]; then
@@ -111,6 +122,13 @@ else
 	exit 1
 fi
 ibx ls --json >"$L/ls"
+if ! live_claim_budget "$A" "$B" <"$L/ls"; then
+	echo "SKIP the boxes actually claimed lack 30 minutes of run budget"
+	ibx release "$A" >/dev/null && A=
+	ibx release "$B" >/dev/null && B=
+	exit 0
+fi
+
 is "ls shows both reservations (ibx.claim.*)" \
 	"$(jq -c --arg a "$A" --arg b "$B" '[.[] | select(.name == $a or .name == $b) | [.reservation, .by, .purpose]] | sort' "$L/ls")" \
 	"$(jq -cn --arg by "$IBX_AGENT_NAME" '[["held", $by, "ibx live test A"], ["held", $by, "ibx live test B"]]')"
@@ -140,6 +158,11 @@ is "exec -i takes exactly 1 MiB" "$(head -c 1048576 /dev/zero | LC_ALL=C tr '\00
 head -c 1048577 /dev/zero | ibx exec "$A" -i -- 'wc -c' >/dev/null 2>&1
 check "exec -i refuses 1 MiB + 1 byte" 125 $?
 
+# The JSON view is a read-only assertion of the machine Secret selections checked by ibx.
+ibx ls --json >"$L/selections"
+yes_ "A and B have no selected, pending or residual Org Secrets" jq -e --arg a "$A" --arg b "$B" \
+	'[.[] | select(.name == $a or .name == $b)] | length == 2 and all(.[]; .secrets == false)' "$L/selections"
+
 # ---- put/get -------------------------------------------------------------------------------
 head -c 1000 /dev/urandom >"$L/f.bin"
 ibx exec "$A" -- "mkdir -p ~/$W/adir" >/dev/null
@@ -155,12 +178,12 @@ head -c 750000 /dev/urandom >"$L/max.bin"
 ibx put "$A" "$L/max.bin" "$W/max.bin" >/dev/null && ibx get "$A" "$W/max.bin" "$L/max.out" >/dev/null
 check "put and get of exactly 750000 bytes" 0 $?
 yes_ "750000 bytes round-trip unchanged" cmp -s "$L/max.bin" "$L/max.out"
-head -c 750001 /dev/zero >"$L/over.bin"
+head -c 5000000 /dev/urandom >"$L/over.bin"
 ibx put "$A" "$L/over.bin" "$W/over.bin" 2>/dev/null
-check "put of 750001 bytes is refused" 125 $?
-ibx exec "$A" -- "head -c 750001 /dev/zero >~/$W/big.bin" >/dev/null
-ibx get "$A" "$W/big.bin" "$L/big.out" 2>/dev/null
-check "get of 750001 bytes is refused" 125 $?
+check "put of five MB succeeds" 0 $?
+ibx get "$A" "$W/over.bin" "$L/big.out" 2>/dev/null
+check "get of five MB succeeds" 0 $?
+yes_ "five MB binary round-trip is unchanged" cmp -s "$L/over.bin" "$L/big.out"
 ibx put "$A" "$L/f.bin" "~/$W/tilde/f.bin" >/dev/null && ibx get "$A" "~/$W/tilde/f.bin" "$L/tilde.out" >/dev/null
 check "put and get with a leading ~/" 0 $?
 yes_ "~/ means HOME" cmp -s "$L/f.bin" "$L/tilde.out"
@@ -197,6 +220,18 @@ check "port rejects a non-number" 125 $?
 ibx unport "$A" ../../x 2>/dev/null
 check "unport rejects a path" 125 $?
 ibx exec "$A" -- "mkdir -p ~/$W/www && echo hi >~/$W/www/index.html && (setsid -f python3 -m http.server 8098 --directory ~/$W/www >/dev/null 2>&1); sleep 1" >/dev/null
+ibx forward "$A" 18098:8098 >"$L/forward.out" 2>"$L/forward.err" &
+pf=$!
+FORWARD_PID=$pf
+body=
+for _ in 1 2 3 4 5; do
+	body=$(curl -s -m 5 http://127.0.0.1:18098/) && [ "$body" = hi ] && break
+	sleep 1
+done
+is "private forward serves the test page" "$body" hi
+kill -TERM "$pf" 2>/dev/null || true
+wait "$pf" || true
+FORWARD_PID=
 URL=$(ibx port "$A" 8098 live-test 2>/dev/null)
 check "port" 0 $?
 body=''
@@ -206,7 +241,7 @@ for _ in 1 2 3 4 5; do
 done
 is "the public URL serves the page" "$body" hi
 ibx keepalive >"$L/keep" 2>&1
-check "keepalive" 0 $?
+# Other reservations may fail independently; verify only the two boxes held by this run.
 yes_ "keepalive leased A" grep -q "^$A: lease until" "$L/keep" || show "$L/keep"
 yes_ "keepalive leased B too" grep -q "^$B: lease until" "$L/keep"
 before=$(ibx ls --json | jq -r --arg a "$A" '.[] | select(.name == $a) | .since')

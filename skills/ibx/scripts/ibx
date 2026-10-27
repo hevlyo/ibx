@@ -20,9 +20,10 @@ shopt -s inherit_errexit
 umask 077
 # Before any child process (uname, cksum, curl -V, jq, mktemp...) inherits it; see load_key.
 ENV_KEY=${INSTABOX_API_KEY:-}
+export -n ENV_KEY
 unset INSTABOX_API_KEY
 
-IBX_VERSION=0.2.0
+IBX_VERSION=0.3.0
 
 stderr() { "$@" >&2 || true; } # a closed stderr must not replace the intended exit status
 
@@ -35,22 +36,24 @@ Agents
                                          The purpose must be ONE quoted argument. Write the name
                                          down: shell variables do not survive between calls.
                                          Metadata is public to the account: keep the purpose generic
-  ibx exec <box> [-t SECS] [-i] -- <cmd> run as the sandbox user with bash -lc (HOME /data/home).
+  ibx exec <box> [--stream] [-t SECS] [-i] -- <cmd> run as the sandbox user with bash -lc (HOME /data/home).
                                          Default 300 s, max 600; -i sends stdin (up to 1 MiB).
                                          One argument = a bash script; several = one quoted command
+                                         --stream opts into SSE; a dropped stream kills the command
   ibx put [--force] <box> <local> <remote>
-                                         copy a file in (up to 750 KB; relative paths under HOME).
+                                         copy a file in (up to 5 GiB; relative paths under HOME).
                                          Refuses files that look like credentials unless --force
-  ibx get <box> <remote> [local]         copy a file out (same limit, text or binary)
+  ibx get <box> <remote> [local]         copy a file out (binary safe; IBX_GET_MAX defaults to 2G)
   ibx ssh <box> [--] [cmd...]          ssh through a 1-hour token revoked on exit; streams stdio:
                                            ibx ssh BOX 'bash -s' <script.sh
                                            tar c dir | ibx ssh BOX 'tar x'
                                            ibx ssh BOX 'tar c dir' | tar x
+  ibx forward <box> [LOCAL:]REMOTE...   private localhost tunnel, foreground, 1-hour SSH token
   ibx port <box> <port> [name]           publish an HTTP port at a public URL (NO authentication)
   ibx unport <box> <port>                unpublish it
   ibx renew [--json] <box>               refresh your reservation (jobs that run past 24 h)
-  ibx release [--json] <box>             give it back: unpublish ibx ports, drop its lease and
-                                         reservation
+  ibx release [--json] <box>             give it back: unpublish ibx and reservation-created ports,
+                                         drop its lease and reservation
   ibx ls [--all] [--json]                pool sandboxes, state and holders (--all: every sandbox)
 
 Humans
@@ -65,20 +68,24 @@ Humans
 Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox, cap reached
 or local claim lock busy; 125 ibx itself failed (API, network, usage); 255 ssh could not connect;
 130/143 when
-ibx receives SIGINT/SIGTERM. The remote command may still be running after interruption.
-keepalive exits 1 when any lease could not be renewed.
+ibx receives SIGINT/SIGTERM. Exec disconnect kills its process group, partly-run work included;
+setsid children can survive. SSH commands may still run. keepalive exits 1 for real failures,
+not max-run cooldown skips. Leases prevent idle pause, not the free 480-minute max-run pause.
 
 Environment: INSTABOX_API_KEY (else the file IBX_KEY_FILE, default
 ${XDG_CONFIG_HOME:-~/.config}/instabox/api-key), INSTABOX_API_URL (https://api.instabox.sh;
 another host needs IBX_ALLOW_CUSTOM_API=1), IBX_AGENT_NAME (shown in reservations; default a
 pseudonymous id of this user, host and known agent session), IBX_STALE_SECS (reservation age
 that counts as abandoned, 86400), IBX_ALLOW_ANY=1 (commands outside the pool), IBX_ALLOW_VAULT=1
-(claim sandboxes that receive Vault secrets), IBX_MAX_CLAIMS (live reservations per agent,
+(claim sandboxes that receive Vault secrets), IBX_ALLOW_SECRETS=1 (proxy Secrets only,
+user-only; env Secrets stay refused), IBX_GET_MAX (download cap, default 2G), IBX_MAX_CLAIMS
+(live reservations per agent,
 default 3; 0 disables the cap), IBX_STATE_DIR (an atomic mkdir lock, default directory
 ${XDG_STATE_HOME:-~/.local/state}/ibx).
 claim, renew and release accept --json anywhere after the command. JSON includes warnings;
-errors have error.code (no_free_sandbox, claim_limit, lock_busy, failed, interrupted) and
-error.message. lock_busy exits 75 after waiting up to 5 minutes for a usable local lock.
+errors have error.code (no_free_sandbox, claim_limit, lock_busy, auth, account_blocked, failed,
+interrupted) and error.message. lock_busy exits 75 after waiting up to 5 minutes for a usable
+local lock.
 EOF
 }
 
@@ -92,8 +99,8 @@ if [ "$1" = exec ]; then
 	for a in "${@:2}"; do
 		case "$a" in -h | --help) usage; exit 0 ;; --) break ;; esac
 		if [ -n "$help_timeout" ]; then help_timeout=; continue; fi
-		if [ -z "$help_box" ]; then help_box=1; continue; fi
-		case "$a" in -i) ;; -t) help_timeout=1 ;; *) break ;; esac
+		if [ -z "$help_box" ]; then [ "$a" != --stream ] || continue; help_box=1; continue; fi
+		case "$a" in -i | --stream) ;; -t) help_timeout=1 ;; *) break ;; esac
 	done
 elif [ "$1" = ssh ]; then
 	for a in "${@:2}"; do
@@ -140,7 +147,16 @@ claim | renew | release)
 	;;
 esac
 [ -z "$JSON" ] || exec {JSON_FD}>&1 # die can run inside a command substitution
+COMMAND=$1
+STREAM=
+EXEC_SAFE=
+SIGNAL_FD=
+if exec {SIGNAL_FD}>&2; then :; else SIGNAL_FD=; fi
 kept_claim=null
+curl_pid=
+file_transfer=
+ssh_pid=
+ssh_filter_pid=
 sleep_pid=
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX") || {
@@ -161,6 +177,9 @@ cleanup() {
 		kill "$sleep_pid" 2>/dev/null || true
 		wait "$sleep_pid" 2>/dev/null || true
 	fi
+	if [ -n "$curl_pid" ]; then kill "$curl_pid" 2>/dev/null || true; wait "$curl_pid" 2>/dev/null || true; fi
+	if [ -n "$ssh_pid" ]; then kill "$ssh_pid" 2>/dev/null || true; wait "$ssh_pid" 2>/dev/null || true; fi
+	if [ -n "$ssh_filter_pid" ]; then kill "$ssh_filter_pid" 2>/dev/null || true; wait "$ssh_filter_pid" 2>/dev/null || true; fi
 	for f in "${cleanup_fns[@]}"; do "$f" || true; done
 	if [ "$rc" != 0 ] && [ ! -s "$tmp/result" ] && [ ! -s "$tmp/error" ]; then
 		json_error failed "exit $rc" "$kept_claim"
@@ -183,10 +202,17 @@ cleanup() {
 }
 interrupted() {
 	local message="interrupted by SIG$1: a remote command it started may still be running"
+	case $COMMAND in exec | put | get)
+		message="interrupted by SIG$1: the remote command was killed when the connection closed; it may have run partly; processes it started in a new session (setsid) keep running" ;;
+	esac
+	case $file_transfer in
+	PUT) message="interrupted by SIG$1: the file upload stopped; the remote file may have been replaced; check before retrying" ;;
+	GET) message="interrupted by SIG$1: the file download stopped; check the local destination" ;;
+	esac
 	if [ "$kept_claim" != null ]; then
 		message+="; sandbox still reserved: $(jq -r 'map(.name) | join(", ")' <<<"$kept_claim")"
 	fi
-	warn "$message"
+	if [ -n "$SIGNAL_FD" ]; then warn "$message" 2>&"$SIGNAL_FD"; else warn "$message"; fi
 	json_error interrupted "$message" "$kept_claim"
 	exit "$2"
 }
@@ -210,7 +236,16 @@ json_error() { # commit one complete object; only the main EXIT cleanup prints i
 	# Hard-link creation is atomic and refuses an existing destination, including another error.
 	ln "$candidate" "$tmp/error" 2>/dev/null || true
 }
-die() { stderr printf 'ibx: %s\n' "$*"; json_error failed "$*"; exit 125; }
+fatal_check() { [ ! -s "$tmp/fatal" ] || die "API refused the request"; }
+die() { # fatal API refusals survive command substitutions and outer handlers
+	local code=failed message="$*"
+	if [ -s "$tmp/fatal" ]; then
+		code=$(jq -r .code "$tmp/fatal") message=$(jq -r .message "$tmp/fatal")
+	fi
+	stderr printf 'ibx: %s\n' "$message"
+	json_error "$code" "$message" "$kept_claim"
+	exit 125
+}
 warn() {
 	stderr printf 'ibx: %s\n' "$*"
 	if [ -n "$JSON" ] && command -v jq >/dev/null; then
@@ -284,9 +319,12 @@ fi
 # The key stays in this (unexported) variable and reaches curl through stdin (-H @-): it is never
 # in argv, in the environment of child processes, or in a file that a SIGKILL would leave behind.
 AUTH=
+export -n AUTH
 KEY_SOURCE=
 load_key() {
-	local key=$ENV_KEY
+	local key
+	export -n key
+	key=$ENV_KEY
 	KEY_SOURCE=INSTABOX_API_KEY
 	if [ -z "$key" ] && [ -r "$KEYFILE" ]; then
 		[ -z "$(find "$KEYFILE" -prune \( -perm -040 -o -perm -004 \) 2>/dev/null)" ] ||
@@ -303,6 +341,7 @@ if [ "$1" != doctor ]; then
 fi
 
 idem() { od -An -N12 -tx1 /dev/urandom | tr -d ' \n'; }
+now_precise() { jq -nr 'now * 1000 | floor | . as $ms | (($ms / 1000 | floor | todate | rtrimstr("Z")) + "." + ((1000 + $ms % 1000 | tostring)[1:]) + "Z")'; }
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 size_of() { wc -c <"$1" | tr -d ' '; }
 shuffle() { # lines of stdin in random order (no shuf on macOS)
@@ -333,17 +372,45 @@ api() {
 	case "$m $p" in GET* | "POST "*/exec | "POST "*/ssh-tokens | PUT* | "POST "*/ports | "DELETE "*/ports/* | "DELETE "*/activity-leases/* | "DELETE "*/ssh-tokens/* | "POST "*/wake) ;;
 	*) args+=(-H "Idempotency-Key: ibx-$(idem)") ;;
 	esac
-	code=$(printf '%s\n' "$AUTH" | curl "${args[@]}" "$API$p") || {
-		rc=$?
+	if [[ $m == POST && $p == */exec ]]; then
+		curl "${args[@]}" "$API$p" < <(printf '%s\n' "$AUTH") >"$tmp/http-status" &
+		curl_pid=$!
+		rc=0
+		wait "$curl_pid" || rc=$?
+		curl_pid=
+		code=$(cat "$tmp/http-status")
+	else
+		rc=0
+		code=$(printf '%s\n' "$AUTH" | curl "${args[@]}" "$API$p") || rc=$?
+	fi
+	printf '%s\n' "$code" >"$tmp/status"
+	if [ "$rc" != 0 ]; then
 		stderr printf '{"error":{"code":"transport","message":"curl exit %s on %s %s","retryable":false}}\n' "$rc" "$m" "$p"
 		return 1
-	}
+	fi
+	api_refusal "$code" "$tmp/resp"
 	case "$code" in
 	2??) cat "$tmp/resp" ;;
 	*) stderr cat "$tmp/resp"; stderr echo; return 1 ;;
 	esac
 }
-err_code() { jq -r '.error.code // empty' <"$1" 2>/dev/null || true; }
+err_code() { jq -r '.error.code // empty' 2>/dev/null <"$1" || true; }
+
+auth_code() {
+	case $1 in missing_key | malformed_key | invalid_key | expired_key | revoked_key | session_expired | missing_scope | insufficient_scope | unauthenticated | api_key_expired | api_key_revoked) return 0 ;; *) return 1 ;; esac
+}
+api_refusal() { # status body-file: remember account-wide failures, including from subshells
+	local code message kind=
+	code=$(err_code "$2")
+	if [ "$1" = 401 ] || auth_code "$code"; then kind=auth; fi
+	case $code in credit_exhausted | spend_limit_reached | subscription_required | payment_method_required | payment_failed) kind=account_blocked ;; esac
+	[ "$1" != 402 ] || kind=account_blocked
+	[ -n "$kind" ] || return 0
+	message=$(jq -r "$JQ_DEFS"' .error | [.code,.message,.hint,((.requiredScopes // []) | join(", "))] | map(select(. != null and . != "") | tostring | clean) | join("; ")' "$2" | printable)
+	if [ "$kind" = auth ] && [ "$COMMAND" = exec ]; then message="exec rejected (the command did not run); $message"; fi
+	if [ "$kind" = auth ]; then message+="; ask the user to fix this key; never look for another one"; fi
+	jq -cn --arg c "$kind" --arg m "$message" '{code:$c,message:$m}' >"$tmp/fatal"
+}
 
 all_machines() { # every sandbox of the account (GET /v1/machines is paged)
 	local page cursor='' acc='[]'
@@ -365,6 +432,12 @@ JQ_DEFS='def age($now): (.metadata["ibx.claim.at"] // "") as $a | if $a == "" th
 	def free($now; $stale): age($now) as $g | $g == null or ($g != "invalid" and $g > $stale);
 	def inpool: (.metadata["ibx.pool"] // "") == "1";
 	def vaulton: if .vault == false then false else true end;
+	def timestamp: if type == "string" then (try (
+		capture("^(?<base>[0-9T:-]+)(?:\\.(?<fraction>[0-9]+))?(?:Z|\\+00:00)$") |
+		(.base + "Z" | fromdateiso8601) + (("0." + (.fraction // "0")) | tonumber)) catch null) else null end;
+	def pauses: if (.maxRunMinutes // -1) > 0 then (.runStartedAt | timestamp) as $s |
+		if $s == null then null else ($s + .maxRunMinutes * 60 | todate) end else null end;
+	def available($now): (.maxRunMinutes // -1) != 0 and ((.cooldownUntil | timestamp) // 0) <= $now;
 	def clean: if type == "string" then gsub("[\u0000-\u001f\u007f-\u009f]"; " ") else . end;'
 
 resolve() { # [--pool] name-or-id -> id. With --pool, only pool sandboxes (agent commands).
@@ -384,10 +457,49 @@ resolve() { # [--pool] name-or-id -> id. With --pool, only pool sandboxes (agent
 vault_items() { # id -> number of Vault items written into the sandbox (0 when the Vault is off)
 	local r
 	r=$(api GET "/v1/machines/$1/vault" 2>"$tmp/verr") || {
+		if [ "$(err_code "$tmp/verr")" = permission_denied ]; then
+			warn "cannot inspect the Vault of ${2:-$1} with this key (workspace key or not its creator); recreate it with --no-vault --secrets none"
+		fi
 		[ "$(err_code "$tmp/verr")" = not_found ] && { echo 0; return 0; } # a server without Vault
 		return 1
 	}
-	jq -r 'if .enabled == false then 0 else ([.items[]?] | length) end' <<<"$r"
+	jq -er 'if (.enabled | type) != "boolean" or (.items | type) != "array" then error("invalid Vault response") else (if .enabled == false then 0 else (.items | length) end) + ((.applied.files // []) | length) + ((.applied.kept // []) | length) end' <<<"$r"
+}
+
+secrets_state() { # id: clean only on an explicit empty selection; never print Secret values
+	local r
+	if ! r=$(api GET "/v1/machines/$1/secrets" 2>"$tmp/serr"); then
+		if [ "$(err_code "$tmp/serr")" = not_found ]; then
+			if [ ! -s "$tmp/org-secrets-limit" ]; then
+				r=$(api GET /v1/usage) || return 1
+				jq -r '.limits.orgSecrets == true' <<<"$r" >"$tmp/org-secrets-limit"
+			fi
+			[ "$(cat "$tmp/org-secrets-limit")" = false ] && return 0
+		fi
+		return 1
+	fi
+	jq -e --arg allow "${IBX_ALLOW_SECRETS:-}" '
+		(.secrets | type == "array" and length == 0) and
+		((.envSecrets // []) | type == "array" and length == 0) and
+		((.items // []) | type == "array") and ((.guest.items // []) | type == "array" and length == 0) and
+		(.proxy.state != "pending") and (.guest.state != "pending") and
+		(if $allow == "1" then all(.items[]?; .delivery != "env") else (.items // []) == [] end)
+		or ($allow == "1" and (.secrets | type == "array" or . == "all") and
+		 ((.envSecrets // []) == []) and ((.guest.items // []) == []) and
+		 (.guest.state != "pending") and (.proxy.state != "pending") and
+		 (.items | type == "array") and all(.items[]; .delivery == "proxy"))' <<<"$r" >/dev/null
+}
+cooldown_wait() { # error-file machine-json deadline: safe only when no command started
+	local seconds until
+	until=$(jq -r "$JQ_DEFS"' .cooldownUntil // empty | clean' <<<"$2")
+	seconds=$(jq -r --argjson m "$2" "$JQ_DEFS"'
+		.error.retryAfterSeconds // (((($m.cooldownUntil | timestamp) // 0) - now) | ceil)' "$1")
+	if [[ $seconds =~ ^[0-9]+$ ]] && [ "$seconds" -gt 0 ] && [ "$seconds" -lt "$(( $3 - SECONDS - 2 ))" ]; then
+		sleep_for "$((seconds + RANDOM % 2))"
+		return 0
+	fi
+	warn "${LABEL:-sandbox} is in its max-run cooldown until ${until:-the server permits a wake}"
+	return 1
 }
 
 wait_op() { # operation-id: waits up to 8 minutes
@@ -396,6 +508,7 @@ wait_op() { # operation-id: waits up to 8 minutes
 	[[ $op =~ ^[A-Za-z0-9_-]+$ ]] || { warn "unexpected operation id"; return 1; }
 	while [ $SECONDS -lt $end ]; do
 		if ! r=$(api GET "/v1/operations/$op?wait=25s" 2>"$tmp/operr"); then
+			fatal_check
 			[ "$(err_code "$tmp/operr")" = not_found ] && { warn "operation $op not found"; return 1; }
 			sleep_for 3
 			continue
@@ -414,7 +527,7 @@ wait_op() { # operation-id: waits up to 8 minutes
 ensure_running() {
 	local m op opid state action nm=$1 end=$((SECONDS + 600)) notready=
 	while [ $SECONDS -lt $end ]; do
-		m=$(api GET "/v1/machines/$1") || { sleep_for 3; continue; }
+		m=$(api GET "/v1/machines/$1") || { [ ! -s "$tmp/fatal" ] || return 3; sleep_for 3; continue; }
 		nm=$(jq -r "$JQ_DEFS"' .name // "" | clean' <<<"$m")
 		[ -n "$nm" ] || nm=$1
 		state=$(jq -r .state <<<"$m")
@@ -442,6 +555,10 @@ ensure_running() {
 				fi
 			elif [ "$(err_code "$tmp/err")" = operation_conflict ]; then
 				wait_op "$(jq -r '.error.operationId // empty' <"$tmp/err")" || return 1
+			elif [ "$(err_code "$tmp/err")" = machine_cooldown ]; then
+				cooldown_wait "$tmp/err" "$m" "$end" || return 1
+			elif [ -s "$tmp/fatal" ]; then
+				return 3
 			else
 				stderr cat "$tmp/err"
 				return 1
@@ -611,30 +728,94 @@ claim_limit() {
 	fi
 }
 
+stream_exec() { # id timeout: stdout/stderr pass through; only pre-start JSON refusals may retry
+	local id=$1 timeout=$2 line headers=1 status=000 streamed='' event='' payload exit_seen='' rc=0
+	rm -f "$tmp/sse"
+	mkfifo "$tmp/sse" || die "could not open the exec stream"
+	: >"$tmp/sse-body"
+	curl -q -N -sS -i --suppress-connect-headers -m "$((timeout + 90))" -X POST -H @- \
+		-H 'Content-Type: application/json' -H 'Accept: text/event-stream' \
+		--data-binary @"$tmp/exec" "$API/v1/machines/$id/exec" \
+		< <(printf '%s\n' "$AUTH") >"$tmp/sse" 2>"$tmp/err" &
+	curl_pid=$!
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=${line%$'\r'}
+		if [ -n "$headers" ]; then
+			case $line in
+			HTTP/*) read -r _ status _ <<<"$line"; streamed= ;;
+			'') case $status in 1??) ;; *) headers= ;; esac ;;
+			*) case ${line,,} in content-type:*text/event-stream*) streamed=1 ;; esac ;;
+			esac
+			continue
+		fi
+		if [ -z "$streamed" ]; then printf '%s\n' "$line" >>"$tmp/sse-body"; continue; fi
+		case $line in
+		event:*) event=${line#event:}; event=${event# } ;;
+		data:*)
+			payload=${line#data:}
+			case $event in
+			stdout | stderr)
+				jq -e '.data | type == "string"' <<<"$payload" >/dev/null || die "invalid exec stream output"
+				if [ "$event" = stdout ]; then jq -j .data <<<"$payload" || die "could not write exec output"
+				else stderr jq -j .data <<<"$payload"; fi ;;
+			exit)
+				jq -e '.exitCode | type == "number" and . == floor and . >= 0 and . <= 255' <<<"$payload" >/dev/null || die "invalid exec stream exit"
+				R=$(jq -c '.stdout = "" | .stderr = ""' <<<"$payload") || die "invalid exec stream result"
+				exit_seen=1 ;;
+			error) die "exec stream failed after starting; the command was killed and may have run partly; check before retrying: $(jq -r "$JQ_DEFS"' .error.message // "stream error" | clean' <<<"$payload")" ;;
+			esac ;;
+		'') event= ;;
+		esac
+	done <"$tmp/sse"
+	wait "$curl_pid" || rc=$?
+	curl_pid=
+	if [ -n "$streamed" ]; then
+		[ "$rc" = 0 ] && [ -n "$exit_seen" ] || die "exec stream closed without a complete result; the command was killed and may have run partly; check before retrying"
+		return 0
+	fi
+	cp "$tmp/sse-body" "$tmp/err"
+	api_refusal "$status" "$tmp/err"
+	case $status in
+	2??) if [ "$rc" = 0 ] && jq -e 'has("exitCode")' "$tmp/sse-body" >/dev/null; then R=$(cat "$tmp/sse-body"); return 0; fi ;;
+	esac
+	return 1
+}
+
 exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call it directly, not
 	# in $(...): then a SIGTERM while it waits for a slot ends ibx before it tries again.
-	local id=$1 t=$2 code starts=0 end=$((SECONDS + 600))
+	local id=$1 t=$2 code starts=0 end=$((SECONDS + 600)) m safe=${EXEC_SAFE:-}
+
 	if [ $# -ge 4 ]; then
 		jq -n --arg c "$3" --argjson t "$t" --rawfile s "$4" '{cmd:$c, timeoutSeconds:$t, stdin:$s}' >"$tmp/exec"
 	else
 		jq -n --arg c "$3" --argjson t "$t" '{cmd:$c, timeoutSeconds:$t}' >"$tmp/exec"
 	fi
 	while :; do
-		if R=$(IBX_EXEC_MAXTIME=$((t + 90)) api POST "/v1/machines/$id/exec" "$tmp/exec" 2>"$tmp/err"); then
+		if [ -n "${STREAM:-}" ]; then
+			if stream_exec "$id" "$t"; then return 0; fi
+		elif IBX_EXEC_MAXTIME=$((t + 90)) api POST "/v1/machines/$id/exec" "$tmp/exec" >"$tmp/exec-result" 2>"$tmp/err"; then
+			R=$(cat "$tmp/exec-result")
 			return 0
 		fi
+		fatal_check
 		code=$(err_code "$tmp/err")
 		case "$code" in
-		quota_exceeded) # at most 4 execs at once per account: wait for a slot
-			[ $SECONDS -lt $end ] || { stderr cat "$tmp/err"; die "exec did not run: 4 other execs kept the account busy for 10 minutes"; }
+		quota_exceeded) # a refusal means the command did not run
+			[ $SECONDS -lt $end ] || { stderr cat "$tmp/err"; die "exec did not run: the account's concurrent-request limit stayed full for 10 minutes"; }
 			sleep_for "$((5 + RANDOM % 5))" ;;
 		machine_not_running) # it never started, so retrying is safe
 			starts=$((starts + 1))
 			[ $starts -le 3 ] || { stderr cat "$tmp/err"; die "exec did not run: ${LABEL:-the sandbox} keeps stopping"; }
 			ensure_running "$id" || die "exec did not run: could not start ${LABEL:-the sandbox}" ;;
+		machine_cooldown)
+			m=$(api GET "/v1/machines/$id") || die "could not read the cooldown"
+			cooldown_wait "$tmp/err" "$m" "$end" || die "exec did not run: ${LABEL:-sandbox} is in its max-run cooldown"
+			;;
+		max_run_disabled) die "exec did not run: max-run is disabled for ${LABEL:-sandbox}" ;;
 		bad_request | unauthenticated | api_key_expired | api_key_revoked | permission_denied | insufficient_scope | not_found | bad_path)
 			stderr cat "$tmp/err"; die "exec rejected (the command did not run)" ;;
 		host_unavailable)
+			[ -n "$safe" ] || die "exec was cut off (the API server restarted; the command may have run partly and was killed; check before retrying)"
 			if [ "$(jq -r '.error.retryable // false' <"$tmp/err")" = true ] && [ $SECONDS -lt $end ]; then sleep_for 5; continue; fi
 			stderr cat "$tmp/err"; die "exec failed (the command may or may not have run; check before retrying)" ;;
 		*) stderr cat "$tmp/err"; die "exec failed (the command may or may not have run; check before retrying)" ;;
@@ -646,10 +827,71 @@ remote_cmd() { # args -> one bash command line: a single argument is a script, s
 	if [ $# -eq 1 ]; then printf '%s' "$1"; else printf '%q ' "$@"; fi
 }
 
+file_api() { # METHOD id remote-path local-file: raw bytes, bounded storage, repeat-safe requests
+	local method=$1 id=$2 remote=$3 local_file=$4 query code rc end=$((SECONDS + 600)) m starts=0
+	file_transfer=$method
+	query=$(jq -rn --arg p "$remote" '$p | @uri')
+	local args=(-q -sS -m 7200 -H @-)
+	if [ "$method" = PUT ]; then
+		args+=(-T "$local_file" -H 'Content-Type: application/octet-stream' -o "$tmp/file-body")
+		query="/v1/machines/$id/files?path=$query&parents=true"
+	else
+		local cap=${IBX_GET_MAX:-2G} bytes
+		[[ $cap =~ ^[0-9]+[kKmMgG]?$ ]] || die "IBX_GET_MAX must be bytes or an integer with K, M or G"
+		bytes=$(jq -nr --arg c "$cap" '$c | capture("^(?<n>[0-9]+)(?<u>[kKmMgG]?)$") | (.n | tonumber) * ({"":1,k:1024,m:1048576,g:1073741824}[.u | ascii_downcase])')
+		[ "$bytes" != 0 ] || die "IBX_GET_MAX must be greater than zero"
+		args+=(--max-filesize "$bytes" -o "$local_file")
+		query="/v1/machines/$id/files/content?path=$query"
+	fi
+	while :; do
+		rc=0
+		curl "${args[@]}" -D "$tmp/file-headers" -w '%{http_code}' "$API$query" \
+			< <(printf '%s\n' "$AUTH") >"$tmp/file-status" &
+		curl_pid=$!
+		wait "$curl_pid" || rc=$?
+		curl_pid=
+		code=$(cat "$tmp/file-status")
+		if [[ $code != 2* ]]; then
+			[ "$method" != GET ] || cp "$local_file" "$tmp/file-body"
+			api_refusal "$code" "$tmp/file-body"
+			fatal_check
+		fi
+		if [ "$rc" != 0 ]; then
+			if [ "$method" = PUT ]; then die "file upload failed (curl exit $rc); the remote file may have been replaced; check before retrying"; fi
+			die "file download failed (curl exit $rc); destination was not replaced"
+		fi
+		case $code in 2??) return 0 ;; esac
+		if [ "$code" = 404 ] && jq -e '.error.code == "not_found" and (.error.message | test("route.*not.*found|unknown route"; "i"))' "$tmp/file-body" >/dev/null; then file_transfer=; return 2; fi
+		case $(err_code "$tmp/file-body") in
+		host_unavailable)
+			jq -e '.error.retryable == true' "$tmp/file-body" >/dev/null && [ "$SECONDS" -lt "$end" ] || die "file transfer interrupted"
+			sleep_for 5 ;;
+		quota_exceeded)
+			[ "$SECONDS" -lt "$end" ] || die "file transfer did not run: concurrent-request limit stayed full"
+			sleep_for 5 ;;
+		machine_not_running)
+			starts=$((starts + 1))
+			[ "$starts" -le 3 ] && [ "$SECONDS" -lt "$end" ] || die "file transfer did not run: $LABEL keeps stopping"
+			ensure_running "$id" || die "could not start $LABEL for file transfer" ;;
+		machine_cooldown)
+			m=$(api GET "/v1/machines/$id") || die "could not read cooldown"
+			cooldown_wait "$tmp/file-body" "$m" "$end" || die "file transfer did not run: max-run cooldown" ;;
+		not_a_file) die "destination is a directory: give the file name too" ;;
+		no_space) die "file transfer failed: disk full" ;;
+		too_large) die "file transfer failed: server limit is 5 GiB" ;;
+		*) die "file transfer failed: $(jq -r '.error.message // "API error"' "$tmp/file-body" | printable)" ;;
+		esac
+	done
+}
+file_sha() {
+	if command -v sha256sum >/dev/null; then sha256sum <"$1" | cut -d' ' -f1
+	else shasum -a 256 <"$1" | cut -d' ' -f1; fi
+}
+
 public_ports() { # id -> "port US name US url" lines (US = \x1f keeps empty fields)
 	local r
 	r=$(api GET "/v1/machines/$1/ports") || return 1
-	jq -r "$JQ_DEFS"' .ports[]? | select(.port | type == "number") | [(.port|tostring), (.name // "" | clean), (.url | clean)] | join("\u001f")' <<<"$r"
+	jq -r "$JQ_DEFS"' .ports[]? | select(.port | type == "number") | [(.port|tostring), (.name // "" | clean), (.url | clean), (.createdAt // "")] | join("\u001f")' <<<"$r"
 }
 
 unpublish() { # id port: also fine when it is already gone (a retried DELETE gets 404)
@@ -688,9 +930,18 @@ ls)
 	all='' json=''
 	for a in "$@"; do case "$a" in --all) all=1 ;; --json) json=1 ;; *) die "usage: ibx ls [--all] [--json]" ;; esac; done
 	ms=$(all_machines) || die "could not list sandboxes"
-	rows=$(jq --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
+	secrets_rows='{}'
+	while IFS= read -r id; do
+		[[ $id =~ ^m_[a-z2-7]{26}$ ]] || continue
+		secret=true
+		IBX_ALLOW_SECRETS='' secrets_state "$id" && secret=false
+		fatal_check
+		secrets_rows=$(jq -c --arg id "$id" --argjson value "$secret" '. + {($id):$value}' <<<"$secrets_rows")
+	done < <(jq -r '.[].id' <<<"$ms")
+	rows=$(jq --argjson secrets "$secrets_rows" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
 		[.[] | select($all == "1" or inpool) | age($now) as $age | {
-			name: (.name | clean), id, state, pool: inpool, vault: vaulton,
+			name: (.name | clean), id, state, pool: inpool, vault: vaulton, secrets:$secrets[.id],
+			pausesAt:pauses, cooldownUntil:(.cooldownUntil // null | clean), maxRunMinutes, runStartedAt,
 			reservation: (if $age == null then "free"
 				elif $age == "invalid" then "invalid"
 				elif $age > $stale then "abandoned" else "held" end),
@@ -705,7 +956,7 @@ ls)
 			elif .reservation == "abandoned" then "free (abandoned reservation by \(.by // "?"))"
 			elif .reservation == "invalid" then "held? reservation date unreadable (\(.since)); only the user should release it"
 			else "held by \(.by // "?") since \(.since): \(.purpose // "")" end),
-			(if .pool then "" else "not in pool" end)] | @tsv' <<<"$rows" | table
+			(if .pool then "" else "not in pool" end), (.pausesAt // ""), (.cooldownUntil // "")] | @tsv' <<<"$rows" | table
 	fi
 	;;
 pool)
@@ -727,13 +978,14 @@ pool)
 			id=$(resolve "$b")
 			if [ "$sub" = add ]; then
 				m=$(api GET "/v1/machines/$id") || die "could not read $b"
+				n=$(vault_items "$id" "$b") || die "could not read the Vault of $b"
+				if [ "$n" != 0 ] && [ -z "$allow_vault" ]; then
+					die "$b receives $n Vault secret(s) at every boot, and agents run untrusted code in pool sandboxes. Use a sandbox created with --no-vault, or ibx pool add --allow-vault $b to accept that"
+				fi
 				if [ "$(jq -r "$JQ_DEFS"' vaulton' <<<"$m")" = true ]; then
-					n=$(vault_items "$id") || die "could not read the Vault of $b"
-					if [ "$n" != 0 ] && [ -z "$allow_vault" ]; then
-						die "$b receives $n Vault secret(s) at every boot, and agents run untrusted code in pool sandboxes. Use a sandbox created with --no-vault, or ibx pool add --allow-vault $b to accept that"
-					fi
 					warn "note: $b has the Vault on ($n item(s) now). Secrets you add to the Vault later reach it; a sandbox created with --no-vault is safer"
 				fi
+				secrets_state "$id" || die "$b has Org Secrets or cannot be inspected; clear both selections with PATCH /v1/machines/ID/secrets {\"secrets\":[],\"envSecrets\":[]}, or recreate with --no-vault --secrets none"
 				set_meta "$id" '. + {"ibx.pool": "1"}' || die "could not add $b"
 				echo "added $b to the pool"
 			else
@@ -771,8 +1023,9 @@ claim)
 		[ "$(jq "$JQ_DEFS"' [.[] | select(inpool)] | length' <<<"$ms")" != 0 ] ||
 			die "the pool is empty: ask the user to run  ibx pool add <box>"
 		claim_limit "$ms" "$token"
-		cands='[.[] | select(inpool) | select(free($now; $stale))'
-		running=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' | select(.state == "running")] | .[].id' <<<"$ms" | shuffle)
+		cands='[.[] | select(inpool) | select(free($now; $stale)) | select(available($now))'
+		shuffled=$(jq -c '.[]' <<<"$ms" | shuffle | jq -sc .)
+		running=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' | select(.state == "running" )] | sort_by(-(((pauses | timestamp) // 1e15) - $now | floor / 3600 | floor)) | .[].id' <<<"$shuffled")
 		others=$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS $cands"' |
 			select(.state | IN("suspended","stopped","starting","resuming","suspending","stopping"))] | .[].id' <<<"$ms" | shuffle)
 		for id in $running $others; do
@@ -780,26 +1033,27 @@ claim)
 			# Short API calls here (8 s including curl's retries), so the confirmation window below
 			# outlasts another agent's PATCH.
 			IBX_MAXTIME=8
-			m=$(api GET "/v1/machines/$id") || { apierr=1; continue; }
+			m=$(api GET "/v1/machines/$id") || { fatal_check; apierr=1; continue; }
 			[ "$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"' free($now; $stale)' <<<"$m")" = true ] || continue
 			name=$(jq -r "$JQ_DEFS"' .name | clean' <<<"$m")
-			if [ "$(jq -r "$JQ_DEFS"' vaulton' <<<"$m")" = true ] && [ "${IBX_ALLOW_VAULT:-}" != 1 ]; then
-				n=$(vault_items "$id") || { apierr=1; continue; }
+			if [ "${IBX_ALLOW_VAULT:-}" != 1 ]; then
+				n=$(vault_items "$id" "${b:-${name:-$id}}") || { fatal_check; apierr=1; continue; }
 				[ "$n" = 0 ] || { warn "skipping $name: the Vault writes $n secret(s) into it"; continue; }
 			fi
+			if ! secrets_state "$id"; then fatal_check; warn "skipping $name: Org Secrets are selected, pending, or cannot be inspected"; continue; fi
 			claim_lock
-			fresh=$(all_machines) || { claim_unlock; apierr=1; continue; }
+			fresh=$(all_machines) || { claim_unlock; fatal_check; apierr=1; continue; }
 			ms=$fresh
 			claim_limit "$fresh" "$token"
 			m=$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$fresh")
 			if [ -z "$m" ] || [ "$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" \
-				"$JQ_DEFS"' inpool and free($now; $stale)' <<<"$m")" != true ]; then
+				"$JQ_DEFS"' inpool and free($now; $stale) and available($now)' <<<"$m")" != true ]; then
 				claim_unlock
 				continue
 			fi
 			name=$(jq -r "$JQ_DEFS"' .name | clean' <<<"$m")
-			claim=$(jq -cn --arg by "$AGENT" --arg at "$(now_iso)" --arg p "${purpose:0:500}" --arg t "$token" \
-				'{"ibx.claim.by":$by, "ibx.claim.at":$at, "ibx.claim.purpose":$p, "ibx.claim.token":$t}')
+			claim=$(jq -cn --arg by "$AGENT" --arg at "$(now_iso)" --arg start "$(now_precise)" --arg p "${purpose:0:500}" --arg t "$token" \
+				'{"ibx.claim.by":$by, "ibx.claim.at":$at, "ibx.claim.start":$start, "ibx.claim.purpose":$p, "ibx.claim.token":$t}')
 			claimed_ids+=("$id")
 			write_rc=0
 			CLAIM_WRITE_TOKEN=$token set_claim "$id" "$claim" || write_rc=$?
@@ -818,7 +1072,11 @@ claim)
 			done
 			IBX_MAXTIME=''
 			[ -n "$ok" ] || continue
-			ensure_running "$id" || { warn "$name would not start; trying another"; set_claim "$id" '{}' || true; continue; }
+			ensure_running "$id" || { fatal_check; warn "$name would not start; trying another"; set_claim "$id" '{}' || true; continue; }
+			m=$(api GET "/v1/machines/$id") || die "could not read the claimed sandbox"
+			pauses=$(jq -c "$JQ_DEFS"' pauses' <<<"$m")
+			cooldown=$(jq -c '.cooldownUntil // null' <<<"$m")
+			if jq -e "$JQ_DEFS"' (pauses | timestamp) as $p | $p != null and $p - now < 3600' <<<"$m" >/dev/null; then warn "$name has under 60 minutes left before its max-run pause"; fi
 			kept_claim=$(jq -cn --arg n "$name" --arg id "$id" '[{name:$n,id:$id}]')
 			claimed_ids=("${claimed_ids[@]/$id/}") # ours to keep: do not clear it on exit
 			# Keep it awake from now on; a keepalive timer renews this lease while it is reserved.
@@ -827,6 +1085,7 @@ claim)
 			if lease_reply=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>/dev/null); then
 				lease=$(jq -c "$JQ_DEFS"' .expiresAt | clean' <<<"$lease_reply")
 			else
+				fatal_check
 				warn "could not set the activity lease on $name: it may pause after 30 idle minutes"
 			fi
 			port_rows='[]'
@@ -835,7 +1094,7 @@ claim)
 				port_rows=null
 			elif [ -n "$ports" ]; then
 				warn "WARNING: $name still has public ports from before (no authentication):"
-				while IFS=$'\037' read -r port pname url; do
+				while IFS=$'\037' read -r port pname url created; do
 					[[ $port =~ ^[0-9]+$ ]] || continue
 					if [ -n "$JSON" ]; then warn "  $port $pname $url"; else stderr printf '  %s %s %s\n' "$port" "$pname" "$url"; fi
 					port_rows=$(jq -c --argjson p "$port" --arg n "$pname" --arg u "$url" '. + [{port:$p,name:$n,url:$u}]' <<<"$port_rows")
@@ -843,7 +1102,7 @@ claim)
 			fi
 			if [ -n "$JSON" ]; then
 				jq -cn --arg n "$name" --arg id "$id" --argjson c "$claim" --argjson l "$lease" \
-					--argjson p "$port_rows" '{name:$n,id:$id,by:$c["ibx.claim.by"],since:$c["ibx.claim.at"],
+					--argjson p "$port_rows" --argjson pause "$pauses" --argjson cool "$cooldown" '{pausesAt:$pause,cooldownUntil:$cool,name:$n,id:$id,by:$c["ibx.claim.by"],since:$c["ibx.claim.at"],
 					purpose:$c["ibx.claim.purpose"],leaseUntil:$l,publicPorts:$p}' >"$tmp/result"
 			else
 				printf '%s\n' "$name"
@@ -856,6 +1115,7 @@ claim)
 		fi
 		sleep_for 20 # some were changing state: look once more
 	done
+	fatal_check
 	[ -z "$apierr" ] || die "could not claim a sandbox: API errors (see above)"
 	claim_limit "$ms" "$token"
 	held=$(held_claims "$ms")
@@ -885,12 +1145,16 @@ release)
 	id=$(resolve --pool "$1")
 	m=$(api GET "/v1/machines/$id") || die "could not read $1"
 	ports=$(public_ports "$id") || die "could not list the public ports of $1; nothing released, try again"
-	left='' unpublished='[]' left_alone='[]'
-	while IFS=$'\037' read -r port name url; do
+	left='' unpublished='[]' left_alone='[]' reasons='[]'
+	start=$(jq -r '.metadata["ibx.claim.start"] // empty' <<<"$m")
+	while IFS=$'\037' read -r port name url created; do
 		[[ $port =~ ^[0-9]+$ ]] || continue
-		if [[ $name == ibx:* ]]; then
+		during=
+		if jq -en --arg s "$start" --arg c "$created" "$JQ_DEFS"' ($s | timestamp) as $s | ($c | timestamp) as $c | $s != null and $c != null and $c >= $s' >/dev/null; then during=1; fi
+		if [[ $name == ibx:* ]] || [ -n "$during" ]; then
 			if unpublish "$id" "$port"; then
 				unpublished=$(jq -c --argjson p "$port" '. + [$p]' <<<"$unpublished")
+				reasons=$(jq -c --argjson p "$port" --arg why "$(if [ -n "$during" ]; then echo 'created during the reservation'; else echo 'published by ibx'; fi)" '. + [{port:$p,reason:$why}]' <<<"$reasons")
 				[ -n "$JSON" ] || echo "unpublished port $port of $1"
 			else left+=" $url"; fi
 		else
@@ -902,8 +1166,8 @@ release)
 	api DELETE "/v1/machines/$id/activity-leases/$LEASE" >/dev/null 2>&1 || true
 	set_claim "$id" '{}' || die "could not clear the reservation of $1"
 	if [ -n "$JSON" ]; then
-		jq -c --argjson u "$unpublished" --argjson l "$left_alone" "$JQ_DEFS"'
-			{name:(.name | clean),id:(.id | clean),unpublished:$u,leftAlone:$l,
+		jq -c --argjson u "$unpublished" --argjson l "$left_alone" --argjson reasons "$reasons" "$JQ_DEFS"'
+			{name:(.name | clean),id:(.id | clean),unpublished:$u,unpublishReasons:$reasons,leftAlone:$l,
 			was:(if (.metadata["ibx.claim.token"] // "") == "" then null else
 				{by:(.metadata["ibx.claim.by"] | clean),since:(.metadata["ibx.claim.at"] | clean),
 				purpose:(.metadata["ibx.claim.purpose"] | clean)} end)}' <<<"$m" >"$tmp/result"
@@ -913,6 +1177,9 @@ release)
 	;;
 exec)
 	[ $# -ge 1 ] || die "usage: ibx exec <box> [-t SECS] [-i] -- <cmd>"
+	STREAM=
+	if [ "$1" = --stream ]; then STREAM=1; shift; fi
+	[ $# -ge 1 ] || die "usage: ibx exec [--stream] <box> [-t SECS] [-i] -- <cmd>"
 	box=$1
 	shift
 	t=300 stdin=''
@@ -920,6 +1187,7 @@ exec)
 		case "$1" in
 		-t) t=${2:-}; shift 2 || shift ;;
 		-i) stdin=1; shift ;;
+		--stream) STREAM=1; shift ;;
 		--) shift; break ;;
 		*) break ;;
 		esac
@@ -942,11 +1210,15 @@ exec)
 	stderr jq -j '.stderr // ""' <<<"$r"
 	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && warn "output truncated (1 MiB per stream)"
 	if [ "$(jq -r '.timedOut // false' <<<"$r")" = true ]; then
-		warn "timed out after ${t}s; for long jobs run them detached: setsid -f CMD >LOG 2>&1"
+		warn "timed out after ${t}s; the command may never have started if the sandbox was slow; for long jobs run them detached: setsid -f CMD >LOG 2>&1"
 		exit 124
 	fi
 	rc=$(jq -r '.exitCode // 125' <<<"$r")
-	[ "$rc" = 143 ] && warn "the remote command was killed by SIGTERM (a pkill -f matching itself?)"
+	[ "$(jq -r '.invalidUtf8 // false' <<<"$r")" != true ] || warn "output was not UTF-8 and was altered (bytes became U+FFFD); copy files with ibx get"
+	signal=$(jq -r "$JQ_DEFS"' .signal // empty | clean' <<<"$r" | printable)
+	[ -z "$signal" ] || warn "the remote command was killed by SIG$signal"
+	disk=$(jq -r "$JQ_DEFS"' .diskWarning.message // empty | clean' <<<"$r" | printable)
+	[ -z "$disk" ] || warn "$disk"
 	exit "$rc"
 	;;
 put)
@@ -960,13 +1232,25 @@ put)
 	if [ -z "$force" ] && { looks_secret "$src" || looks_secret "$(phys "$src")"; }; then
 		die "$src looks like a credential; credentials never go to a sandbox (--force if it is really not one)"
 	fi
+	[ "$(size_of "$src")" -le 5368709120 ] || die "put exceeds the server limit of 5 GiB"
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	case $dst in /*) remote=$dst ;; *) remote=/data/home/$dst ;; esac
+	file_rc=0
+	file_api PUT "$id" "$remote" "$src" || file_rc=$?
+	if [ "$file_rc" = 0 ]; then
+		[ "$(file_sha "$src")" = "$(jq -r .sha256 "$tmp/file-body")" ] || die "uploaded file SHA-256 does not match the local file"
+		echo "copied $src -> $box:$dst"
+		exit 0
+	fi
+	warn "this server has no file routes; falling back to exec with its 750 KB limit"
 	[ "$(size_of "$src")" -le 750000 ] || die "$src is over 750 KB: tar c FILES | ibx ssh $box 'tar x -C DIR'"
 	base64 <"$src" | tr -d '\n' >"$tmp/in"
 	id=$(resolve --pool "$box")
 	LABEL=$box
 	q=$(printf %q "$dst")
 	# Runs in the sandbox (Debian, GNU coreutils).
-	exec_in "$id" 120 "[ ! -d $q ] || { echo 'destination is a directory: give the file name too' >&2; exit 3; }
+	EXEC_SAFE=1 exec_in "$id" 120 "[ ! -d $q ] || { echo 'destination is a directory: give the file name too' >&2; exit 3; }
 mkdir -p -- \"\$(dirname -- $q)\" && { base64 -d >$q.ibx-part || { rm -f -- $q.ibx-part; exit 1; }; } && mv -fT -- $q.ibx-part $q" "$tmp/in"
 	r=$R
 	[ "$(jq -r .exitCode <<<"$r")" = 0 ] || die "put failed: $(jq -r .stderr <<<"$r" | printable)"
@@ -977,11 +1261,26 @@ get)
 	box=$1 src=${2#\~/} dst=${3:-$(basename -- "$2")}
 	[ "$src" != '~' ] && [ -n "$src" ] || die "give a file path in the sandbox (relative to HOME)"
 	[ -d "$dst" ] && dst=${dst%/}/$(basename -- "$src")
+	LABEL=$box
+	id=$(resolve --pool "$box")
+	ensure_running "$id" || die "could not start $box for file transfer"
+	case $src in /*) remote=$src ;; *) remote=/data/home/$src ;; esac
+	stage=$(mktemp "$(dirname -- "$dst")/.ibx-get.XXXXXX") || die "could not stage download"
+	remove_download() { rm -f "$stage"; }
+	cleanup_fns+=(remove_download)
+	file_rc=0
+	file_api GET "$id" "$remote" "$stage" || file_rc=$?
+	if [ "$file_rc" = 0 ]; then
+		mv -f -- "$stage" "$dst" || die "could not write $dst"
+		echo "copied $box:$src -> $dst"
+		exit 0
+	fi
+	warn "this server has no file routes; falling back to exec with its 750 KB limit"
 	id=$(resolve --pool "$box")
 	LABEL=$box
 	q=$(printf %q "$src")
 	# Runs in the sandbox (Debian, GNU coreutils).
-	exec_in "$id" 120 "[ -f $q ] || { echo 'not a regular file' >&2; exit 3; }; s=\$(stat -L -c %s -- $q); [ \"\$s\" -le 750000 ] || { echo \"\$s bytes is over 750 KB: use ibx ssh BOX 'cat FILE' >LOCAL\" >&2; exit 4; }; head -c 750001 -- $q | base64 -w0"
+	EXEC_SAFE=1 exec_in "$id" 120 "[ -f $q ] || { echo 'not a regular file' >&2; exit 3; }; s=\$(stat -L -c %s -- $q); [ \"\$s\" -le 750000 ] || { echo \"\$s bytes is over 750 KB: use ibx ssh BOX 'cat FILE' >LOCAL\" >&2; exit 4; }; head -c 750001 -- $q | base64 -w0"
 	r=$R
 	[ "$(jq -r .exitCode <<<"$r")" = 0 ] || die "get failed: $(jq -r .stderr <<<"$r" | printable)"
 	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && die "get failed: output truncated"
@@ -990,7 +1289,7 @@ get)
 	mv -f -- "$tmp/out" "$dst" || die "could not write $dst"
 	echo "copied $box:$src -> $dst"
 	;;
-ssh)
+ssh | forward)
 	[ $# -ge 1 ] || die "usage: ibx ssh <box> [cmd...]"
 	box=$1
 	shift
@@ -1028,14 +1327,37 @@ ssh)
 	printf 'Host ibx\n  HostName %s\n  Port %s\n  User %s\n  UserKnownHostsFile "%s"\n  StrictHostKeyChecking yes\n  BatchMode yes\n  PubkeyAuthentication no\n  LogLevel ERROR\n  ConnectTimeout 20\n  ServerAliveInterval 30\n  ServerAliveCountMax 4\n' \
 		"$host" "$port" "$user" "$tmp/kh" >"$tmp/ssh_config"
 	unset tok user
-	sshargs=(-F "$tmp/ssh_config" ibx)
-	[ $# -gt 0 ] && sshargs+=(-- "$(remote_cmd "$@")")
-	# stderr goes through an unbuffered filter that redacts tokens; stdout passes straight through
-	# (fd 3). The pipeline ends before the token is revoked, so nothing is lost or reordered later.
-	set +e
-	{ ssh "${sshargs[@]}" 2>&1 1>&3 3>&- | LC_ALL=C awk '{ gsub(/ibssh_[a-z2-7]+/, "ibssh_***"); print; fflush() }' >&2 3>&-; } 3>&1
-	rc=${PIPESTATUS[0]}
-	set -e
+	sshargs=(-F "$tmp/ssh_config")
+	if [ "$cmd" = forward ]; then
+		[ $# -gt 0 ] || die "usage: ibx forward <box> [LOCAL:]REMOTE..."
+		jq -e '.capabilities | index("port-forwarding") != null' <<<"$info" >/dev/null || die "server does not support port-forwarding"
+		sshargs+=(-N -o ExitOnForwardFailure=yes)
+		for mapping in "$@"; do
+			local_port=${mapping%%:*} remote_port=${mapping##*:}
+			[[ $mapping =~ ^([0-9]+:)?[0-9]+$ ]] || die "forward ports must be [LOCAL:]REMOTE"
+			[[ $local_port =~ ^[0-9]{1,5}$ && $remote_port =~ ^[0-9]{1,5}$ ]] || die "forward ports must be 1-65535"
+			[ "$((10#$local_port))" -ge 1 ] && [ "$((10#$local_port))" -le 65535 ] &&
+				[ "$((10#$remote_port))" -ge 1 ] && [ "$((10#$remote_port))" -le 65535 ] || die "forward ports must be 1-65535"
+			sshargs+=(-L "127.0.0.1:$((10#$local_port)):127.0.0.1:$((10#$remote_port))")
+		done
+		sshargs+=(ibx)
+		warn "private tunnel in the foreground; SSH token expires in 1 hour; the claim's lease keeps the sandbox awake"
+	else
+		sshargs+=(ibx)
+		[ $# -gt 0 ] && sshargs+=(-- "$(remote_cmd "$@")")
+	fi
+	# Main-shell waits let a signal close the tunnel before revoking its token.
+	mkfifo "$tmp/ssh-errors"
+	LC_ALL=C awk '{ gsub(/ibssh_[a-z2-7]+/, "ibssh_***"); print; fflush() }' <"$tmp/ssh-errors" >&2 &
+	ssh_filter_pid=$!
+	ssh "${sshargs[@]}" <&0 2>"$tmp/ssh-errors" &
+	ssh_pid=$!
+	rc=0
+	wait "$ssh_pid" || rc=$?
+	ssh_pid=
+	wait "$ssh_filter_pid" || true
+	ssh_filter_pid=
+
 	exit "$rc"
 	;;
 port)
@@ -1056,7 +1378,7 @@ unport)
 	echo "unpublished port $2 of $1"
 	;;
 keepalive)
-	# instabox pauses a sandbox after 30 idle minutes and currently ignores autoSuspendAfterSeconds.
+	# Free-plan idle pause is fixed at 30 minutes. Leases do not prevent max-run pauses.
 	# An activity lease (1 h) keeps it awake; renewing it every 15 minutes from a timer keeps
 	# reserved pool sandboxes (or, with --all, every pool sandbox) running while that timer runs.
 	# Idle-paused ones are woken; manually paused and stopped ones are left alone.
@@ -1065,14 +1387,20 @@ keepalive)
 	ms=$(all_machines) || die "could not list sandboxes"
 	echo '{"ttlSeconds":3600}' >"$tmp/lease"
 	fail=0
-	while IFS=$'\037' read -r id name state auto; do
+	while IFS=$'\037' read -r id name state auto cool; do
 		[ -n "$id" ] || continue
 		[[ $id =~ ^m_[a-z2-7]{26}$ ]] || continue
+		if jq -en --arg c "$cool" "$JQ_DEFS"' ($c | timestamp) as $c | $c != null and $c > now' >/dev/null; then
+			echo "$name: max-run cooldown until $cool, skipped"
+			continue
+		fi
 		if [ "$state" = running ] || { [ "$state" = suspended ] && [ -n "$auto" ]; }; then
 			if r=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>"$tmp/err"); then
 				echo "$name: lease until $(jq -r .expiresAt <<<"$r")"
+			elif [ "$(err_code "$tmp/err")" = machine_cooldown ]; then
+				echo "$name: max-run cooldown until ${cool:-$(jq -r '.error.retryAfterSeconds // "unknown"' "$tmp/err")} (retryAfterSeconds), skipped"
 			else
-				echo "$name: FAILED $(jq -c '.error | {code, message}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)"
+				echo "$name: FAILED $(jq -c '.error | {code, message, retryAfterSeconds}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)"
 				fail=1
 			fi
 		else
@@ -1080,7 +1408,7 @@ keepalive)
 		fi
 	done < <(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
 		.[] | select(inpool) | select($all == "1" or (free($now; $stale) | not)) |
-		[.id, (.name | clean), .state, (.autoSuspendedAt // "")] | join("\u001f")' <<<"$ms")
+		[.id, (.name | clean), .state, (.autoSuspendedAt // ""), (.cooldownUntil // "" | clean)] | join("\u001f")' <<<"$ms")
 	exit $fail
 	;;
 doctor)
@@ -1115,18 +1443,46 @@ doctor)
 			n=$(jq "$JQ_DEFS"' [.[] | select(inpool)] | length' <<<"$ms")
 			total=$(jq length <<<"$ms")
 			if [ "$n" = 0 ]; then no "the pool is empty ($total sandboxes in the account): ibx pool add <box>"; else ok "pool: $n of $total sandboxes"; fi
-			while IFS=$'\037' read -r id name; do
+			while IFS=$'\037' read -r id name on; do
 				[ -n "$id" ] || continue
 				if v=$(vault_items "$id" 2>/dev/null); then
-					if [ "$v" = 0 ]; then note "$name has the Vault on (empty now): secrets added to the Vault later reach it"
+					if [ "$v" = 0 ]; then
+						[ "$on" != true ] || note "$name has the Vault on (empty now): secrets added to the Vault later reach it"
 					else no "$name receives $v Vault secret(s): claim skips it unless IBX_ALLOW_VAULT=1; recreate it with --no-vault"; fi
 				else
-					note "could not read the Vault of $name"
+					no "could not read the Vault of $name"
 				fi
-			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | select(vaulton) | [.id, (.name | clean)] | join("\u001f")' <<<"$ms")
+			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | [.id, (.name | clean), (vaulton | tostring)] | join("\u001f")' <<<"$ms")
+			orgid=$(jq -r '.orgId // empty' <<<"$me")
+			if [[ $orgid =~ ^[A-Za-z0-9_-]+$ ]] && org=$(api GET "/v1/orgs/$orgid"); then
+				ok "org: $(jq -c '{tier,freeSandboxHoursLimit:.limits.freeSandboxHours,freeSandboxHoursUsed:.usage.freeSandboxHours,startsPerMinute:.limits.startsPerMinute,cardMissingAt,disabledAt}' <<<"$org" | printable); 0 free hours means no cap"
+				if [ "$(jq -r .tier <<<"$org")" = free ] && command -v systemctl >/dev/null &&
+					systemctl --user cat ibx-keepalive.service 2>/dev/null | grep -q -- '--all'; then note "keepalive --all cycles every free box through 8-hour max-run pauses and uses free hours"; fi
+				if orgsecrets=$(api GET "/v1/orgs/$orgid/secrets"); then
+					while IFS=$'\037' read -r secret risk; do
+						[ -n "$secret" ] || continue
+						if [ "$risk" = true ]; then no "unsafe Org Secret: $secret (env delivery or wildcard hosts)"; else note "Org Secret exists: $secret"; fi
+					done < <(jq -r "$JQ_DEFS"' .items[]? | [(.name | clean), ((.delivery == "env" or .hosts == "*" or ((.hosts | type) == "array" and (.hosts | index("*") != null))) | tostring)] | join("\u001f")' <<<"$orgsecrets")
+				else no "could not audit Org Secrets"; fi
+			else no "could not read the org plan"; fi
+			while IFS=$'\037' read -r id name; do
+				[ -n "$id" ] || continue
+				IBX_ALLOW_SECRETS='' secrets_state "$id" || no "$name has Org Secrets or cannot be inspected; clear proxy and env selections"
+				ok "$name run budget: $(jq -c --arg id "$id" "$JQ_DEFS"' .[] | select(.id == $id) | {maxRunMinutes,pausesAt:pauses,cooldownUntil}' <<<"$ms" | printable)"
+				if tokens=$(api GET "/v1/machines/$id/ssh-tokens"); then
+					while IFS= read -r token_name; do [ -z "$token_name" ] || note "$name has a long-lived SSH token: $token_name"; done < <(jq -r "$JQ_DEFS"' .tokens[]? | select(.revokedAt == null) | (.expiresAt | timestamp) as $e | select($e == null or $e > now + 3600) | .name | clean' <<<"$tokens")
+				else no "could not audit SSH tokens for $name"; fi
+			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | [.id,(.name | clean)] | join("\u001f")' <<<"$ms")
+			if allports=$(api GET /v1/ports); then
+				while IFS=$'\037' read -r name port reserved; do
+					[ -n "$name" ] || continue
+					if [ "$reserved" = false ]; then no "$name has a public port without a reservation: $port"; else note "$name has a non-ibx public port: $port"; fi
+				done < <(jq -r --argjson ms "$ms" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"' .ports[]? as $p | $ms[] | select(inpool and .id == $p.machineId) | (free($now;$stale) | not) as $held | select($held == false or (($p.name // "") | startswith("ibx:") | not)) | [(.name | clean),($p.port | tostring),($held | tostring)] | join("\u001f")' <<<"$allports")
+			else no "could not audit public ports"; fi
+
 			if r=$(api GET /v1/usage 2>/dev/null); then ok "limits: $(jq -c '.limits | {maxMachines, machineSpec}' <<<"$r")"; fi
 		else
-			no "API call failed: $(jq -c '.error | {code, message}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)"
+			no "API call failed: $(jq -c '.error | {code, message, hint, requiredScopes}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)"
 		fi
 	else
 		no "no API key: set INSTABOX_API_KEY or write it to $KEYFILE (chmod 600)"

@@ -32,7 +32,7 @@ export HOME=$S/home XDG_CONFIG_HOME=$S/home/.config TMPDIR=$S/tmp
 export IBX_STATE_DIR=$S/state XDG_STATE_HOME=$S/home/.local/state
 export IBX_KEY_FILE=$S/no-key-file IBX_AGENT_NAME=tester IBX_CLAIM_SETTLE='0.2 0.1'
 unset INSTABOX_KEY_FILE IBX_STALE_SECS IBX_MAXTIME IBX_EXEC_MAXTIME IBX_REEXEC CURL_HOME \
-	IBX_ALLOW_ANY IBX_ALLOW_VAULT IBX_ALLOW_CUSTOM_API CODEX_HOME IBX_MAX_CLAIMS CLAUDE_CONFIG_DIR \
+	IBX_ALLOW_ANY IBX_ALLOW_VAULT IBX_ALLOW_SECRETS IBX_GET_MAX IBX_ALLOW_CUSTOM_API CODEX_HOME IBX_MAX_CLAIMS CLAUDE_CONFIG_DIR \
 	CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID IBX_TEST_CLAIM_LOCK_SECS
 
 # The key reaches the mock through its environment, so no process has it in its arguments.
@@ -197,7 +197,7 @@ t_cli() {
 	run -u INSTABOX_API_KEY
 	rc_is "no arguments prints the usage" 0
 	local help_args
-	for help_args in 'claim --help' 'claim -h' 'release --help' 'exec --help' 'exec box-1 --help' 'exec box-1 -t 30 --help' 'pool add --help' 'ssh --help' 'ssh -h' 'put box-1 --help'; do
+	for help_args in 'claim --help' 'claim -h' 'release --help' 'exec --help' 'exec --stream --help' 'exec box-1 --stream --help' 'exec box-1 --help' 'exec box-1 -t 30 --help' 'pool add --help' 'ssh --help' 'ssh -h' 'put box-1 --help'; do
 		reset
 		# These fixed test arguments deliberately split into words.
 		# shellcheck disable=SC2086
@@ -268,7 +268,7 @@ t_cli() {
 	err_has "a world-readable key file is warned about" 'readable by other users'
 	run INSTABOX_API_KEY=$OTHER_KEY ls
 	rc_is "a wrong key fails" 125
-	err_has "a wrong key: the API error is shown" unauthenticated
+	err_has "a wrong key: the API error is shown" invalid_key
 }
 
 t_doctor() {
@@ -285,7 +285,7 @@ t_doctor() {
 	out_has "doctor explains the empty pool" '^FAIL +the pool is empty \(2 sandboxes'
 	run INSTABOX_API_KEY=$OTHER_KEY doctor
 	rc_is "doctor fails with a wrong key" 125
-	out_has "doctor shows the API error" '^FAIL +API call failed: .*unauthenticated'
+	out_has "doctor shows the API error" '^FAIL +API call failed: .*invalid_key'
 	run -u INSTABOX_API_KEY doctor
 	rc_is "doctor fails without a key" 125
 	out_has "doctor says the key is missing" '^FAIL +no API key'
@@ -669,7 +669,7 @@ t_closed_stderr() {
 	rc_is "a warning after keeping a claim with stderr closed still succeeds" 0
 	is "the caller learns the held box and its warning with stderr closed" \
 		"$(jq -sc 'length == 1 and .[0].name == "box-1" and (.[0].warnings | length == 1)' "$S/out")" true
-	is "the successful warned claim is still held" "$(claim_keys box-1)" 4
+	is "the successful warned claim is still held" "$(claim_keys box-1)" 5
 }
 
 t_claim_names() {
@@ -930,7 +930,7 @@ EOF
 			if [ "$phase" = kept ]; then
 				is "$sig after keep: the caller learns the reserved box" "$(jq -c '.error.held | map({name,id})' "$S/out")" \
 					"$(state | jq -c '[.machines[] | {name,id}]')"
-				is "$sig after keep: the reservation is still held" "$(claim_keys box-1)" 4
+				is "$sig after keep: the reservation is still held" "$(claim_keys box-1)" 5
 			else
 				is "$sig during $phase: no reservation remains" "$(claim_keys box-1)" 0
 			fi
@@ -986,7 +986,7 @@ PYCODE
 	wait "$SIGNAL_PID"; RC=$? TIMEDOUT=
 	rc_is "interruption at the keep commit point exits 143" 143
 	is "interruption at the keep commit point reports one held box" "$(jq -sc 'length == 1 and .[0].error.code == "interrupted" and .[0].error.held[0].name == "box-1"' "$S/out")" true
-	is "cleanup preserves the box reported as kept" "$(claim_keys box-1)" 4
+	is "cleanup preserves the box reported as kept" "$(claim_keys box-1)" 5
 	yes_ "the commit-point interruption leaves no lock" [ ! -e "$IBX_STATE_DIR/claim.lock" ]
 
 	reset '"seed":{"count":1}'
@@ -1079,7 +1079,7 @@ t_claim_json() {
 	reset '"seed":{"count":1},"set":{"box-1":{"ports":[{"port":8080,"name":"ibx:old"},{"port":8081,"name":"manual"}]}}'
 	run claim x --json
 	rc_is "claim accepts --json after the purpose" 0
-	is "claim JSON keys" "$(jq -c 'keys' "$S/out")" '["by","id","leaseUntil","name","publicPorts","purpose","since","warnings"]'
+	is "claim JSON keys" "$(jq -c 'keys' "$S/out")" '["by","cooldownUntil","id","leaseUntil","name","pausesAt","publicPorts","purpose","since","warnings"]'
 	is "claim JSON includes public ports" "$(jq -c '[.publicPorts[].port]' "$S/out")" '[8080,8081]'
 	yes_ "claim JSON includes lease expiry and warnings" jq -e '.leaseUntil | type == "string"' "$S/out"
 	is "claim JSON collects each port warning" "$(jq '.warnings | length' "$S/out")" 3
@@ -1090,7 +1090,7 @@ t_claim_json() {
 	is "renew has no warnings" "$(jq -c .warnings "$S/out")" '[]'
 	run release box-1 --json
 	rc_is "release accepts --json after the box" 0
-	is "release JSON keys" "$(jq -c 'keys' "$S/out")" '["id","leftAlone","name","unpublished","warnings","was"]'
+	is "release JSON keys" "$(jq -c 'keys' "$S/out")" '["id","leftAlone","name","unpublishReasons","unpublished","warnings","was"]'
 	is "release JSON lists unpublished and untouched ports" "$(jq -c '[.unpublished, [.leftAlone[].port], .was.by]' "$S/out")" '[[8080],[8081],"tester"]'
 	is "release JSON collects its warning" "$(jq '.warnings | length' "$S/out")" 1
 	run release --json box-1
@@ -1291,7 +1291,7 @@ t_claim_states() {
 	IBX_CLAIM_SETTLE='2 1' "$IBX" claim "interrupted" >"$S/out" 2>"$S/err" </dev/null &
 	local pid=$!
 	for _ in $(seq 50); do
-		[ "$(claim_keys box-1)" = 4 ] && break
+		[ "$(claim_keys box-1)" = 5 ] && break
 		sleep 0.1
 	done
 	kill -TERM "$pid"
@@ -1476,7 +1476,7 @@ t_exec() {
 	rc_is "a timed-out exec exits 124" 124
 	err_has "a timeout suggests running detached" 'timed out after 1s'
 
-	ctl '{"execResults":[{"stdout":"partial","truncated":true},{"exitCode":143}]}'
+	ctl '{"execResults":[{"stdout":"partial","truncated":true},{"exitCode":143,"signal":"TERM"}]}'
 	run exec box-1 -- 'cat huge'
 	is "truncated output is passed on" "$(OUT)" partial
 	err_has "truncated output is warned about" 'output truncated'
@@ -1499,7 +1499,8 @@ t_exec() {
 	reset '"set":{"box-1":{"state":"idle"}}'
 	LIMIT=20 run exec box-1 -- 'exit 6'
 	rc_is "exec on an idle-paused sandbox wakes it, then runs" 6
-	is "an idle-paused sandbox is woken once" "$(count POST '/wake$')" 1
+	is "the gateway wakes an idle box without an explicit wake POST" "$(count POST '/wake$')" 0
+	is "the auto-woken box is running" "$(box box-1 .state)" running
 
 	reset '"dropExecs":1'
 	run exec box-1 -- 'echo ran >>ran.txt'
@@ -1519,9 +1520,9 @@ t_exec() {
 	rc_is "host_unavailable (not retryable) fails with 125" 125
 	is "and is not retried" "$(count POST '/exec$')" 1
 	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":503,"code":"host_unavailable","retryable":true}]'
-	run exec box-1 -- 'exit 2'
-	rc_is "host_unavailable (retryable) is retried" 2
-	is "and then the command ran" "$(count POST '/exec$')" 2
+	run EXEC_SAFE=1 exec box-1 -- 'exit 2'
+	rc_is "host_unavailable never repeats a user command" 125
+	is "the potentially partly-run command is not retried" "$(count POST '/exec$')" 1
 	run exec nosuch -- true
 	rc_is "exec on an unknown sandbox fails" 125
 
@@ -1536,7 +1537,7 @@ t_exec() {
 	err_has "it says the command did not run" 'exec did not run: .* keeps stopping'
 	is "after four tries" "$(count POST '/exec$')" 4
 	local code
-	for code in api_key_expired api_key_revoked; do
+	for code in api_key_expired api_key_revoked missing_key malformed_key invalid_key expired_key revoked_key session_expired missing_scope; do
 		reset "\"faults\":[{\"kind\":\"error\",\"method\":\"POST\",\"match\":\"/exec\$\",\"status\":401,\"code\":\"$code\",\"message\":\"no\"}]"
 		run exec box-1 -- true
 		rc_is "$code: exec fails with 125" 125
@@ -1556,16 +1557,18 @@ printf '%s\\n' "\$\$" >"\$IBX_EXEC_SLEEP_MARKER"
 exec '$real_sleep' 20
 EOF
 	chmod +x "$bin/sleep"
+	printf 'safe retry fixture\n' >"$S/retry-safe.txt"
 	for kind in quota host; do
 		rm -f "$marker"
 		case $kind in
 		quota) reset '"quotaExecs":100' ;;
-		host) reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":503,"code":"host_unavailable","retryable":true,"count":100}]' ;;
+		host) reset '"faults":[{"kind":"error","method":"PUT","match":"/files$","status":503,"code":"host_unavailable","retryable":true,"count":100}]' ;;
 		esac
-		PATH="$bin:$PATH" IBX_EXEC_SLEEP_MARKER=$marker python3 - "$IBX" "$marker" "$S/out" "$S/err" <<'PYCODE'
+		PATH="$bin:$PATH" IBX_EXEC_SLEEP_MARKER=$marker python3 - "$IBX" "$marker" "$S/out" "$S/err" "$kind" "$S/retry-safe.txt" <<'PYCODE'
 from pathlib import Path
 import os, signal, subprocess, sys, time
-proc = subprocess.Popen([sys.argv[1], 'exec', 'box-1', '--', 'true'],
+args = ['exec', 'box-1', '--', 'true'] if sys.argv[5] == 'quota' else ['put', 'box-1', sys.argv[6], 'retry-safe']
+proc = subprocess.Popen([sys.argv[1], *args],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 for _ in range(600):
     if Path(sys.argv[2]).exists():
@@ -1593,7 +1596,12 @@ PYCODE
 		RC=$? TIMEDOUT=
 		rc_is "$kind: interrupt closes the pipes and reaps the sleep promptly" 0
 		err_has "$kind: the caller sees the interruption warning" 'interrupted by SIGTERM'
-		is "$kind: no exec is retried after interruption" "$(count POST '/exec$')" 1
+		if [ "$kind" = quota ]; then
+			is "quota: no exec is retried after interruption" "$(count POST '/exec$')" 1
+		else
+			err_has "interrupted uploads report remote outcome uncertainty" 'remote file may have been replaced'
+			is "safe host retry: no upload is retried after interruption" "$(count PUT '/files$')" 1
+		fi
 	done
 }
 
@@ -1640,7 +1648,7 @@ t_sigterm() {
 	RC=$? TIMEDOUT=
 	rc_is "SIGTERM to a running ibx exec: exit 143" 143
 	err_has "it warns that the remote command may still run" \
-		'^ibx: interrupted by SIGTERM: a remote command it started may still be running$'
+		'^ibx: interrupted by SIGTERM: the remote command was killed when the connection closed'
 	is "and prints no result as if it had finished" "$(OUT)" ''
 
 	# As agent harnesses do it: SIGTERM to the whole process group, curl included.
@@ -1713,21 +1721,19 @@ t_files() {
 	rc_is "get of exactly 750000 bytes" 0
 	yes_ "750000 bytes round-trip unchanged" cmp -s "$S/max.bin" "$S/max.out"
 	head -c 750001 /dev/zero >"$S/over.bin"
-	ctl '{"resetCalls":true}'
 	run put box-1 "$S/over.bin" over.bin
-	rc_is "put of 750001 bytes is refused" 125
-	err_has "it suggests tar over ssh" 'over 750 KB: tar c FILES \| ibx ssh box-1'
-	is "and makes no request" "$(ncalls)" 0
-	head -c 750001 /dev/zero >"$home/big.bin"
-	run get box-1 big.bin "$S/big.out"
-	rc_is "get of 750001 bytes is refused" 125
-	err_has "it suggests ssh" '750001 bytes is over 750 KB'
-	yes_ "and writes nothing" [ ! -e "$S/big.out" ]
+	rc_is "put above the old 750 KB limit succeeds" 0
+	run get box-1 over.bin "$S/big.out"
+	rc_is "get above the old 750 KB limit succeeds" 0
+	yes_ "large files round-trip unchanged" cmp -s "$S/over.bin" "$S/big.out"
+	run IBX_GET_MAX=750000 get box-1 over.bin "$S/capped.out"
+	rc_is "get honors IBX_GET_MAX" 125
+	yes_ "an oversized download leaves no destination" [ ! -e "$S/capped.out" ]
 	run get box-1 sub/dir/f.bin "$S/no-such-dir/f.bin"
 	rc_is "get into a missing local directory fails with 125" 125
 	run get box-1 no-such-file "$S/x"
 	rc_is "get of a missing file fails" 125
-	err_has "it says why" 'not a regular file'
+	err_has "it says why" 'file not found'
 	run put box-1 "$S/no-such-file" x
 	rc_is "put of a missing local file fails" 125
 	run put box-1 "$S/f.bin"
@@ -1776,8 +1782,8 @@ t_put_guard() {
 	# shellcheck disable=SC2088 # a literal ~/ that ibx strips
 	run put box-1 "$S/plain.txt" '~/tl/plain.txt'
 	rc_is "put to ~/PATH" 0
-	yes_ "the leading ~/ is dropped (HOME is where relative paths go)" \
-		eval 'last_exec .cmd | grep -q "tl/plain.txt" && ! last_exec .cmd | grep -q "~"'
+	yes_ "the leading ~/ becomes an absolute path under remote HOME" jq -e \
+		'.calls | map(select(.method == "PUT" and (.path | endswith("/files")))) | last.query | contains("path=%2Fdata%2Fhome%2Ftl%2Fplain.txt")' < <(calls)
 	out_has "and the message shows the path under HOME" "-> box-1:tl/plain.txt$"
 	if [ -n "$REAL" ]; then
 		yes_ "the file is at HOME/tl/plain.txt" cmp -s "$S/plain.txt" "$(box box-1 .home)/tl/plain.txt"
@@ -1895,7 +1901,7 @@ t_vault() {
 	rc_is "doctor fails when the Vault writes secrets into a pool sandbox" 125
 	out_has "FAIL names it" '^FAIL +box-1 receives 3 Vault secret\(s\): claim skips it unless IBX_ALLOW_VAULT=1'
 	out_has "warn for the Vault on but empty" '^warn +box-2 has the Vault on \(empty now\)'
-	out_lacks "nothing about sandboxes without the Vault or outside the pool" 'box-[34]'
+	out_lacks "no Vault warnings for a clean disabled Vault or a box outside the pool" '^(warn|FAIL).*box-[34].*Vault'
 	reset '"seed":{"count":2,"vault":{"box-1":0}}'
 	run doctor
 	rc_is "doctor passes with only an empty Vault" 0
@@ -1942,6 +1948,12 @@ t_secrets() {
 	group "the API key stays out of files, arguments, the environment and output"
 	reset
 	local pid f
+	rm -f "$S/spy.args"
+	run ENV_KEY=exported AUTH=exported key=exported PATH="$SPY:$PATH" exec box-1 -- true
+	rc_is "inherited export attributes do not change key handling" 0
+	is "internal key variables stay out of child environments even when those names were exported" \
+		"$(grep -c '^1 .* -H @- ' "$S/spy.args")" 0
+
 	rm -f "$S/spy.args"
 	ctl '{"execResults":[{"stdout":"slow\n","delay":3}]}'
 	env PATH="$SPY:$PATH" "$IBX" exec box-1 -- 'slow job' >"$S/out" 2>"$S/err" </dev/null &
@@ -1999,6 +2011,7 @@ t_ssh() {
 	cat >"$fake/ssh" <<'SH'
 #!/bin/sh
 printf '%s\n' "$@" >"$SSH_ARGS_FILE"
+case "$*" in *cat-stdin*) cat ;; esac
 SH
 	chmod +x "$fake/ssh"
 	local remote
@@ -2011,6 +2024,10 @@ SH
 		is "ssh $remote creates a token" "$(count POST '/ssh-tokens$')" 1
 		is "ssh $remote revokes its token" "$(box box-1 '[.tokens[] | .revoked]')" '[true]'
 	done
+	printf 'ssh stdin preserved\n' >"$S/ssh-in"
+	run -s "$S/ssh-in" PATH="$fake:$PATH" SSH_ARGS_FILE="$S/ssh-args" ssh box-1 cat-stdin
+	rc_is "main-shell SSH wait preserves caller stdin" 0
+	is "SSH receives the exact caller input" "$(OUT)" 'ssh stdin preserved'
 	reset '"set":{"box-2":{"state":"suspended"}}'
 	run ssh box-1 'echo hi'
 	rc_is "ssh that cannot connect exits 255" 255
@@ -2182,7 +2199,477 @@ t_cleanup() {
 
 start=$(date +%s)
 echo "ibx offline tests: $IBX against $BASE (exec: $EXEC_MODE)"
-for t in cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
+t_stream030() {
+	group "0.3.0 opt-in exec streams"
+	reset '"execResults":[{"stdout":"buffered\n"}]'
+	run STREAM=1 exec box-1 -- true
+	rc_is "buffered exec remains the default even with an unrelated STREAM environment variable" 0
+	is "buffered exec does not request SSE" "$(calls | jq -c '[.calls[] | select(.path | endswith("/exec")) | .accept]')" '["*/*"]'
+	reset '"execResults":[{"stdout":"hello é\n","stderr":"remote warning\n","exitCode":7}]'
+	run exec box-1 --stream -- true
+	rc_is "streamed exec preserves the remote exit status" 7
+	is "stream stdout survives UTF-8 and ignores ping comments" "$(OUT)" 'hello é'
+	is "stream stderr stays on stderr" "$(ERR)" 'remote warning'
+	is "stream explicitly requests SSE" "$(calls | jq -c '[.calls[] | select(.path | endswith("/exec")) | .accept]')" '["text/event-stream"]'
+	reset '"execResults":[{"stdout":"leading flag\n"}]'
+	run exec --stream box-1 -- true
+	rc_is "--stream can precede the box" 0
+	is "the leading option still streams the command" "$(OUT)" 'leading flag'
+	printf 'stdin030\n' >"$S/stream-in"
+	reset '"execResults":[{"stdout":"stdin accepted\n"}]'
+	run -s "$S/stream-in" exec box-1 -i --stream -t 30 -- cat
+	rc_is "streaming accepts stdin and timeout options" 0
+	is "streaming sends exactly the requested stdin" "$(last_exec .stdinLength)" 9
+	head -c 1048576 /dev/zero | LC_ALL=C tr '\000' a >"$S/stream-big-in"
+	reset '"execResults":[{"stdout":"big stdin accepted\n"}]'
+	run -s "$S/stream-big-in" exec box-1 --stream -i -- cat
+	rc_is "stream header parsing handles a one-MiB request and interim responses" 0
+	is "the full streamed stdin reaches the mock" "$(last_exec .stdinLength)" 1048576
+
+	reset '"quotaExecs":1,"execResults":[{"stdout":"after quota\n"}]'
+	run exec box-1 --stream -- true
+	rc_is "a pre-start JSON quota refusal can retry safely into an SSE response" 0
+	is "the quota refusal is followed by exactly one started command" "$(count POST '/exec$')" 2
+	is "the successful retry emits output once" "$(OUT)" 'after quota'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":403,"code":"missing_scope","requiredScopes":["machines:write"],"hint":"ask the user"}]'
+	run exec box-1 --stream -- true
+	rc_is "pre-start JSON auth errors do not retry" 125
+	err_has "stream auth refusals keep their safe hint" 'missing_scope.*ask the user'
+	is "a streamed auth refusal sends one request" "$(count POST '/exec$')" 1
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":503,"code":"host_unavailable","retryable":true}]'
+	run EXEC_SAFE=1 exec box-1 --stream -- true
+	rc_is "a pre-start host_unavailable response stays conservative even if retryable" 125
+	is "a host refusal before stream establishment never repeats a user command" "$(count POST '/exec$')" 1
+
+	reset '"execResults":[{"stdout":"partial output\n","streamError":true}]'
+	run exec box-1 --stream -- true
+	rc_is "a started stream error is terminal" 125
+	is "partial output survives the stream error" "$(OUT)" 'partial output'
+	err_has "stream error explains partly-run work" 'failed after starting.*killed.*partly.*check before retrying'
+	is "retryable host_unavailable inside a stream never retries" "$(count POST '/exec$')" 1
+	reset '"execResults":[{"stdout":"before drop\n","streamDrop":true}]'
+	run exec box-1 --stream -- true
+	rc_is "a stream without an exit event fails" 125
+	is "output before a dropped stream survives" "$(OUT)" 'before drop'
+	is "a dropped stream is never retried" "$(count POST '/exec$')" 1
+	reset '"execResults":[{"timedOut":true,"exitCode":124}]'
+	run exec box-1 --stream -t 1 -- true
+	rc_is "stream timeout remains exit 124" 124
+	err_has "stream timeout includes the slow-start caveat" 'may never have started'
+	reset '"execResults":[{"invalidUtf8":true,"exitCode":255,"signal":"USR1","diskWarning":{"message":"stream disk warning"}}]'
+	run exec box-1 --stream -- true
+	rc_is "stream exit diagnostics preserve code 255" 255
+	err_has "stream exit reports invalid UTF-8" 'not UTF-8'
+	err_has "stream exit names the actual signal" 'SIGUSR1'
+	err_has "stream exit reports disk warnings" 'stream disk warning'
+	python3 - "$S/stream-control" <<'PYCODE'
+import json, sys
+from pathlib import Path
+Path(sys.argv[1]).write_text(json.dumps({'reset': True, 'execResults': [{'stdout': 'é' * 786432}]}))
+PYCODE
+	curl -q -fsS --data-binary @"$S/stream-control" "$BASE/_control" >/dev/null
+	run exec box-1 --stream -- true
+	rc_is "stream output can exceed one MiB" 0
+	is "all 1.5 MiB of multibyte output arrives" "$(wc -c <"$S/out" | tr -d ' ')" 1572864
+	reset '"execResults":[{"stdout":"early output\n","streamDelay":20}]'
+	python3 - "$IBX" "$S/out" "$S/err" <<'PYCODE'
+from pathlib import Path
+import os, selectors, signal, subprocess, sys
+proc = subprocess.Popen([sys.argv[1], 'exec', 'box-1', '--stream', '--', 'true'],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+selector = selectors.DefaultSelector()
+selector.register(proc.stdout, selectors.EVENT_READ)
+first = proc.stdout.readline() if selector.select(timeout=10) else b''
+early = first == b'early output\n' and proc.poll() is None
+proc.send_signal(signal.SIGTERM)
+try:
+    out, err = proc.communicate(timeout=10)
+    status = 0 if early and proc.returncode == 143 else 1
+except subprocess.TimeoutExpired:
+    os.killpg(proc.pid, signal.SIGKILL)
+    out, err = proc.communicate(timeout=25)
+    status = 1
+Path(sys.argv[2]).write_bytes(first + out)
+Path(sys.argv[3]).write_bytes(err)
+sys.exit(status)
+PYCODE
+	RC=$? TIMEDOUT=
+	rc_is "SSE emits output before exit and a parent-only TERM promptly closes it" 0
+	is "partial output is retained on interruption" "$(OUT)" 'early output'
+	err_has "a stream interruption says the process group was killed" 'remote command was killed when the connection closed'
+	is "interrupted streaming sends no retry" "$(count POST '/exec$')" 1
+	if [ -n "$REAL" ]; then
+		reset
+		run exec box-1 --stream -- 'head -c 1572864 /dev/zero | tr "\\000" x'
+		rc_is "real mock commands also stream above the buffered cap" 0
+		is "real streamed output is uncapped" "$(wc -c <"$S/out" | tr -d ' ')" 1572864
+		run exec box-1 --stream -- "printf '\\377'"
+		rc_is "real streamed invalid UTF-8 retains the command's successful status" 0
+		err_has "real streamed invalid UTF-8 is reported" 'not UTF-8'
+		run exec box-1 --stream -- 'kill -TERM $$'
+		rc_is "real streamed signal exits preserve 128 plus signal" 143
+		err_has "real streamed signals use API names without a duplicate prefix" 'killed by SIGTERM$'
+		run -s "$S/stream-big-in" exec box-1 --stream -i -- 'wc -c'
+		rc_is "real SSE concurrently drains output while feeding large stdin" 0
+		is "real SSE stdin is complete" "$(OUT | tr -d ' ')" 1048576
+		run exec box-1 --stream -t 1 -- 'sleep 5'
+		rc_is "real SSE enforces the command deadline" 124
+		reset
+		local stream_home
+		stream_home=$(box box-1 .home)
+		python3 - "$IBX" "$stream_home" "$S/out" "$S/err" <<'PYCODE'
+from pathlib import Path
+import os, selectors, signal, subprocess, sys, time
+home = Path(sys.argv[2])
+command = "echo $$ >stream.pid; (sleep 10; touch stream-after) & printf 'ready\\n'; wait"
+proc = subprocess.Popen([sys.argv[1], 'exec', 'box-1', '--stream', '-t', '20', '--', command],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+selector = selectors.DefaultSelector()
+selector.register(proc.stdout, selectors.EVENT_READ)
+first = proc.stdout.readline() if selector.select(timeout=8) else b''
+remote_pid = int((home / 'stream.pid').read_text()) if (home / 'stream.pid').exists() else None
+def running():
+    if remote_pid is None:
+        return False
+    try:
+        os.kill(remote_pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+early = first == b'ready\n' and running() and not (home / 'stream-after').exists()
+proc.send_signal(signal.SIGTERM)
+try:
+    out, err = proc.communicate(timeout=10)
+    status = 0 if early and proc.returncode == 143 else 1
+except subprocess.TimeoutExpired:
+    os.killpg(proc.pid, signal.SIGKILL)
+    out, err = proc.communicate(timeout=25)
+    status = 1
+deadline = time.monotonic() + 5
+while running() and time.monotonic() < deadline:
+    time.sleep(0.05)
+if running():
+    status = 1
+time.sleep(11)
+if (home / 'stream-after').exists():
+    status = 1
+Path(sys.argv[3]).write_bytes(first + out)
+Path(sys.argv[4]).write_bytes(err)
+sys.exit(status)
+PYCODE
+		RC=$? TIMEDOUT=
+		rc_is "real SSE delivers early output and disconnect kills the process group before a delayed side effect" 0
+
+	fi
+}
+
+t_stream_backpressure030() {
+	group "0.3.0 streamed command deadlines with stalled readers"
+	if [ -z "$REAL" ]; then skip "process-group backpressure requires real mock commands"; return; fi
+	reset '"seed":{"count":1}'
+	local id home
+	id=$(box box-1 .id)
+	home=$(box box-1 .home)
+	python3 - "$BASE" "$id" "$home" <<'PYCODE'
+from pathlib import Path
+from urllib.parse import urlsplit
+import http.client, json, os, socket, sys, time
+url = urlsplit(sys.argv[1])
+home = Path(sys.argv[3])
+conn = http.client.HTTPConnection(url.hostname, url.port, timeout=10)
+conn.connect()
+conn.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+body = json.dumps({'cmd': 'echo $$ >stalled.pid; (sleep 4; touch stalled-after) & head -c 67108864 /dev/zero; wait', 'timeoutSeconds': 1})
+# The key is synthetic, supplied by the offline harness; no real account is used.
+conn.request('POST', '/v1/machines/' + sys.argv[2] + '/exec', body=body,
+             headers={'Authorization': 'Bearer ' + os.environ['INSTABOX_API_KEY'],
+                      'Accept': 'text/event-stream', 'Content-Type': 'application/json'})
+reply = conn.getresponse()
+status = 0 if reply.status == 200 else 1
+try:
+    deadline = time.monotonic() + 3
+    while not (home / 'stalled.pid').exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pid = int((home / 'stalled.pid').read_text())
+    def running():
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    while running() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if running():
+        status = 1
+    time.sleep(5)
+    if (home / 'stalled-after').exists():
+        status = 1
+finally:
+    # Intentionally never read the verbose response body.
+    reply.close()
+    conn.close()
+sys.exit(status)
+PYCODE
+	RC=$? TIMEDOUT=
+	rc_is "a stalled SSE reader cannot defer timeout or allow a delayed side effect" 0
+}
+
+t_files030() {
+	group "0.3.0 official file routes and older-server fallback"
+	local home fake=$S/file-shims real_curl
+	reset
+	home=$(box box-1 .home)
+	python3 - "$S/sparse030.bin" <<'PYCODE'
+import sys
+with open(sys.argv[1], 'wb') as stream:
+    stream.truncate(5 * 1024**3 + 1)
+PYCODE
+	run put box-1 "$S/sparse030.bin" too-large
+	rc_is "put refuses above five GiB before making a request" 125
+	is "over-limit upload sends no API request" "$(ncalls)" 0
+	rm "$S/sparse030.bin"
+
+	head -c 5000000 /dev/urandom >"$S/file030.bin"
+	run put box-1 "$S/file030.bin" 'sub/file with spaces..bin'
+	rc_is "official PUT streams five MB with spaces and dots in the path" 0
+	is "file upload uses no exec" "$(count POST '/exec$')" 0
+	run get box-1 'sub/file with spaces..bin' "$S/file030.out"
+	rc_is "official content GET downloads five MB" 0
+	is "a successful first GET has no stderr diagnostics" "$(ERR)" ''
+	yes_ "the five MB binary file round-trips unchanged" cmp -s "$S/file030.bin" "$S/file030.out"
+	printf 'keep original\n' >"$S/limited.out"
+	run IBX_GET_MAX=1M get box-1 'sub/file with spaces..bin' "$S/limited.out"
+	rc_is "a bounded GET refuses excess bytes" 125
+	is "a refused download preserves existing local content" "$(cat "$S/limited.out")" 'keep original'
+	mkdir -p "$home/dir030"
+	run put box-1 "$S/file030.bin" dir030
+	rc_is "the file route refuses a directory destination" 125
+	err_has "directory failure is actionable" 'destination is a directory'
+	for code in no_space too_large; do
+		ctl "$(jq -cn --arg c "$code" '{faults:[{kind:"error",method:"PUT",match:"/files$",status:507,code:$c}]}')"
+		run put box-1 "$S/file030.bin" x
+		rc_is "$code file errors exit 125" 125
+	done
+	ctl '{"faults":[{"kind":"error","method":"PUT","match":"/files$","status":409,"code":"machine_not_running","count":100}]}'
+	run put box-1 "$S/file030.bin" repeated-refusal
+	rc_is "persistent not-running file refusals are bounded" 125
+	is "the file route stops after four not-running refusals" "$(calls | jq '[.calls[] | select(.method == "PUT" and .status == 409 and (.query | contains("repeated-refusal")))] | length')" 4
+	ctl '{"clearFaults":true,"faults":[{"kind":"drop","method":"PUT","match":"/files$"}]}'
+	run put box-1 "$S/file030.bin" committed-before-drop
+	rc_is "a dropped committed upload response reports failure" 125
+	err_has "a dropped upload does not claim the remote destination is untouched" 'remote file may have been replaced'
+	yes_ "the mock confirms upload committed before the reply dropped" cmp -s "$S/file030.bin" "$home/committed-before-drop"
+	ctl '{"fileBadHash":true}'
+	run put box-1 "$S/file030.bin" bad-hash
+	rc_is "an uploaded SHA-256 mismatch fails" 125
+	err_has "checksum mismatch is explained" 'SHA-256 does not match'
+	ctl '{"fileBadHash":false,"faults":[{"kind":"error","method":"PUT","match":"/files$","status":429,"code":"quota_exceeded"}]}'
+	run put box-1 "$S/file030.bin" retry-quota
+	rc_is "atomic upload retries a quota refusal" 0
+	ctl '{"faults":[{"kind":"drop","method":"GET","match":"/files/content$"}]}'
+	run get box-1 'sub/file with spaces..bin' "$S/short030.out"
+	rc_is "a short file response fails" 125
+	yes_ "a short response creates no local output" [ ! -e "$S/short030.out" ]
+	ctl '{"faults":[{"kind":"error","method":"GET","match":"/files/content$","status":404,"code":"not_found","message":"file not found"}]}'
+	run get box-1 absent "$S/absent030.out"
+	rc_is "a real missing file never falls back to exec" 125
+	is "missing file uses no exec" "$(count POST '/exec$')" 0
+	ctl '{"filesEnabled":false}'
+	run put box-1 "$S/file030.bin" old-large
+	rc_is "older-server fallback keeps the 750 KB cap" 125
+	err_has "older-server fallback is disclosed" 'falling back to exec.*750 KB'
+	if [ -n "$REAL" ]; then
+		printf 'old server\n' >"$S/old030.txt"
+		run put box-1 "$S/old030.txt" old-small
+		rc_is "older-server fallback writes a small file" 0
+		run get box-1 old-small "$S/old030.out"
+		rc_is "older-server fallback reads a small file" 0
+		yes_ "older-server fallback round-trips unchanged" cmp -s "$S/old030.txt" "$S/old030.out"
+		ctl '{"faults":[{"kind":"error","method":"POST","match":"/exec$","status":503,"code":"host_unavailable","retryable":true}]}'
+		run put box-1 "$S/old030.txt" retry-safe
+		rc_is "repeat-safe legacy upload may retry host_unavailable" 0
+	fi
+	reset
+	ctl '{"set":{"box-1":{"tokens":[{"id":"cn_test","name":"TEST-LONG","createdAt":"2026-01-01T00:00:00Z"}]}}}'
+	run doctor
+	out_has "doctor audits non-expiring SSH tokens" 'long-lived SSH token: TEST-LONG'
+	out_has "doctor reads concrete org usage" 'freeSandboxHoursUsed.*12'
+	reset '"faults":[{"kind":"drop","method":"DELETE","match":"/ssh-tokens/","before":true,"count":12}]'
+	mkdir "$fake"
+	real_curl=$(command -v curl)
+	printf '#!/bin/sh\nexit 0\n' >"$fake/ssh"
+	# Only suppress the revoke backoff; all API and token verification calls still run.
+	printf '#!/bin/sh\nexit 0\n' >"$fake/sleep"
+	chmod +x "$fake/ssh" "$fake/sleep"
+	run PATH="$fake:$PATH" ssh box-1 true
+	rc_is "an SSH command can succeed while token cleanup fails" 0
+	err_has "dropped token DELETEs remain visibly unconfirmed" 'may NOT be revoked'
+	is "the failed revocation leaves one live token in the mock" "$(box box-1 '[.tokens[] | select(.revoked == false)] | length')" 1
+	: "$real_curl"
+}
+
+t_platform030() {
+	group "0.3.0 lifecycle, Secrets, ports and transfers"
+	local future past id selected fixture code fake=$S/forward030
+	python3 - "$here/live.sh" "$S/live-budget-functions" <<'PYCODE'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+functions = []
+for name in ('live_budget_rows', 'live_claim_budget'):
+    start = source.index(name + '() {')
+    end = source.index('\n}\n', start) + 3
+    functions.append(source[start:end])
+Path(sys.argv[2]).write_text('\n'.join(functions))
+PYCODE
+	jq -cn --arg short "$(ago -600)" --arg long "$(ago -2400)" \
+		'[{name:"short",pool:true,reservation:"free",pausesAt:$short},{name:"long-a",pool:true,reservation:"free",pausesAt:$long},{name:"long-b",pool:true,reservation:"free",pausesAt:$long}]' >"$S/live-budget-rows"
+	# shellcheck disable=SC1090,SC1091 # only the pure budget functions are extracted; no live suite runs
+	source "$S/live-budget-functions"
+	is "live preflight sees two eligible candidates" "$(live_budget_rows <"$S/live-budget-rows" | jq length)" 2
+	live_claim_budget short long-a <"$S/live-budget-rows"
+	is "live guard rejects an actually claimed nearly-spent box" "$?" 1
+	yes_ "live guard accepts the two actual healthy claims" live_claim_budget long-a long-b <"$S/live-budget-rows"
+
+	future=$(ago -300) past=$(ago 300)
+	reset
+	hold box-1 0
+	ctl "$(jq -cn --arg c "$future" '{set:{"box-1":{cooldownUntil:$c}}}')"
+	run keepalive
+	rc_is "cooldown skips are successful keepalive ticks" 0
+	out_has "keepalive prints the cooldown deadline" 'box-1: max-run cooldown until .*skipped'
+	is "cooldown skip sends no PUT" "$(count PUT .)" 0
+	reset '"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":409,"code":"machine_cooldown","retryAfterSeconds":2}]'
+	run keepalive --all
+	rc_is "a cooldown raced with keepalive does not fail the pool tick" 0
+	is "the other boxes still get leases" "$(count PUT .)" 3
+	reset
+	ctl "$(jq -cn --arg old "$(ago 25000)" '{set:{"box-1":{runStartedAt:$old},"box-2":{maxRunMinutes:0},"box-3":{maxRunMinutes:-1}}}')"
+	run claim --json x
+	rc_is "claim chooses a box with run budget" 0
+	is "claim prefers unlimited over nearly spent and disabled boxes" "$(jq -r .name "$S/out")" box-3
+	yes_ "claim JSON has pause and cooldown fields" jq -e 'has("pausesAt") and has("cooldownUntil")' "$S/out"
+	reset '"seed":{"count":1}'
+	ctl "$(jq -cn --arg c "$future" '{set:{"box-1":{cooldownUntil:$c}}}')"
+	run claim --json x
+	rc_is "claim skips boxes in cooldown" 75
+	is "cooldown candidates receive no metadata write" "$(count PATCH .)" 0
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"machine_cooldown","retryAfterSeconds":1}]'
+	run exec box-1 -- true
+	rc_is "exec waits out a short cooldown refusal before starting" 0
+	is "one refused request and one actual exec" "$(count POST '/exec$')" 2
+	reset '"set":{"box-1":{"state":"suspended"}},"faults":[{"kind":"error","method":"POST","match":"/resume$","status":409,"code":"machine_cooldown","retryAfterSeconds":1}]'
+	run exec box-1 -- true
+	rc_is "ensure_running waits out a short lifecycle cooldown" 0
+	reset '"seed":{"count":2,"states":["suspended","suspended"]},"faults":[{"kind":"error","method":"POST","match":"/resume$","status":402,"code":"credit_exhausted","message":"wait until next UTC month"}]'
+	run claim --json x
+	rc_is "account blocks stop claim with exit 125" 125
+	is "account blocks have a distinct JSON code" "$(jq -r .error.code "$S/out")" account_blocked
+	is "account block stops after the first candidate" "$(count POST '/resume$')" 1
+	is "account block cleanup leaves no reservation" "$(state | jq '[.machines[] | select(.metadata["ibx.claim.token"])] | length')" 0
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/machines$","status":401,"code":"expired_key","hint":"ask the user","requiredScopes":["machines:write"]}]'
+	run claim --json x
+	rc_is "an expired key is an auth failure" 125
+	yes_ "auth JSON keeps the code and safe server hint" jq -e '.error.code == "auth" and (.error.message | contains("expired_key") and contains("ask the user") and contains("machines:write"))' "$S/out"
+	for fixture in '"all"' '["TEST_PROXY"]' '[]'; do
+		reset '"seed":{"count":1}'
+		selected=$(jq -cn --argjson p "$fixture" '{secrets:$p,envSecrets:[],items:[],version:0}')
+		[ "$fixture" != '[]' ] || selected='{"secrets":[],"envSecrets":["TEST_ENV"],"items":[],"version":0}'
+		ctl "$(jq -cn --argjson s "$selected" '{set:{"box-1":{secrets:$s}}}')"
+		run claim --json x
+		rc_is "unsafe Org Secret selection $fixture fails closed" 75
+		is "unsafe Secret selections receive no reservation PATCH" "$(count PATCH .)" 0
+		run IBX_ALLOW_SECRETS=1 claim --json x
+		if [ "$fixture" = '[]' ]; then rc_is "env Secrets cannot be overridden" 75
+		else rc_is "the user can explicitly allow proxy selections" 0; fi
+		if [ "$fixture" = '"all"' ]; then
+			run IBX_ALLOW_SECRETS=1 ls --json
+			is "ls still reports proxy selection risk when override is set" "$(jq -r '.[0].secrets' "$S/out")" true
+			run IBX_ALLOW_SECRETS=1 doctor
+			rc_is "doctor audits selected proxy Secrets even when override is set" 125
+		fi
+	done
+	for fixture in '{"secrets":[],"envSecrets":[],"items":[],"version":0,"proxy":{"state":"pending"}}' '{"secrets":[],"envSecrets":[],"items":[],"version":0,"guest":{"items":[{"name":"RESIDUE"}]}}'; do
+		reset '"seed":{"count":1}'
+		ctl "$(jq -cn --argjson s "$fixture" '{set:{"box-1":{secrets:$s}}}')"
+		run IBX_ALLOW_SECRETS=1 claim --json x
+		rc_is "pending or guest Secret residue cannot be overridden" 75
+	done
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/secrets$","status":403,"code":"permission_denied"}]'
+	run claim --json x
+	rc_is "uninspectable Secrets fail closed" 75
+	reset '"seed":{"count":1},"orgSecretsEnabled":false'
+	run claim --json x
+	rc_is "older servers without Org Secrets are accepted only when usage disables them" 0
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/machines/.*/secrets$","status":404,"code":"not_found","count":10}]'
+	run claim --json x
+	rc_is "ambiguous Secret 404 with orgSecrets enabled fails closed" 75
+	reset '"seed":{"count":1,"pool":[0]},"set":{"box-1":{"secrets":{"secrets":"all","envSecrets":[],"items":[],"version":0}}}'
+	run pool add box-1
+	rc_is "pool add refuses Org Secret selections" 125
+	err_has "pool add explains both selections must be cleared" 'secrets.*envSecrets.*--no-vault --secrets none'
+	reset '"orgSecrets":[{"name":"TEST_ENV","delivery":"env","hosts":["*"]}]'
+	run doctor
+	rc_is "doctor fails for unsafe org-wide Secrets" 125
+	out_has "doctor names the unsafe Secret without its value" 'FAIL.*unsafe Org Secret: TEST_ENV'
+	reset '"seed":{"count":1},"set":{"box-1":{"ports":[{"port":8081,"name":"old"}]}}'
+	run claim --json x
+	id=$(jq -r .id "$S/out")
+	selected=$(box box-1 '.metadata["ibx.claim.start"]')
+	run renew box-1
+	is "renew preserves the stable reservation start" "$(box box-1 '.metadata["ibx.claim.start"]')" "$selected"
+	ctl "$(jq -cn --arg at "$past" '{set:{"box-1":{rawPorts:[{port:8081,name:"old",url:"https://old.mock.invalid",createdAt:$at}]}}}')"
+	# Reset rawPorts after the old-port check; publish as sandbox-local code, with its limited bearer.
+	ctl '{"set":{"box-1":{"rawPorts":[]}}}'
+	curl -q -fsS -H 'Authorization: Port mock-port' -H 'Content-Type: application/json' -d '{"port":8082,"name":"web"}' "$BASE/v1/machines/$id/ports" >/dev/null
+	ctl '{"set":{"box-1":{"clearRawPorts":true}}}'
+	run release --json box-1
+	rc_is "release removes a port created inside the sandbox during its reservation" 0
+	yes_ "release gives the new port cleanup reason" jq -e '.unpublishReasons | any(.port == 8082 and .reason == "created during the reservation")' "$S/out"
+	is "the older non-ibx port stays" "$(box box-1 '[.ports[].port]')" '[8081]'
+	run doctor
+	rc_is "doctor fails for a public port on an unreserved pool box" 125
+	reset '"seed":{"count":1},"set":{"box-1":{"ports":[{"port":8081,"name":"older"},{"port":8082,"name":"newer"},{"port":8083,"name":"ibx:newer"}],"mergeMetadata":{"ibx.claim.start":"2026-10-27T10:00:00.150Z"},"rawPorts":[{"port":8081,"name":"older","url":"old","createdAt":"2026-10-27T10:00:00.100Z"},{"port":8082,"name":"newer","url":"new","createdAt":"2026-10-27T10:00:00.200Z"},{"port":8083,"name":"ibx:newer","url":"new-ibx","createdAt":"2026-10-27T10:00:00.200Z"}]}}'
+	run release --json box-1
+	rc_is "release distinguishes ports created within the same second" 0
+	is "only the later same-second port is removed" "$(jq -c '[.unpublished,[.leftAlone[].port]]' "$S/out")" '[[8082,8083],[8081]]'
+	yes_ "new ports get the reservation cleanup reason regardless of prefix" jq -e \
+		'.unpublishReasons | all(.[]; .reason == "created during the reservation")' "$S/out"
+	reset '"seed":{"count":1},"set":{"box-1":{"vault":0,"applied":{"env":[],"files":["leftover"],"kept":[]}}}'
+	run claim --json x
+	rc_is "Vault file residue is unsafe even with no selected items" 75
+	reset '"seed":{"count":1},"set":{"box-1":{"vault":false,"applied":{"files":["leftover"],"kept":[]}}}'
+	run claim --json x
+	rc_is "disabling Vault does not hide persistent file residue" 75
+	reset '"seed":{"count":1},"set":{"box-1":{"rawVault":{}}}'
+	run claim --json x
+	rc_is "a malformed Vault inspection fails closed" 125
+
+	reset '"seed":{"count":1},"set":{"box-1":{"vault":0}},"faults":[{"kind":"error","method":"GET","match":"/vault$","status":403,"code":"permission_denied"}]'
+	run claim --json x
+	rc_is "uninspectable Vault fails closed" 125
+	err_has "Vault 403 has actionable wording" 'cannot inspect the Vault.*--no-vault --secrets none'
+	reset '"execResults":[{"stdout":"changed","invalidUtf8":true,"signal":"USR1","exitCode":255,"diskWarning":{"message":"disk is 95% full"}}]'
+	run exec box-1 -- true
+	rc_is "ExecResult warnings preserve the remote status" 255
+	err_has "invalid UTF-8 is reported" 'output was not UTF-8'
+	err_has "nonstandard signals are reported" 'SIGUSR1'
+	err_has "disk warnings are reported" 'disk is 95% full'
+	mkdir "$fake"
+	printf '#!/bin/sh\nprintf "%%s\\n" "$@" >"$FORWARD_ARGS"\n' >"$fake/ssh"
+	chmod +x "$fake/ssh"
+	reset
+	run PATH="$fake:$PATH" FORWARD_ARGS="$S/forward-args" forward box-1 18080:8080 9000
+	rc_is "forward uses the SSH setup" 0
+	yes_ "forward binds both ends to loopback" grep -q '127.0.0.1:18080:127.0.0.1:8080' "$S/forward-args"
+	yes_ "forward refuses failed listener setup" grep -q ExitOnForwardFailure=yes "$S/forward-args"
+	is "forward revokes its token" "$(box box-1 '[.tokens[].revoked]')" '[true]'
+	err_lacks "token revocation is confirmed" 'NOT be revoked'
+	run PATH="$fake:$PATH" FORWARD_ARGS="$S/forward-args" forward box-1 0:8080
+	rc_is "forward refuses invalid ports" 125
+}
+
+for t in platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
 	put_guard poolonly vault hostile secrets ssh install cleanup; do
 	want "$t" && "t_$t"
 done

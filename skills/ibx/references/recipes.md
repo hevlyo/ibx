@@ -5,13 +5,15 @@ Write it down, because shell variables do not survive between your tool calls. T
 these recipes were verified on 2026-10-15 ([field-notes.md](field-notes.md)). The API is in
 beta and changes fast, so prefer what you observe.
 
-Two forms run code in the sandbox:
+Two forms run code in the sandbox. Exec can also opt into SSE:
 
-- `ibx exec BOX [-t SECS] [-i] -- 'script'`: no ssh client needed, at most 600 s, output
+- `ibx exec BOX [-t SECS] [-i] -- 'script'` needs no ssh client, runs for at most 600 s, and its output
   arrives when the command ends. A **single** argument is a bash script, so `~`, `$VAR`, pipes
-  and `&&` are evaluated in the sandbox. `-i` sends your stdin (text, up to 1 MiB).
-- `ibx ssh BOX 'bash -s' <<'EOF' ... EOF`: streams output. It lasts as long as your tool call
-  (Claude Code: 10 minutes at most), and the connection closes if the sandbox pauses. Use it for
+  and `&&` are evaluated in the sandbox. `-i` sends your stdin (text, up to 1 MiB). Add
+  `--stream` before `--` for incremental, uncapped SSE output; disconnect kills the command.
+  This keeps the 600-second limit and never retries a started stream error.
+- `ibx ssh BOX 'bash -s' <<'EOF' ... EOF` streams output. It lasts as long as your tool call
+  (at most 10 minutes in Claude Code), and the connection closes if the sandbox pauses. Use it for
   multi-line work and big transfers.
 
 Give every call a tool timeout of at least `-t` + 120 s (the default `-t 300` needs 420000 ms),
@@ -31,7 +33,7 @@ use `$(id -un)` and `$HOME`.
 6. [Docker and compose](#6-docker-and-compose)
 7. [Large public datasets](#7-large-public-datasets)
 8. [Safe process killing](#8-safe-process-killing)
-9. [Publishing a port (only when asked)](#9-publishing-a-port-only-when-asked)
+9. [Publishing a port (only when asked)](#9-private-previews-and-public-ports)
 10. [Cleaning up](#10-cleaning-up)
 
 ## 1. Screenshot a web page with headless Chromium
@@ -43,7 +45,7 @@ ibx exec BOX -t 120 -- 'mkdir -p shots && timeout 90 chromium --headless --disab
   --hide-scrollbars --no-first-run --user-data-dir="$(mktemp -d)" \
   --window-size=1280,800 --virtual-time-budget=5000 \
   --screenshot="$HOME/shots/page.png" "https://example.com/" && ls -l shots/page.png'
-ibx get BOX shots/page.png ./page.png        # up to 750 KB
+ibx get BOX shots/page.png ./page.png        # bounded by IBX_GET_MAX, default 2G
 ibx ssh BOX 'cat shots/page.png' >page.png   # any size
 ```
 
@@ -53,7 +55,7 @@ Then open `page.png` with your own image-reading tool.
   `1280,3000`). For a phone, use `390,844`.
 - `--virtual-time-budget=MS` lets scripts and timers run before the capture.
 - `--user-data-dir="$(mktemp -d)"` gives a fresh profile, with no cookies from earlier runs.
-- Other outputs: `--print-to-pdf=FILE --no-pdf-header-footer` for a PDF, `--dump-dom` for the
+- For other outputs, use `--print-to-pdf=FILE --no-pdf-header-footer` for a PDF, `--dump-dom` for the
   rendered HTML on stdout.
 - Keep Chromium's sandbox. Add `--no-sandbox` only if Chromium refuses to start with a sandbox
   error, and then only for pages you trust.
@@ -61,14 +63,14 @@ Then open `page.png` with your own image-reading tool.
 
 ## 2. Auditing an untrusted npm or pip package
 
-Treat the sandbox as compromised from step 4 on: the guest user has sudo, and outbound
+Treat the sandbox as compromised from step 4 on. The guest user has sudo, and outbound
 internet is open. Claim a sandbox for this alone (`ibx claim "audit PKG@VERSION (untrusted)"`)
 and **check that it holds nothing of value first**. `ibx claim` already skips sandboxes the
 Vault writes secrets into, but an item can arrive later
-([trust-model.md](trust-model.md#5-the-vault)):
+([trust-model.md](trust-model.md#5-vault-and-org-secrets)):
 
 ```bash
-ibx exec BOX -- "env | cut -d= -f1 | sort"   # names only
+ibx exec BOX -- 'env | cut -d= -f1 | sort; test -s /run/instabox/secrets/env && echo ORG-SECRETS-PRESENT; env | grep -c "=ibsec_"'   # names only
 ibx exec BOX -- 'ls -A ~'
 ```
 
@@ -142,7 +144,7 @@ tcpdump flush the file:
 ibx exec BOX -- "sudo pkill -INT -f '[t]cpdump -i any'; sudo pkill -f '[i]notifywait -m'; sleep 1; ls -la ~/audit"
 ```
 
-**6. Read the evidence:**
+**6. Read the evidence.**
 
 ```bash
 ibx ssh BOX 'bash -s' <<'EOF'
@@ -199,14 +201,16 @@ ibx exec BOX -t 480 -i -- 'bash -s' <script.sh    # no ssh client; script up to 
 
 ## 4. Moving big files
 
-`ibx put` and `ibx get` stop at 750 KB. Above that, stream through `ibx ssh`:
+`ibx put` streams files up to 5 GiB and checks SHA-256. `ibx get` defaults to a 2G cap
+(`IBX_GET_MAX`). Older servers fall back to exec with a 750 KB limit and a warning. Use SSH
+for directories:
 
 ```bash
 git archive HEAD | ibx ssh BOX 'mkdir -p src && tar xf - -C src'          # a repo: versioned files only
 tar czf - -C ./data . | ibx ssh BOX 'mkdir -p data && tar xzf - -C data'  # any directory in
 mkdir -p ./out && ibx ssh BOX 'tar czf - -C out .' | tar xzf - -C ./out   # a directory out
-ibx ssh BOX 'cat >big.bin' <big.bin                                       # one file in
-ibx ssh BOX 'cat results.parquet' >results.parquet                        # one file out
+ibx put BOX big.bin big.bin                                       # one file in
+ibx get BOX results.parquet results.parquet                        # one file out
 sha256sum big.bin; ibx exec BOX -- 'sha256sum big.bin'                    # verify (macOS: shasum -a 256)
 ```
 
@@ -248,21 +252,23 @@ ibx exec BOX -- 'kill -TERM -- -"$(cat jobs/build/pid)"'
 
 - Poll with separate `ibx exec` calls like the one above, doing other work in between, or run
   a poll loop as a background task if your harness has them. Do not hold a tool call open with
-  a long foreground `sleep` loop: some harnesses forbid foreground sleeps, and the call can hit
+  a long foreground `sleep` loop. Some harnesses forbid foreground sleeps, and the call can hit
   its timeout.
 - `setsid -f` puts the job in a new session, so the exec ending (or timing out) does not take
   it down. `$$` in the inner bash is the process group ID, so `kill -- -PGID` stops the job
   together with its children.
 - The idle pause (30 minutes) ignores light CPU. Over 30 minutes, the user's keepalive timer
   ([keepalive.md](keepalive.md)) keeps a reserved sandbox up. Polling with an exec at least
-  every 25 minutes also counts as activity, according to the spec. An idle pause only freezes
-  the job, and the next exec wakes the sandbox and the job carries on.
+  every 25 minutes also counts as activity, according to the spec. An idle pause usually preserves
+  the job. Free boxes also pause at 480 continuous minutes, regardless of leases; all wake
+  paths refuse until cooldownUntil. A refused poll is not a dead job. Checkpoint near 8 hours
+  and check the PID and runtime.processesPreserved after waking.
 - "gone without an exit code" usually means the sandbox booted fresh or the OOM killer struck
   (`sudo dmesg | grep -i 'killed process'`). ibx warns about a fresh boot only when it started,
   resumed or woke the sandbox itself (`claim`, `ssh`, or an exec that found it not running).
   When the server wakes an idle-paused sandbox for an exec, ibx cannot tell, so this poll is
   how you find out. Make long jobs restartable.
-- Jobs past 24 h: run `ibx renew BOX` so your reservation does not count as abandoned.
+- For jobs past 24 h, run `ibx renew BOX` so your reservation does not count as abandoned.
 - For an interactive session that survives disconnects, install tmux
   (`sudo apt-get install -y tmux`).
 
@@ -294,18 +300,18 @@ ibx exec BOX -t 480 -- 'cd src && docker compose down -v --rmi local'
 The budget is 7.8 GiB of RAM with **no swap** (running out means the OOM killer and exit 137),
 20 GiB on `/data`, and 16 GiB on the system disk. Downloads run at about 3.3 Gbit/s.
 
-- **Stream**: download, decompress and filter in one pipeline. Never keep both the compressed
+- Download, decompress and filter in one pipeline. Never keep both the compressed
   file and its decompressed copy.
-- Put temporary files on `/data`: `mkdir -p ~/tmp` and pass `-T ~/tmp`, `TMPDIR=~/tmp` or the
+- Put temporary files on `/data`. Use `mkdir -p ~/tmp` and pass `-T ~/tmp`, `TMPDIR=~/tmp` or the
   tool's own setting. Check `df -h /tmp /data` and `free -m` first; a tmpfs `/tmp` would use
   RAM.
-- Bound memory explicitly: `sort -S 2G`, DuckDB `memory_limit`, pandas `chunksize=`, polars
+- Bound memory explicitly. Use `sort -S 2G`, DuckDB `memory_limit`, pandas `chunksize=`, polars
   lazy `scan_*`.
 - Use `set -o pipefail` so a failed download fails the command. Write results to a file
   instead of piping into `head`, which would make the pipeline end with SIGPIPE.
 - Anything that may take more than ~8 minutes goes detached (recipe 5). Keep results small,
   bring them back, and delete the inputs.
-- Tools that may be missing: `sudo apt-get install -y jq zstd pigz`.
+- Install missing tools with `sudo apt-get install -y jq zstd pigz`.
 
 ```bash
 # Rows per value of column 3 in a gzipped CSV, never stored on disk
@@ -343,9 +349,10 @@ To keep a large file, use a resumable download in a detached job:
 
 ## 8. Safe process killing
 
-`pkill -f PATTERN` inside an exec also matches the exec's own `bash -lc` command line, so it
-kills itself (exit 143). Look first, kill in a separate exec, and use a bracket pattern
-(`'[m]y-server'` matches "my-server" but not its own text):
+The old exec self-match was not reproduced on 2026-10-27; SSH remains unverified.
+A broad `pkill -f` pattern can kill unrelated processes. Prefer recorded PIDs. If you need a
+pattern, look first and use brackets, especially with SSH. `'[m]y-server'` matches "my-server"
+but not its own text.
 
 ```bash
 ibx exec BOX -- "pgrep -af '[m]y-server' || echo none"          # look
@@ -355,7 +362,7 @@ ibx exec BOX -- "pkill -TERM -f '[m]y-server' || true"           # by pattern, i
 ibx exec BOX -- "sleep 3; if pgrep -f '[m]y-server' >/dev/null; then pkill -KILL -f '[m]y-server'; echo killed; else echo gone; fi"
 ```
 
-- Exit 143 from an exec that ran `pkill` or `killall` means it killed itself. Redo it as above.
+- Exit 143 means TERM; inspect the returned signal rather than assuming a self-match. Redo it as above.
 - `pkill -x NAME` matches only the exact process name, so it cannot hit the exec's bash, but it
   stops *every* process of that name.
 - Stop containers with `docker compose stop` or `docker stop`, not by PID.
@@ -363,7 +370,12 @@ ibx exec BOX -- "sleep 3; if pgrep -f '[m]y-server' >/dev/null; then pkill -KILL
   `containerd`. Leave processes you did not start alone; ask the user about leftovers from
   earlier holders.
 
-## 9. Publishing a port (only when asked)
+## 9. Private previews and public ports
+
+For a preview on the user's computer, keep `ibx forward BOX 18080:8000` running in the
+foreground and visit `http://127.0.0.1:18080`. It binds only to localhost, revokes its 1-hour
+SSH token on exit, and relies on the claim's lease. Whether an open tunnel outlives token
+expiry remains unverified. Max-run pauses still interrupt access.
 
 A public URL has **no authentication**, and anyone with it reaches the service. Publish only
 when the user asks, tell them that, and unpublish as soon as they are done.
@@ -380,15 +392,17 @@ ibx unport BOX 8000        # when the user is done
 
 - Ports are 1024-65535, with 5901 and 6768 reserved, and at most 16 per sandbox. Publishing the
   same port again keeps its URL.
-- The URL answers only while the sandbox runs, and a request to it does not wake the sandbox.
+- The prose docs say URL visits wake an idle-paused box and wait; the spec still says 503.
+  This has not been verified here. Manual pauses and stops still answer 503.
   For a demo that must stay up past 30 idle minutes, the user needs the keepalive timer
   ([keepalive.md](keepalive.md)).
 - If `curl` inside works but the public URL does not, bind to `0.0.0.0` instead of
   `127.0.0.1`.
 - instabox has no access control for these URLs. If the user wants protection, it has to live
   in the application itself.
-- `ibx release` unpublishes every port ibx published (names starting with `ibx:`), and refuses
-  to finish while one is still public. It warns about other ports and leaves them alone.
+- Release removes ibx ports and every port created during the reservation, including guest
+  port-agent ports. Older non-ibx ports remain with a warning. Stop your server before release;
+  a process left running can publish another port later.
 - `ibx unport` of a port that is not published does nothing and succeeds, so it is safe to
   repeat.
 
