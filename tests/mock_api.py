@@ -32,16 +32,23 @@ Test endpoints (no auth):
         idle; ports: [{port, name, url}]; vault: N (on, N items), false (off) or null (no
         "vault" field and no Vault route); name/id rename it (id: any string, even an invalid one).
         rawPorts overrides GET /ports verbatim, for malformed provider responses.
+    clockSkew: SECONDS                seconds the mock's clock runs ahead of the client's (negative:
+        behind); applies to every timestamp it makes, before the reset's seed; reset restores 0
+    metadataKeepsUpdatedAt: true      PATCH leaves updatedAt as it was (reset: false)
     clearFaults: true
     opDelay: SECONDS                   delay for new operations (reset restores --op-delay)
     faults: [{kind, method, match, count, status, code, message, retryable, operationId,
               before, seconds, skip}]
         kind "drop": the reply is cut off mid-body (before: true closes the connection
-        without a reply; the request is not processed then); "error": answer status/code
-        instead; "delay": wait `seconds` before handling the request; "conflict": resume/start
-        answer 409 operation_conflict naming an operation that is already in progress;
-        "failop": the next operation fails. skip: leave the first N matching requests alone.
-        match is a regular expression searched in the path.
+        without a reply; the request is not processed then; plain: true answers an exec that
+        asks for a stream with a plain JSON result instead, as a buffering proxy would; with a
+        queued or canned result);
+        "error": answer status/code instead (body: TEXT sends that text/html page instead of
+        an error envelope, as a gateway in front of the API would); "delay": wait `seconds`
+        before handling the request; "conflict": resume/start answer 409 operation_conflict
+        naming an operation that is already in progress; "failop": the next operation fails.
+        skip: leave the first N matching requests alone. match is a regular expression
+        searched in the path.
     dropGets K, quotaExecs K, dropExecs K, conflictResumes K, failOps K   shortcuts
     execResults: [{stdout, stderr, exitCode, timedOut, truncated, signal, delay}]
         delay: seconds the exec takes before it answers (a slow command, in both exec modes)
@@ -93,8 +100,15 @@ def rid(prefix, n=26):
     return prefix + "".join(secrets.choice(B32) for _ in range(n))
 
 
+CLOCK_SKEW = 0.0  # seconds the server clock runs ahead of the client (control "clockSkew")
+
+
+def now():
+    return datetime.now(timezone.utc) + timedelta(seconds=CLOCK_SKEW)
+
+
 def iso(dt=None):
-    dt = dt or datetime.now(timezone.utc)
+    dt = dt or now()
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + "%06dZ" % dt.microsecond
 
 
@@ -154,6 +168,7 @@ class State:
         self.org_secrets_enabled = True
         self.files_enabled = True
         self.file_bad_hash = False
+        self.metadata_keeps_updated_at = False
         self.org = {"id": "org_mock", "tier": "free", "limits": {"freeSandboxHours": 0, "startsPerMinute": 3}, "usage": {"freeSandboxHours": 12}}
         startup = {"dropGets": args.drop_gets, "quotaExecs": args.quota_execs,
                    "dropExecs": args.drop_execs, "conflictResumes": args.conflict_resumes,
@@ -201,7 +216,7 @@ class State:
         m["operationId"] = None
         if st == "idle":
             st = "suspended"
-            m["autoSuspendedAt"] = iso(datetime.now(timezone.utc) - timedelta(minutes=5))
+            m["autoSuspendedAt"] = iso(now() - timedelta(minutes=5))
         if st not in STATES:
             raise bad_request("unknown state %s" % st)
         m["state"] = st
@@ -334,12 +349,18 @@ class State:
         return None
 
     def control(self, c):
+        global CLOCK_SKEW
+        if c.get("reset"):
+            CLOCK_SKEW = 0.0
+        if "clockSkew" in c:  # before seeding, so every timestamp of the reset uses it
+            CLOCK_SKEW = float(c["clockSkew"])
         if c.get("reset"):
             self.op_delay = self.default_op_delay
             self.org_secrets = []
             self.org_secrets_enabled = True
             self.files_enabled = True
             self.file_bad_hash = False
+            self.metadata_keeps_updated_at = False
             self.seed(**self.defaults)
             self.faults, self.exec_results, self.calls, self.idem = [], [], [], {}
         if "orgSecrets" in c:
@@ -348,6 +369,8 @@ class State:
             self.org_secrets_enabled = c["orgSecretsEnabled"]
         if "fileBadHash" in c:
             self.file_bad_hash = c["fileBadHash"]
+        if "metadataKeepsUpdatedAt" in c:
+            self.metadata_keeps_updated_at = truthy(c["metadataKeepsUpdatedAt"])
         if "filesEnabled" in c:
             self.files_enabled = c["filesEnabled"]
         if "org" in c:
@@ -380,8 +403,6 @@ class State:
                 m["metadata"].pop(k, None)
             for p in ch.get("ports") or []:
                 self.publish(m, int(p["port"]), p.get("name"), p.get("url"))
-            if ch.get("clearRawPorts"):
-                m.pop("_raw_ports", None)
             if "rawPorts" in ch:
                 m["_raw_ports"] = copy.deepcopy(ch["rawPorts"])
             for lease in ch.get("leases") or []:
@@ -463,7 +484,7 @@ class State:
     def put_lease(self, m, lease, ttl):
         if len(m["_leases"]) >= 128 and lease not in m["_leases"]:
             raise ApiError(429, "quota_exceeded", "at most 128 active task leases per machine")
-        exp = iso(datetime.now(timezone.utc) + timedelta(seconds=ttl))
+        exp = iso(now() + timedelta(seconds=ttl))
         m["_leases"][lease] = {"id": lease, "machineId": m["id"], "expiresAt": exp}
         return m["_leases"][lease]
 
@@ -625,11 +646,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.dispatch("DELETE")
 
-    def reply(self, status, obj, drop=False):
+    def reply(self, status, obj, drop=False, content_type=None):
         data = obj if isinstance(obj, bytes) else (b"" if obj is None else (json.dumps(obj) + "\n").encode())
         self.send_response(status)
         if obj is not None:
-            self.send_header("Content-Type", "application/octet-stream" if isinstance(obj, bytes) else "application/json")
+            self.send_header("Content-Type", content_type or ("application/octet-stream" if isinstance(obj, bytes) else "application/json"))
             if isinstance(obj, dict) and (obj.get("error") or {}).get("retryAfterSeconds"):
                 self.send_header("Retry-After", str(obj["error"]["retryAfterSeconds"]))
         self.send_header("Content-Length", str(len(data)))
@@ -677,6 +698,10 @@ class Handler(BaseHTTPRequestHandler):
                 with S.lock:
                     call["status"], call["dropped"] = 0, True
                 return self.cut()
+            if fault and fault["kind"] == "error" and "body" in fault:
+                with S.lock:
+                    call["status"] = int(fault.get("status", 502))
+                return self.reply(call["status"], fault["body"].encode(), content_type="text/html; charset=utf-8")
             if fault and fault["kind"] == "error":
                 raise ApiError(int(fault.get("status", 500)), fault.get("code", "internal"),
                                fault.get("message", "mock: injected error"),
@@ -696,7 +721,8 @@ class Handler(BaseHTTPRequestHandler):
             call["status"], call["dropped"] = status, drop
         if drop and obj is None:
             return self.cut()
-        if status == 200 and method == "POST" and path.endswith("/exec") and "text/event-stream" in self.headers.get("Accept", ""):
+        if status == 200 and method == "POST" and path.endswith("/exec") and "text/event-stream" in self.headers.get("Accept", "") \
+                and not (drop and fault.get("plain")):
             return self.reply_sse(obj, drop)
         self.reply(status, obj, drop)
 
@@ -865,6 +891,8 @@ class Handler(BaseHTTPRequestHandler):
             if parts == ["orgs", "org_mock"] and method == "GET":
                 return 200, S.org
             if parts == ["orgs", "org_mock", "secrets"] and method == "GET":
+                if not S.org_secrets_enabled:
+                    raise not_found("route not found")
                 return 200, {"items": S.org_secrets}
             if parts == ["ports"] and method == "GET":
                 return 200, {"ports": [dict(p, machineId=m["id"]) for m in S.machines.values() for p in m["_ports"].values()]}
@@ -1006,7 +1034,8 @@ class Handler(BaseHTTPRequestHandler):
         if "autoSuspendAfterSeconds" in b:
             m["autoSuspendAfterSeconds"] = b["autoSuspendAfterSeconds"]
 
-        m["updatedAt"] = iso()  # metadata changes do not bump revision
+        if not self.S.metadata_keeps_updated_at:  # the spec does not say whether PATCH bumps it
+            m["updatedAt"] = iso()  # metadata changes do not bump revision
         return 200, self.S.public(m)
 
     def check_cooldown(self, m):
@@ -1014,7 +1043,10 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(409, "max_run_disabled", "max-run is disabled")
         until = m.get("cooldownUntil")
         if until:
-            seconds = (datetime.fromisoformat(until.replace("Z", "+00:00")) - datetime.now(timezone.utc)).total_seconds()
+            try:
+                seconds = (datetime.fromisoformat(until.replace("Z", "+00:00")) - now()).total_seconds()
+            except ValueError:  # a deadline the client may not parse: the server still enforces it
+                seconds = 60
             if seconds > 0:
                 raise ApiError(409, "machine_cooldown", "max-run cooldown", retryAfterSeconds=max(1, int(seconds + 1)))
 
@@ -1133,7 +1165,7 @@ class Handler(BaseHTTPRequestHandler):
         t = {"id": rid("cn_"), "name": name, "machineId": m["id"], "host": "127.0.0.1",
              "port": self.S.ssh_port, "token": tok,
              "command": "ssh -p %d %s@127.0.0.1" % (self.S.ssh_port, tok),
-             "createdAt": iso(), "expiresAt": iso(datetime.now(timezone.utc) + timedelta(seconds=ttl)),
+             "createdAt": iso(), "expiresAt": iso(now() + timedelta(seconds=ttl)),
              "hostKeyFingerprint": "SHA256:" + b64encode(hashlib.sha256(
                  self.S.ca_key.encode()).digest()).decode().rstrip("="),
              "_revoked": False}
@@ -1161,8 +1193,6 @@ class Handler(BaseHTTPRequestHandler):
         with S.lock:
             m = S.find(mref)
             self.check_cooldown(m)
-            if m["state"] == "suspended" and m.get("autoSuspendedAt"):
-                self.wake(m)
             if m["state"] != "running" or m["operationId"]:
                 raise ApiError(409, "machine_not_running", "the sandbox is %s" % m["state"])
             if S.running_execs >= S.max_execs:

@@ -2,7 +2,7 @@
 
 Concrete ways to get common jobs done in a pool sandbox. `BOX` is the name `ibx claim` printed.
 Write it down, because shell variables do not survive between your tool calls. The facts behind
-these recipes were verified on 2026-10-15 ([field-notes.md](field-notes.md)). The API is in
+these recipes were checked through 2026-10-27 ([field-notes.md](field-notes.md)). The API is in
 beta and changes fast, so prefer what you observe.
 
 Two forms run code in the sandbox. Exec can also opt into SSE:
@@ -19,6 +19,11 @@ Two forms run code in the sandbox. Exec can also opt into SSE:
 Give every call a tool timeout of at least `-t` + 120 s (the default `-t 300` needs 420000 ms),
 and `ibx claim` and `ibx ssh` 600000 ms. Where a tool call stops at 10 minutes, as in Claude
 Code, keep `-t` at 480 or less; work that takes more than ~8 minutes goes detached (recipe 5).
+That budget covers the command, not what comes before it: ibx can first wait up to 600 s for
+a free request slot (32 per user) or a max-run cooldown, and up to 10 more minutes for a paused
+box to start. An ibx interrupted during those waits says `interrupted by SIG... before anything
+started in the sandbox`; only then is running the same command again known to be safe. `ibx ls`
+shows a cooldown.
 
 Commands start in HOME (`/data/home`). The guest user has passwordless sudo; its name varies, so
 use `$(id -un)` and `$HOME`.
@@ -262,7 +267,7 @@ ibx exec BOX -- 'kill -TERM -- -"$(cat jobs/build/pid)"'
   every 25 minutes also counts as activity, according to the spec. An idle pause usually preserves
   the job. Free boxes also pause at 480 continuous minutes, regardless of leases; all wake
   paths refuse until cooldownUntil. A refused poll is not a dead job. Checkpoint near 8 hours
-  and check the PID and runtime.processesPreserved after waking.
+  and check the PID and runtime.processesPreserved in ibx ls --json after waking.
 - "gone without an exit code" usually means the sandbox booted fresh or the OOM killer struck
   (`sudo dmesg | grep -i 'killed process'`). ibx warns about a fresh boot only when it started,
   resumed or woke the sandbox itself (`claim`, `ssh`, or an exec that found it not running).
@@ -386,7 +391,7 @@ ibx exec BOX -- 'mkdir -p site jobs/web && cd jobs/web &&
   setsid -f bash -c "echo \$\$ >pid; exec python3 -m http.server 8000 --bind 0.0.0.0 --directory ~/site >log 2>&1" </dev/null >/dev/null 2>&1
   sleep 1; curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8000/'
 ibx port BOX 8000 site     # prints the URL (and a warning) for the user
-curl -sS -o /dev/null -w '%{http_code}\n' 'URL'   # from outside: 200; 503 while the sandbox is paused
+curl -sS -o /dev/null -w '%{http_code}\n' 'URL'   # from outside: 200 while the box runs
 ibx unport BOX 8000        # when the user is done
 ```
 

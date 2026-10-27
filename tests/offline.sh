@@ -185,6 +185,9 @@ hold() { # name [age-seconds] [by]: give the sandbox a reservation
 	ctl "{\"set\":{\"$1\":{\"mergeMetadata\":$(claim_md "$(ago "${2:-0}")" "${3:-}")}}}"
 }
 claim_keys() { box "$1" '[.metadata | keys[] | select(startswith("ibx.claim."))] | length'; }
+fail_next() { # the last run printed FAIL lines, each followed by an indented next step
+	awk '/^FAIL /{f++; if ((getline n) <= 0 || n !~ /^      next: [^ ]/) bad++} END {exit !(f > 0 && bad == 0)}' "$S/out"
+}
 
 want() { [ -z "${ONLY:-}" ] || [[ $1 == *$ONLY* ]]; }
 
@@ -283,12 +286,15 @@ t_doctor() {
 	run doctor
 	rc_is "doctor fails on an empty pool" 125
 	out_has "doctor explains the empty pool" '^FAIL +the pool is empty \(2 sandboxes'
+	out_has "and how to fill it" '^      next: .*ibx pool add BOX'
 	run INSTABOX_API_KEY=$OTHER_KEY doctor
 	rc_is "doctor fails with a wrong key" 125
 	out_has "doctor shows the API error" '^FAIL +API call failed: .*invalid_key'
+	out_has "a refused key is the user's to fix" '^      next: the user fixes or replaces this key'
 	run -u INSTABOX_API_KEY doctor
 	rc_is "doctor fails without a key" 125
 	out_has "doctor says the key is missing" '^FAIL +no API key'
+	yes_ "its FAIL line has a next step" fail_next
 	reset
 	local config=$S/claude-doctor
 	run CLAUDE_CONFIG_DIR="$config" doctor
@@ -980,7 +986,9 @@ PYCODE
 	chmod +x "$copy"
 	reset '"seed":{"count":1}'
 	IBX=$copy IBX_COMMIT_MARKER=$marker signal_claim --json x
-	for _ in $(seq 100); do [ -e "$marker" ] && break; sleep 0.05; done
+	# Up to 20 s: the claim makes several API writes before it gets there, and a loaded CI
+	# host can take more than 5 s for them.
+	for _ in $(seq 400); do [ -e "$marker" ] && break; sleep 0.05; done
 	yes_ "the claim pauses at its keep commit point" [ -e "$marker" ]
 	kill -TERM "$SIGNAL_PID"
 	wait "$SIGNAL_PID"; RC=$? TIMEDOUT=
@@ -1475,6 +1483,7 @@ t_exec() {
 	run exec box-1 -t 1 -- 'sleep 5'
 	rc_is "a timed-out exec exits 124" 124
 	err_has "a timeout suggests running detached" 'timed out after 1s'
+	err_has "with stdin redirected too" 'setsid -f CMD </dev/null >LOG 2>&1'
 
 	ctl '{"execResults":[{"stdout":"partial","truncated":true},{"exitCode":143,"signal":"TERM"}]}'
 	run exec box-1 -- 'cat huge'
@@ -1499,8 +1508,10 @@ t_exec() {
 	reset '"set":{"box-1":{"state":"idle"}}'
 	LIMIT=20 run exec box-1 -- 'exit 6'
 	rc_is "exec on an idle-paused sandbox wakes it, then runs" 6
-	is "the gateway wakes an idle box without an explicit wake POST" "$(count POST '/wake$')" 0
-	is "the auto-woken box is running" "$(box box-1 .state)" running
+	is "409 machine_not_running, one wake, run" \
+		"$(calls | jq -c '[.calls[] | select(.method == "POST") | [(.path | split("/") | last), .status]]')" \
+		'[["exec",409],["wake",200],["exec",200]]'
+	is "the woken box is running" "$(box box-1 .state)" running
 
 	reset '"dropExecs":1'
 	run exec box-1 -- 'echo ran >>ran.txt'
@@ -1536,9 +1547,10 @@ t_exec() {
 	rc_is "a fourth machine_not_running gives up" 125
 	err_has "it says the command did not run" 'exec did not run: .* keeps stopping'
 	is "after four tries" "$(count POST '/exec$')" 4
-	local code
-	for code in api_key_expired api_key_revoked missing_key malformed_key invalid_key expired_key revoked_key session_expired missing_scope; do
-		reset "\"faults\":[{\"kind\":\"error\",\"method\":\"POST\",\"match\":\"/exec\$\",\"status\":401,\"code\":\"$code\",\"message\":\"no\"}]"
+	local code status
+	for code in api_key_expired api_key_revoked unauthenticated missing_key malformed_key invalid_key expired_key revoked_key session_expired missing_scope insufficient_scope; do
+		case $code in missing_scope | insufficient_scope) status=403 ;; *) status=401 ;; esac # as the API sends them
+		reset "\"faults\":[{\"kind\":\"error\",\"method\":\"POST\",\"match\":\"/exec\$\",\"status\":$status,\"code\":\"$code\",\"message\":\"no\"}]"
 		run exec box-1 -- true
 		rc_is "$code: exec fails with 125" 125
 		err_has "$code: it says the command did not run" 'exec rejected \(the command did not run\)'
@@ -1598,6 +1610,8 @@ PYCODE
 		err_has "$kind: the caller sees the interruption warning" 'interrupted by SIGTERM'
 		if [ "$kind" = quota ]; then
 			is "quota: no exec is retried after interruption" "$(count POST '/exec$')" 1
+			err_has "quota: an interrupted slot wait says nothing started" 'interrupted by SIGTERM before anything started in the sandbox'
+			err_lacks "quota: and does not claim the command may have run" 'may have run partly'
 		else
 			err_has "interrupted uploads report remote outcome uncertainty" 'remote file may have been replaced'
 			is "safe host retry: no upload is retried after interruption" "$(count PUT '/files$')" 1
@@ -2510,7 +2524,7 @@ PYCODE
 
 t_platform030() {
 	group "0.3.0 lifecycle, Secrets, ports and transfers"
-	local future past id selected fixture code fake=$S/forward030
+	local future id selected fixture code fake=$S/forward030
 	python3 - "$here/live.sh" "$S/live-budget-functions" <<'PYCODE'
 from pathlib import Path
 import sys
@@ -2531,7 +2545,7 @@ PYCODE
 	is "live guard rejects an actually claimed nearly-spent box" "$?" 1
 	yes_ "live guard accepts the two actual healthy claims" live_claim_budget long-a long-b <"$S/live-budget-rows"
 
-	future=$(ago -300) past=$(ago 300)
+	future=$(ago -300)
 	reset
 	hold box-1 0
 	ctl "$(jq -cn --arg c "$future" '{set:{"box-1":{cooldownUntil:$c}}}')"
@@ -2542,6 +2556,7 @@ PYCODE
 	reset '"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":409,"code":"machine_cooldown","retryAfterSeconds":2}]'
 	run keepalive --all
 	rc_is "a cooldown raced with keepalive does not fail the pool tick" 0
+	out_has "it says when to retry, without a cooldownUntil to print" '^box-1: max-run cooldown, retry after 2 s, skipped$'
 	is "the other boxes still get leases" "$(count PUT .)" 3
 	reset
 	ctl "$(jq -cn --arg old "$(ago 25000)" '{set:{"box-1":{runStartedAt:$old},"box-2":{maxRunMinutes:0},"box-3":{maxRunMinutes:-1}}}')"
@@ -2597,13 +2612,13 @@ PYCODE
 	done
 	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/secrets$","status":403,"code":"permission_denied"}]'
 	run claim --json x
-	rc_is "uninspectable Secrets fail closed" 75
+	rc_is "uninspectable Secrets are an API failure" 125
 	reset '"seed":{"count":1},"orgSecretsEnabled":false'
 	run claim --json x
 	rc_is "older servers without Org Secrets are accepted only when usage disables them" 0
 	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/machines/.*/secrets$","status":404,"code":"not_found","count":10}]'
 	run claim --json x
-	rc_is "ambiguous Secret 404 with orgSecrets enabled fails closed" 75
+	rc_is "ambiguous Secret 404 with orgSecrets enabled fails closed" 125
 	reset '"seed":{"count":1,"pool":[0]},"set":{"box-1":{"secrets":{"secrets":"all","envSecrets":[],"items":[],"version":0}}}'
 	run pool add box-1
 	rc_is "pool add refuses Org Secret selections" 125
@@ -2618,11 +2633,7 @@ PYCODE
 	selected=$(box box-1 '.metadata["ibx.claim.start"]')
 	run renew box-1
 	is "renew preserves the stable reservation start" "$(box box-1 '.metadata["ibx.claim.start"]')" "$selected"
-	ctl "$(jq -cn --arg at "$past" '{set:{"box-1":{rawPorts:[{port:8081,name:"old",url:"https://old.mock.invalid",createdAt:$at}]}}}')"
-	# Reset rawPorts after the old-port check; publish as sandbox-local code, with its limited bearer.
-	ctl '{"set":{"box-1":{"rawPorts":[]}}}'
 	curl -q -fsS -H 'Authorization: Port mock-port' -H 'Content-Type: application/json' -d '{"port":8082,"name":"web"}' "$BASE/v1/machines/$id/ports" >/dev/null
-	ctl '{"set":{"box-1":{"clearRawPorts":true}}}'
 	run release --json box-1
 	rc_is "release removes a port created inside the sandbox during its reservation" 0
 	yes_ "release gives the new port cleanup reason" jq -e '.unpublishReasons | any(.port == 8082 and .reason == "created during the reservation")' "$S/out"
@@ -2669,7 +2680,299 @@ PYCODE
 	rc_is "forward refuses invalid ports" 125
 }
 
-for t in platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
+t_guards030() {
+	group "0.3.0 guards: literal file names, RFC 3339 dates, Secret checks, keepalive refusals"
+	local home cwd=$PWD code h fake=$S/guards-ssh future past start sel id f c args pid
+	reset '"seed":{"count":1}'
+	home=$(box box-1 .home)
+	# curl reads -T - as stdin and expands {a,b} unless -g: the literal file must be what arrives.
+	printf 'literal braces\n' >"$S/{x,.env}"
+	printf 'decoy\n' >"$S/x"
+	printf 'synthetic credential\n' >"$S/.env"
+	run put box-1 "$S/{x,.env}" literal
+	rc_is "put uploads a file whose name has braces" 0
+	yes_ "the brace name is literal: no other file is uploaded in its place" cmp -s "$S/{x,.env}" "$home/literal"
+	printf 'literal dash\n' >"$S/-"
+	cd "$S" || return
+	run put box-1 - dash
+	cd "$cwd" || return
+	rc_is "put uploads a local file named -" 0
+	yes_ "a file named - is read, not stdin" cmp -s "$S/-" "$home/dash"
+	mkdir "$fake"
+	printf '#!/bin/sh\nexit 0\n' >"$fake/ssh"
+	chmod +x "$fake/ssh"
+	rm -f "$S/spy.args"
+	run PATH="$SPY:$PATH" ls
+	rc_is "(spied ls)" 0
+	run PATH="$SPY:$PATH" exec box-1 -- true
+	rc_is "(spied exec)" 0
+	run PATH="$SPY:$PATH" exec box-1 --stream -- true
+	rc_is "(spied exec --stream)" 0
+	run PATH="$SPY:$PATH" put box-1 "$S/x" spy-put
+	rc_is "(spied put)" 0
+	run PATH="$SPY:$PATH" get box-1 spy-put "$S/spy-get"
+	rc_is "(spied get)" 0
+	run PATH="$fake:$SPY:$PATH" forward box-1 18080:8080
+	rc_is "(spied forward)" 0
+	# Each kind of curl call: api(), the stream, the upload, the download, the token revoke.
+	for h in ' -X GET -H @- .*/v1/machines' ' -X POST -H @- .*/exec$' ' -N .* -H @- .*/exec$' \
+		' -H @- -T ' ' -H @- --max-filesize ' ' -X DELETE -H @- .*/ssh-tokens/'; do
+		yes_ "(the spy saw the curl call /$h/)" grep -Eq -- "$h" "$S/spy.args"
+	done
+	is "every curl that sends a request turns globbing off" "$(grep ' -H @- ' "$S/spy.args" | grep -cv -- ' -g ')" 0
+	# /dev/stdin and the fd names are curl's own stdin (the drained key header) once curl opens
+	# them: put refuses them, and hands curl the file's physical path, so no alias reaches it.
+	printf 'orig\n' >"$home/f4"
+	run -s "$S/x" put box-1 /dev/stdin f4
+	rc_is "put refuses /dev/stdin" 125
+	err_has "and says to name the file" 'put copies a named file'
+	yes_ "and leaves the remote file alone" grep -qx orig "$home/f4"
+	ln -s /dev/stdin "$S/stdin-link"
+	run -s "$S/x" put box-1 "$S/stdin-link" f4
+	yes_ "a link to /dev/stdin uploads the file it resolves to, or is refused; never an empty file (rc $RC)" \
+		eval '{ [ "$RC" = 0 ] && cmp -s "$S/x" "$home/f4"; } || { [ "$RC" = 125 ] && grep -qx orig "$home/f4"; }'
+
+	# Dates: valid RFC 3339 offsets are parsed; an unreadable one is null, never a vanished row.
+	reset '"set":{"box-1":{"runStartedAt":"2026-10-27T10:00:00+05:30"},"box-2":{"runStartedAt":"2026-10-27t10:00:00.5-03:00"},"box-3":{"runStartedAt":"2026-10-27T10:00:00+0530"}}'
+	run ls --json
+	rc_is "ls with offset and unreadable run starts" 0
+	is "no row is dropped for a date ibx cannot read" "$(jq -c 'map(.name)' "$S/out")" '["box-1","box-2","box-3"]'
+	is "offsets move the pause to UTC" "$(jq -c 'map(.pausesAt)' "$S/out")" '["2026-10-27T12:30:00Z","2026-10-27T21:00:00Z",null]'
+	reset '"seed":{"count":1},"set":{"box-1":{"runStartedAt":"2026-10-27T10:00:00+0530"}}'
+	run claim --json x
+	rc_is "claim takes a box whose run start it cannot read" 0
+	yes_ "and reports its pause as null" jq -e '.name == "box-1" and .pausesAt == null' "$S/out"
+	future=$(jq -nr 'now + 600 + 7200 | floor | strftime("%Y-%m-%dT%H:%M:%S+02:00")')
+	past=$(jq -nr 'now - 600 - 14400 | floor | strftime("%Y-%m-%dT%H:%M:%S-04:00")')
+	for code in "$future" soon; do
+		reset '"seed":{"count":1}'
+		ctl "$(jq -cn --arg c "$code" '{set:{"box-1":{cooldownUntil:$c}}}')"
+		run claim --json x
+		rc_is "claim skips a box with cooldownUntil $code" 75
+		is "and writes no reservation to it" "$(count PATCH .)" 0
+	done
+	reset '"seed":{"count":1}'
+	ctl "$(jq -cn --arg c "$past" '{set:{"box-1":{cooldownUntil:$c}}}')"
+	run claim --json x
+	rc_is "an offset cooldown that has ended allows the claim" 0
+	reset '"seed":{"count":1}'
+	hold box-1 0
+	ctl "$(jq -cn --arg c "$future" '{set:{"box-1":{cooldownUntil:$c}}}')"
+	run keepalive
+	rc_is "keepalive with an offset cooldown" 0
+	out_has "it reads the offset cooldown" '^box-1: max-run cooldown until .*\+02:00, skipped$'
+	is "and sends no lease request" "$(count PUT .)" 0
+	ctl '{"set":{"box-1":{"cooldownUntil":"soon"}}}'
+	run keepalive
+	rc_is "keepalive with an unreadable cooldown" 0
+	is "leaves the decision to the server" "$(count PUT '/activity-leases/')" 1
+	out_has "which refuses it as a cooldown skip" '^box-1: max-run cooldown until soon, skipped$'
+	reset '"seed":{"count":1},"set":{"box-1":{"tokens":[{"id":"cn_odd","name":"ODD-EXPIRY","expiresAt":"not-a-date","revokedAt":null}]}}'
+	run doctor
+	out_has "doctor still reports a token whose expiry it cannot read" 'long-lived SSH token: ODD-EXPIRY'
+
+	# Org Secrets: an inspection failure is an API error, unknown delivery fails closed, and
+	# a proxy Secret without hosts means every host.
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/machines/.*/secrets$","status":503,"code":"internal","count":20}]'
+	run claim --json x
+	rc_is "claim exits 125 when it cannot inspect Org Secrets" 125
+	is "with an API failure, not no_free_sandbox" "$(jq -r .error.code "$S/out")" failed
+	err_has "it says the Secrets could not be inspected" 'skipping box-1: could not inspect its Org Secrets'
+	reset '"seed":{"count":1,"pool":[0]},"faults":[{"kind":"error","method":"GET","match":"/machines/.*/secrets$","status":503,"code":"internal","count":20}]'
+	run pool add box-1
+	rc_is "pool add refuses a box whose Secrets it cannot inspect" 125
+	err_has "and says so instead of claiming Secrets are selected" 'could not inspect the Org Secrets of box-1'
+	for h in '"secrets":[]' '"secrets":"all"'; do
+		reset "\"seed\":{\"count\":1},\"set\":{\"box-1\":{\"secrets\":{$h,\"envSecrets\":[],\"items\":[{\"name\":\"NEW\",\"delivery\":\"future\"}],\"version\":0}}}"
+		run IBX_ALLOW_SECRETS=1 claim --json x
+		rc_is "the proxy override refuses unknown delivery ($h)" 75
+	done
+	# The override is for proxy Secrets scoped to named hosts: omitted or empty hosts mean every host.
+	for h in '"hosts":["*"]' '"hosts":["api.example.com","*"]' '"hosts":[]' '"hosts":null' '"size":1'; do
+		for sel in '"all"' '["WIDE"]'; do
+			reset "\"seed\":{\"count\":1},\"set\":{\"box-1\":{\"secrets\":{\"secrets\":$sel,\"envSecrets\":[],\"items\":[{\"name\":\"WIDE\",\"delivery\":\"proxy\",$h}],\"version\":0}}}"
+			run IBX_ALLOW_SECRETS=1 claim --json x
+			rc_is "the proxy override refuses a wildcard proxy Secret ($sel, $h)" 75
+			is "and reserves nothing" "$(count PATCH .)" 0
+		done
+		reset "\"seed\":{\"count\":1,\"pool\":[0]},\"set\":{\"box-1\":{\"secrets\":{\"secrets\":[\"WIDE\"],\"envSecrets\":[],\"items\":[{\"name\":\"WIDE\",\"delivery\":\"proxy\",$h}],\"version\":0}}}"
+		run IBX_ALLOW_SECRETS=1 pool add box-1
+		rc_is "pool add with the override refuses a wildcard proxy Secret ($h)" 125
+		is "and leaves the box out of the pool" "$(box box-1 '.metadata["ibx.pool"] // "none"')" none
+	done
+	reset '"seed":{"count":1},"set":{"box-1":{"secrets":{"secrets":"all","envSecrets":[],"items":[{"name":"SCOPED","delivery":"proxy","hosts":["api.example.com"]}],"version":0}}}'
+	run IBX_ALLOW_SECRETS=1 claim --json x
+	rc_is "the proxy override still allows a proxy Secret for named hosts" 0
+	for h in null '[]' '["*"]' '"*"'; do
+		reset "\"orgSecrets\":[{\"name\":\"WIDE\",\"delivery\":\"proxy\",\"hosts\":$h}]"
+		run doctor
+		rc_is "doctor fails for a proxy Secret with hosts $h" 125
+		out_has "and names it" '^FAIL +unsafe Org Secret: WIDE'
+	done
+	reset '"orgSecrets":[{"name":"NOHOSTS","delivery":"proxy"}]'
+	run doctor
+	rc_is "doctor fails for a proxy Secret that omits hosts" 125
+	reset '"orgSecrets":[{"name":"LATER","delivery":"later","hosts":["api.example.com"]}]'
+	run doctor
+	rc_is "doctor fails for a Secret with an unknown delivery" 125
+	reset '"orgSecrets":[{"name":"SCOPED","delivery":"proxy","hosts":["api.example.com"]}]'
+	run doctor
+	rc_is "a proxy Secret for named hosts is only a warning" 0
+	out_has "and is listed" '^warn +Org Secret exists: SCOPED'
+	reset '"orgSecretsEnabled":false'
+	run doctor
+	rc_is "doctor accepts a server without Org Secrets (404, usage says off)" 0
+	out_has "and says so" '^ok +Org Secrets: none on this server'
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/orgs/[^/]+/secrets$","status":404,"code":"not_found","count":10}]'
+	run doctor
+	rc_is "an Org Secrets 404 while usage says they exist still fails" 125
+	out_has "as an audit failure" '^FAIL +could not audit Org Secrets'
+	# Doctor shows the API's reason for a failed audit instead of guessing one.
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/orgs/[^/]+/secrets$","status":403,"code":"permission_denied","message":"only org admins may list Secrets here","count":10}]'
+	run doctor
+	rc_is "doctor fails when the Org Secrets audit is refused" 125
+	out_has "with the API's reason" '^FAIL +could not audit Org Secrets \(permission_denied: only org admins may list Secrets here\)$'
+	out_lacks "without guessing a missing scope" 'machines:read'
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/orgs/[^/]+/secrets$","status":403,"code":"missing_scope","message":"this key lacks a scope","requiredScopes":["machines:read"],"count":10}]'
+	run doctor
+	out_has "a missing scope is named as such" '^      next: .*machines:read'
+	reset '"seed":{"count":1},"set":{"box-1":{"secrets":{"secrets":["X"],"envSecrets":[],"items":[],"version":0}}}'
+	run doctor
+	rc_is "doctor fails for a box with Org Secrets selected" 125
+	out_has "and says they are selected" '^FAIL +box-1 has Org Secrets selected, pending or left behind$'
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/machines/.*/secrets$","status":503,"code":"host_unavailable","message":"mock: secrets down","count":20}]'
+	run doctor
+	rc_is "doctor fails for a box whose Org Secrets it cannot inspect" 125
+	out_has "and says why" '^FAIL +could not inspect the Org Secrets of box-1 \(host_unavailable: mock: secrets down\)$'
+	out_lacks "without calling that a selection" 'has Org Secrets selected'
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/vault$","status":403,"code":"permission_denied","message":"not the creator","count":20}]'
+	run doctor
+	rc_is "doctor fails for a box whose Vault it cannot read" 125
+	out_has "and says why" '^FAIL +could not read the Vault of box-1 \(permission_denied: not the creator\)$'
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/machines$","status":503,"code":"host_unavailable","message":"mock: list down","retryable":true,"count":10}]'
+	run doctor
+	rc_is "doctor fails when it cannot list the sandboxes" 125
+	out_has "and says so, with the API's reason" '^FAIL +could not list sandboxes \(host_unavailable: mock: list down\)'
+	out_lacks "never as an empty pool" 'pool is empty|pool add'
+	is "and audits no ports against a list it does not have" "$(count GET '^/v1/ports$')" 0
+	yes_ "with a next step" fail_next
+	reset '"seed":{"count":2,"vault":{"box-1":2}},"set":{"box-2":{"ports":[{"port":8081,"name":"x"}]}},"orgSecrets":[{"name":"ENVV","delivery":"env","hosts":["*"]}]'
+	run doctor
+	rc_is "doctor with several failures" 125
+	is "it reports each of them" "$(grep -c '^FAIL ' "$S/out")" 3
+	yes_ "every FAIL line is followed by a next step" fail_next
+
+	# keepalive: refusals that renewing cannot fix are skips; a billing block stops the tick.
+	reset '"seed":{"count":1},"set":{"box-1":{"maxRunMinutes":0}}'
+	run keepalive --all
+	rc_is "keepalive skips a box whose max-run is disabled" 0
+	out_has "and says why" '^box-1: max-run is disabled \(maxRunMinutes 0\), skipped$'
+	# The lease route does not list 402, but it wakes an idle-paused box first, and wake does.
+	# box-2 is paused for idleness; box-1 and box-3 run and need no wake.
+	reset '"set":{"box-2":{"state":"idle"}}'
+	id=$(box box-2 .id)
+	ctl "{\"faults\":[{\"kind\":\"error\",\"method\":\"PUT\",\"match\":\"/$id/activity-leases/\",\"status\":402,\"code\":\"credit_exhausted\",\"message\":\"wait until next UTC month\"}]}"
+	run keepalive --all
+	rc_is "a billing block is a skip: exit 0, so the timer unit does not restart" 0
+	out_has "it names the billing block" '^box-2: account blocked by billing: credit_exhausted; wait until next UTC month.*skipped'
+	out_has "the running box after it still gets its lease" '^box-3: lease until '
+	is "every box is asked once" "$(count PUT '/activity-leases/')" 3
+	reset '"set":{"box-2":{"state":"idle"}}'
+	ctl "$(jq -cn --arg a "$(box box-1 .id)" --arg b "$(box box-2 .id)" '{faults:[
+		{kind:"error",method:"PUT",match:("/" + $a + "/activity-leases/"),status:409,code:"operation_conflict"},
+		{kind:"error",method:"PUT",match:("/" + $b + "/activity-leases/"),status:402,code:"credit_exhausted"}]}')"
+	run keepalive --all
+	rc_is "a billing block does not hide another box's failed lease" 1
+	out_has "which is reported" '^box-1: FAILED .*operation_conflict'
+	out_has "and the box after them still gets its lease" '^box-3: lease until '
+	reset '"seed":{"count":1}'
+	hold box-1 0
+	run INSTABOX_API_KEY=$OTHER_KEY keepalive
+	rc_is "keepalive with a rejected key fails as ibx itself (125), not as a lease (1)" 125
+
+	# Release compares the claim start with port times from the server's clock.
+	reset '"seed":{"count":1},"clockSkew":-120'
+	run claim --json x
+	rc_is "claim against a server clock two minutes behind" 0
+	start=$(box box-1 '.metadata["ibx.claim.start"]')
+	yes_ "the reservation start is the server's time of the claim ($start)" \
+		jq -en --arg s "$start" --arg u "$(box box-1 .updatedAt)" '($s | sub("\\.[0-9]+"; "") | fromdateiso8601) < now - 60 and $s <= $u'
+	curl -q -fsS -H 'Authorization: Port mock-port' -H 'Content-Type: application/json' -d '{"port":8082,"name":"web"}' "$BASE/v1/machines/$(box box-1 .id)/ports" >/dev/null
+	run release --json box-1
+	rc_is "release with a skewed server clock" 0
+	yes_ "a port the sandbox published during the reservation is removed" jq -e \
+		'.unpublishReasons == [{"port":8082,"reason":"created during the reservation"}]' "$S/out"
+	reset '"seed":{"count":1},"metadataKeepsUpdatedAt":true'
+	run claim --json x
+	rc_is "claim on a server whose metadata PATCH leaves updatedAt alone" 0
+	is "then the start falls back to this computer's clock, never an old updatedAt" \
+		"$(box box-1 '.metadata["ibx.claim.start"] != .updatedAt')" true
+
+	# A stream answered with a refusal the exec route sends before the command starts (plain
+	# JSON 4xx, a retryable 503 host_unavailable dial failure) never started the command.
+	for code in '503,"code":"host_unavailable","retryable":true' '409,"code":"operation_conflict"'; do
+		reset "\"faults\":[{\"kind\":\"error\",\"method\":\"POST\",\"match\":\"/exec\$\",\"status\":$code}]"
+		run exec box-1 --stream -- true
+		rc_is "a plain JSON stream refusal fails with 125 (${code%%,*})" 125
+		err_has "and says the command did not run" 'exec did not run: the API'
+		is "without a retry" "$(count POST '/exec$')" 1
+	done
+	# Any other reply without a stream may come after the command started: a 500, a 503 that
+	# says it cannot be retried, a gateway's page, a buffered result cut off mid-body.
+	for f in '"kind":"error","status":500,"code":"internal"' '"kind":"error","status":503,"code":"host_unavailable","retryable":false' \
+		'"kind":"error","status":502,"body":"<html><body>502 Bad Gateway</body></html>"' '"kind":"drop","plain":true'; do
+		reset "\"execResults\":[{\"stdout\":\"hi\\n\"}],\"faults\":[{\"method\":\"POST\",\"match\":\"/exec\$\",$f}]"
+		run exec box-1 --stream -- 'echo hi'
+		rc_is "a stream answered without one ($f) fails with 125" 125
+		err_has "and says the command may have run" 'may (or may not )?have run'
+		err_lacks "never that it did not run" 'did not run'
+		is "without a retry" "$(count POST '/exec$')" 1
+	done
+
+	# An interrupt says how far it got: nothing started before the SSH session, and an exec whose
+	# result arrived has finished.
+	for c in ssh forward; do
+		reset '"seed":{"count":1},"faults":[{"kind":"delay","method":"GET","match":"/connection-info$","seconds":3}]'
+		if [ "$c" = ssh ]; then args=(ssh box-1 -- true); else args=(forward box-1 18080:8080); fi
+		PATH="$fake:$PATH" "$IBX" "${args[@]}" >"$S/out" 2>"$S/err" </dev/null &
+		pid=$!
+		for _ in $(seq 100); do [ "$(count GET '/connection-info$')" -ge 1 ] && break; sleep 0.1; done
+		kill -TERM "$pid"
+		wait "$pid"
+		RC=$? TIMEDOUT=
+		rc_is "$c interrupted while it reads the connection info exits 143" 143
+		err_has "and says nothing started" '^ibx: interrupted by SIGTERM before anything started in the sandbox$'
+		is "it created no SSH token" "$(count POST '/ssh-tokens$')" 0
+	done
+	reset '"seed":{"count":1}'
+	jq -cn '{execResults:[{stdout:("x" * 300000)}]}' >"$S/big-result"
+	curl -q -fsS -m 10 -X POST --data-binary @"$S/big-result" "$BASE/_control" >/dev/null || bad "mock control: big result"
+	python3 - "$IBX" "$S/out" "$S/err" <<'PYCODE'
+import os, select, signal, subprocess, sys
+proc = subprocess.Popen([sys.argv[1], 'exec', 'box-1', '--', 'big'], stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+# Output means the result is in; ibx then blocks writing to the pipe nobody reads yet.
+select.select([proc.stdout], [], [], 30)
+os.killpg(proc.pid, signal.SIGTERM)
+out, err = proc.communicate(timeout=20)
+open(sys.argv[2], 'wb').write(out)
+open(sys.argv[3], 'wb').write(err)
+sys.exit(proc.returncode if proc.returncode >= 0 else 128 - proc.returncode)
+PYCODE
+	RC=$? TIMEDOUT=
+	rc_is "exec interrupted while it prints the result exits 143" 143
+	err_has "and says the command had finished" '^ibx: interrupted by SIGTERM after the remote command finished$'
+
+	# ls --json shows the runtime, so agents can check processesPreserved after a wake.
+	reset '"set":{"box-1":{"state":"idle","freshBoot":true}}'
+	run exec box-1 -- true
+	rc_is "exec wakes an idle box that comes back fresh" 0
+	run ls --json
+	is "ls --json reports runtime.processesPreserved" \
+		"$(jq -c '.[] | select(.name == "box-1") | .runtime.processesPreserved' "$S/out")" false
+}
+
+for t in guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
 	put_guard poolonly vault hostile secrets ssh install cleanup; do
 	want "$t" && "t_$t"
 done

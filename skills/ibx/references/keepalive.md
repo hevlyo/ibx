@@ -65,9 +65,16 @@ ibx keepalive --all    # every pool sandbox
 - Output is one line per sandbox: `NAME: lease until TIME`, `NAME: suspended, skipped`, or
   `NAME: FAILED {code, message, retryAfterSeconds}`. A max-run pause prints
   `NAME: max-run cooldown until TIME, skipped`; it sends no lease request if known in advance.
-  A raced `409 machine_cooldown` is also a successful skip, so other boxes still get leases.
-- Exit status: 0 when every eligible lease was renewed or a cooldown was skipped, 1 when at least one failed, 125 when ibx itself
-  failed (no key, API unreachable, missing dependencies).
+  A raced `409 machine_cooldown` is also a successful skip, so other boxes still get leases,
+  and so is `409 max_run_disabled` (`NAME: max-run is disabled (maxRunMinutes 0), skipped`).
+  A `cooldownUntil` ibx cannot read is left to the server, which refuses the lease if it applies.
+- A billing block (402, such as `credit_exhausted`) comes from the wake that the lease route
+  does first for an idle-paused box. Keepalive prints `NAME: account blocked by billing: ...;
+  skipped` for that box and goes on: a running box needs no wake and still gets its lease.
+- Exit status: 0 when every eligible lease was renewed or skipped, billing blocks included;
+  1 when at least one lease failed for another reason; 125 when ibx itself failed (no key, API
+  unreachable, missing dependencies). A billing block alone exits 0 on purpose: the systemd
+  unit below restarts a failed run after 60 s, which cannot help there; the next tick tries again.
 - It needs a key with `machines:read` and `machines:write`. A timer does not see the variables
   of your shell, so keep the key in the default file,
   `${XDG_CONFIG_HOME:-~/.config}/instabox/api-key` (mode 600), or point `IBX_KEY_FILE` at it.
@@ -88,10 +95,12 @@ ibx keepalive --all    # every pool sandbox
 | Cost | running time only while agents work | running time of the whole pool between forced pauses |
 
 Prefer the default. Use `--all` only when free pool sandboxes must keep serving something.
-Free running hours count toward the org's included-usage limit when one is enforced; limit 0
-means no cap. An included-usage suspension was observed on 2026-10-18. With `--all`, free boxes
-cycle through 8 hours running, cooldown, then up to 15 minutes until the next timer tick.
-Paid 4 vCPU/8 GiB boxes cost about $0.034/hour, roughly $124/month for five running all month.
+`--all` burns free hours: running hours count toward the org's included-usage limit when one
+is enforced (limit 0 means no cap), and on 2026-10-18 it led to a credit suspension of this
+account. It cannot keep a free box up past the eight-hour max-run limit either: free boxes
+cycle through 8 hours running, the cooldown, then up to 15 minutes until the next timer tick.
+A paid 4 vCPU/8 GiB box costs about $0.034 per running hour plus storage (about $0.0022 an hour
+for 20 GiB, also while paused); the Pro plan adds a $20 monthly fee that includes $20 of usage.
 `doctor` shows the org plan, usage and run budgets. The user decides whether to use `--all`.
 
 ## 5. Install on Linux: systemd user timer
@@ -139,7 +148,7 @@ systemctl --user start ibx-keepalive.service    # one run now
 
 - `Persistent=true` runs a missed run right after the computer wakes or boots.
 - `Restart=on-failure` retries a failed run after 60 s, at most 3 starts per 15 minutes, so an
-  expired key does not loop forever.
+  expired key does not loop forever. Skips and billing blocks exit 0, so they never restart it.
 - To keep the timer running while the user is logged out (a server, say), run
   `loginctl enable-linger "$USER"`. This also keeps sandboxes awake while nobody is logged in.
 - For a key file elsewhere, add `Environment=IBX_KEY_FILE=%h/path/to/key` under `[Service]`.
@@ -217,8 +226,11 @@ ibx keepalive                  # run once by hand: one line per reserved sandbox
 | cron | `tail -n 30 ~/.cache/ibx-keepalive.log` | run `ibx keepalive` |
 
 A healthy run prints `NAME: lease until ...` about one hour ahead for every reserved sandbox.
+Cooldowns, `max_run_disabled` and billing blocks print `skipped`, never `FAILED`. A billing
+block prints `account blocked by billing` for each box it stops (section 3); the user has to
+resolve it.
 `FAILED` lines carry the API error code. `missing_scope` means the key lacks
-`machines:write` (`insufficient_scope` on older servers), and `expired_key` or `revoked_key` means the user needs a new key (`api_key_expired` on older servers). `machine_cooldown` is expected.
+`machines:write` (`insufficient_scope` on older servers), and `expired_key` or `revoked_key` means the user needs a new key (`api_key_expired` on older servers).
 A key expiry date cannot be read by ibx; note it when creating the key. Expiry stops keepalive.
 
 ## 9. What to expect

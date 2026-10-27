@@ -88,9 +88,10 @@ These paths make the provider root-equivalent inside every sandbox:
   ID, so it is not a random secret. The October prose docs say visits wake idle-paused boxes and wait;
   the spec still says 503. That behavior has not been verified on this account. Manual pauses
   and stops answer 503.
-  The default agent-browser image already has `/usr/local/bin/instabox-port` and a guest-readable
-  credential at `/run/instabox-port/agent.json`. Any guest code can publish ports from inside
-  (spec: POST /v1/machines/{id}/ports, POST /v1/machines/{id}/port-agent).
+  On box-5 on 2026-10-27, the agent-browser image had `/usr/local/bin/instabox-port` and a
+  guest-readable credential at `/run/instabox-port/agent.json`; assume other boxes may too. Any
+  guest code there can publish ports from inside (spec: POST /v1/machines/{id}/ports, POST
+  /v1/machines/{id}/port-agent).
 - **Desktop links** open without signing in until they expire (1 h by default). Sessions opened
   before expiry go on until the viewer leaves or someone calls
   `DELETE /v1/machines/{id}/desktop/stream` (spec: POST /v1/machines/{id}/desktop/stream). The
@@ -134,14 +135,16 @@ untrusted code (section 8).
 
 Org Secrets are independent of `Machine.vault`. Proxy Secrets inject a value only on requests
 matching their allowed hosts. Env Secrets deliver the actual value into the guest. A wildcard
-host allows proxy use against any host. The `all` proxy selection includes future Secrets,
+host allows proxy use against any host, and so does a proxy Secret with no hosts: omitted or
+empty hosts mean `["*"]`. The `all` proxy selection includes future Secrets,
 even if its effective items list is empty today. Dashboard-created sandboxes select all proxy
 Secrets. The official basic setup also creates Org Secrets; never run it in the pool org.
 
 ibx checks both selections, effective items, guest residue and pending application states.
-A failed read is unsafe. A 404 counts as an older server only when `/v1/usage` says Org Secrets
-are disabled. The user-only `IBX_ALLOW_SECRETS` permits proxy selections, never env Secrets or
-guest residue. Keep the pool org free of Org Secrets. Create pool boxes with
+A failed read is unsafe: claim skips the box and, if nothing else is free, exits 125 as an API
+failure rather than 75. A 404 counts as an older server only when `/v1/usage` says Org Secrets
+are disabled. The user-only `IBX_ALLOW_SECRETS` permits proxy Secrets scoped to named hosts,
+never a proxy Secret for every host, env Secrets, an unknown delivery kind or guest residue. Keep the pool org free of Org Secrets. Create pool boxes with
 `--no-vault --secrets none`; clearing proxy selection alone leaves env selection unchanged.
 Vault inspection also checks `applied.files` and `applied.kept`. A 403 stays unsafe, including
 workspace keys and boxes created by another member.
@@ -193,7 +196,8 @@ These are guards against accidents. None of them stops someone who holds the API
   redacts it from error output, revokes it on exit and confirms `revokedAt`. If that fails it
   prints "WARNING: SSH token ... may NOT be revoked; it expires within 1 hour".
 - **Ports.** `ibx port` names its ports `ibx:...` and warns that the URL has no
-  authentication. `ibx release` unpublishes them and every port created at or after the stable `ibx.claim.start`. Renew leaves
+  authentication. `ibx release` unpublishes them and every port created at or after the stable
+  `ibx.claim.start`, the server's time of the claim when the API reports it. Renew leaves
   that start unchanged. Older non-ibx ports remain with a warning. Release kills no processes;
   a process left running can publish a new port after release. Doctor audits public ports on
   unreserved pool boxes.
@@ -294,7 +298,7 @@ ibx pool add box-1
   real data. A key cannot be limited to some sandboxes, so the org is the key boundary. New free personal orgs get one box; a paid workspace is another boundary.
 - Keep the Vault away from pool sandboxes by creating them with `--no-vault` (section 5).
 - A workspace key needs explicit scopes; otherwise it carries `workspace:admin`.
-- Whole-map metadata writes from SDK `setMetadata`, raw PATCH or dashboard labels replace
+- Whole-map metadata writes from SDK `setMetadata` or raw PATCH replace
   `ibx.pool` and `ibx.claim.*`. Read and preserve those keys when using another tool.
 - **Rotate** by creating the new key, replacing the file, then revoking the old key in the
   dashboard (`DELETE /v1/keys/{id}` from a signed-in session). Revoking also ends the SSH

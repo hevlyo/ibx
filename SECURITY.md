@@ -36,7 +36,10 @@ In scope, this repository:
   revoked; agent commands reaching a sandbox outside the pool without `IBX_ALLOW_ANY=1`;
   `ibx claim` handing out a sandbox that the Vault writes secrets into without
   `IBX_ALLOW_VAULT=1`; accepting selected, pending or residual Org Secrets without an explicit
-  user proxy-only override, or accepting env Secrets with that override; `ibx put` accepting a file that its credential rules should refuse;
+  user proxy-only override, or accepting env Secrets, an unknown delivery or a proxy Secret for
+  every host with that override;
+  `ibx put` accepting a file that its credential rules should refuse, or uploading another
+  file than the one named (curl globbing, `-` or `/dev/stdin` read as curl's stdin);
   the key going to a host other than `api.instabox.sh` without `IBX_ALLOW_CUSTOM_API=1`;
   control characters from the API reaching the terminal; command injection through names,
   paths or API replies.
@@ -47,8 +50,9 @@ In scope, this repository:
 
 Out of scope, report these to instabox:
 
-- The instabox API, sandboxes, SSH gateway, CLI, dashboard and official skills. Bugs go through
-  `instabox feedback` (see [Reporting provider bugs](skills/ibx/references/field-notes.md#15-reporting-provider-bugs));
+- The instabox API, sandboxes, SSH gateway, CLI, dashboard and official skills. Bugs go to the
+  instabox team with `instabox feedback`
+  (see [Reporting provider bugs](skills/ibx/references/field-notes.md#15-reporting-provider-bugs));
   vulnerabilities go through instabox's own private channels, never a public report.
 - Platform properties that ibx documents but cannot change. The provider is root in
   every sandbox, an API key cannot be limited to some sandboxes, public URLs have no

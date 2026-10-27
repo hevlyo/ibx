@@ -20,10 +20,14 @@ Read a route from the spec with
 7. [Limits](#7-limits)
 8. [Scopes](#8-scopes)
 9. [curl patterns that survive TLS drops](#9-curl-patterns-that-survive-tls-drops)
+10. [Routes added to ibx in 0.3.0](#10-routes-added-to-ibx-in-030)
+11. [Opt-in exec streaming](#11-opt-in-exec-streaming)
 
 ## 1. Basics
 
-- Base URL: `https://api.instabox.sh`. JSON uses camelCase, and times are RFC 3339 UTC.
+- Base URL: `https://api.instabox.sh`. JSON uses camelCase, and times are RFC 3339 UTC. ibx
+  reads any RFC 3339 offset; a date it cannot read is unknown (null in its output), and a
+  `cooldownUntil` it cannot read keeps `claim` away from that box.
 - Auth: `Authorization: Bearer ibk_...` or `X-API-Key: ibk_...`. If you send both, they must
   carry the same key (spec: info.description, "API keys").
 - Every non-2xx reply has the envelope
@@ -102,9 +106,9 @@ spec.
 | 401 missing_key, malformed_key, invalid_key, expired_key, revoked_key, session_expired | `auth`, exit 125; ask the user to fix this key |
 | 403 missing_scope | `auth`, with requiredScopes and hint; exec did not run |
 | Older unauthenticated, api_key_expired, api_key_revoked, insufficient_scope | supported as auth errors |
-| 402 credit_exhausted, spend_limit_reached, subscription_required, payment_method_required, payment_failed | `account_blocked`; stop claim, exec or SSH, ask the user |
-| 409 machine_cooldown | no command started; wait within the 10-minute budget, else name the cooldown |
-| 409 max_run_disabled | no command started; refuse |
+| 402 credit_exhausted, spend_limit_reached, subscription_required, payment_method_required, payment_failed | `account_blocked`; stop claim, exec or SSH, ask the user; keepalive skips that box (status 0) and still leases the others |
+| 409 machine_cooldown | no command started; wait within the 10-minute budget, else name the cooldown; keepalive skips the box |
+| 409 max_run_disabled | no command started; refuse; keepalive skips the box |
 | 429 quota_exceeded | nothing started; wait up to 10 minutes |
 | 503 host_unavailable, even retryable | never repeat user exec; a restarting API may have killed it partly run |
 | delete_confirmation_required | deletion needs X-Confirm-Delete; ibx never deletes sandboxes |
@@ -138,7 +142,8 @@ its single JSON error object. `auth`, `account_blocked` and `failed` normally ex
   repeated, and every term must match. For example `metadata=ibx.pool:1` lists pool sandboxes.
 - Deleted sandboxes are not listed.
 - ibx metadata keys: `ibx.pool` (`"1"` = in the pool), `ibx.claim.by`, `ibx.claim.at`
-  (renewed RFC 3339), `ibx.claim.start` (stable start), `ibx.claim.purpose`, `ibx.claim.token`. A reservation older than
+  (renewed RFC 3339), `ibx.claim.start` (stable start: the `updatedAt` of the claim's PATCH
+  reply when that PATCH moved it, else the local clock), `ibx.claim.purpose`, `ibx.claim.token`. A reservation older than
   `IBX_STALE_SECS` (default 86400) counts as abandoned. Metadata has no compare-and-swap, and
   the last PATCH wins.
 
@@ -158,7 +163,7 @@ its single JSON error object. `auth`, `account_blocked` and `failed` normally ex
 | SSH certificate TTL | default 1 h, max 24 h | schemas.CreateConnectionRequest |
 | Desktop link TTL | default 1 h, 60 s to 24 h | schemas.DesktopStreamRequest |
 | Activity lease | 30-3600 s (0 or absent: 300); 128 active per sandbox | PUT .../activity-leases/{leaseID} |
-| Max-run | free 480 minutes fixed, paid -1 allowed; 0 disables wakes | schemas.MaxRunMinutes |
+| Max-run | free 480 minutes, fixed; paid default -1 (unlimited); 0 sleeps at once, then refuses wakes with `409 max_run_disabled` once the cooldown ends | schemas.MaxRunMinutes |
 | Idle pause | free fixed 1800; paid 300-1800 in steps of 300, 0 with alwaysOn; manualLifecycle 120-86400 | schemas.AutoSuspendAfterSeconds |
 | Public ports | 16 per sandbox; ports 1024-65535; 5901 and 6768 reserved | POST .../ports, PublishPortRequest |
 | Sandboxes | free default 1; this account grandfathered at 5; read maxMachines | GET /v1/usage |
@@ -271,30 +276,46 @@ Notes:
 | Route | Scope | Detail |
 |---|---|---|
 | GET /v1/machines/{id}/secrets | machines:read | selections, effective metadata and application state, never values |
-| PATCH /v1/machines/{id}/secrets | machines:write | clear both proxy and env selections; ibx never changes them |
 | GET /v1/orgs/{id}/secrets | machines:read | org Secret metadata; doctor audits names and risk |
 | PUT /v1/machines/{id}/files | machines:write or machines:exec | raw bytes, atomic, parents=true; follows the target symlink, unlike the old mv fallback |
 | GET /v1/machines/{id}/files/content | machines:write or machines:exec | raw bytes and Content-Length; ibx stages before replacing local output |
 | GET /v1/ports | machines:read | all public ports with machineId and createdAt |
-| GET /v1/machines/{id}/logs | machines:read | never wakes the box |
 | GET /v1/orgs/{id} | authenticated org member/key | tier, limits and usage; the org-list route is insufficient |
 
+Reference only: ibx never calls these, but the docs point users and agents to them.
+
+| Route | Scope | Detail |
+|---|---|---|
+| PATCH /v1/machines/{id}/secrets | machines:write | `{"secrets":[],"envSecrets":[]}` clears both selections of an old box |
+| GET /v1/machines/{id}/logs | machines:read | console log and recent operations; never wakes the box |
+
 The lease route is documented in OpenAPI, not in the prose documentation. Watch the spec for
-changes. Whole-map metadata PATCH, SDK setMetadata and dashboard labels replace pool and claim
-keys. Other tools must preserve them. ibx uses read-modify-write but has no server-side CAS.
+changes. A whole-map metadata PATCH and SDK `setMetadata` replace the pool and claim keys.
+Other tools must preserve them. ibx uses read-modify-write but has no server-side CAS.
 
 Claim JSON adds pausesAt and cooldownUntil, each a timestamp or null. Release preserves the
 unpublished array of port numbers and adds unpublishReasons, an array of {port, reason}.
 A port created during the reservation has reason "created during the reservation" even if
 its name starts with ibx:. Older ibx ports have reason "published by ibx". The ls secrets flag
 is true for selected or uninspectable Secrets and false only after a clean inspection;
-diagnostic audits ignore the proxy override.
+diagnostic audits ignore the proxy override. `ls --json` rows also carry the Machine's
+`runtime` object (`ready`, and `processesPreserved` after a start or resume), or null.
+Claim reports a box whose Secrets it could not inspect as an API failure (125), not as busy.
+Doctor treats an Org Secret as unsafe unless it has proxy delivery and a non-empty host list
+without `*` (omitted or empty hosts mean every host, per schemas.SecretHosts); with
+`IBX_ALLOW_SECRETS=1`, claim and pool add accept only such scoped proxy Secrets. A 404 from
+GET /v1/orgs/{id}/secrets is clean only when usage says the server has no Org Secrets.
 
 ## 11. Opt-in exec streaming
 
 `ibx exec BOX --stream -- CMD` sends `Accept: text/event-stream`. The parser ignores ping
 comments, forwards stdout/stderr data, and takes status and diagnostic fields from the exit
-event. Pre-start JSON refusals use the same classification as buffered exec. An error event,
-transport loss or missing exit event is terminal, with partial output retained and no retry.
+event. A 4xx error envelope, or a retryable 503 `host_unavailable` (a dial failure), instead
+of a stream is a refusal from before the command started (per the exec route): quota,
+cooldown and not-running refusals are waited out as in buffered exec, and any other is
+reported as "did not run". Any other reply without a stream (a 2xx, a 500, a 503 the API says
+cannot be retried, a gateway's page, a reply cut off) may come after the command started and
+is reported as "may have run". An error event, transport loss or missing exit event is
+terminal, with partial output retained and no retry.
 The server kills the process group when the stream closes. Timeouts stay at 1-600 seconds;
 streaming changes output delivery, not long-job lifecycle. Put/get never use SSE.

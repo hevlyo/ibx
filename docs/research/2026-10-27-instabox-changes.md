@@ -76,8 +76,10 @@ Sources are MachineSecrets, SecretSelection, Machine.vault and llms-full.txt lin
 Claim, pool add and doctor now fail closed for unsafe or uninspectable selections. A 404 is
 clean only when usage says orgSecrets is disabled; result 23 showed route-not-found and
 machine-not-found share a code. The user-only IBX_ALLOW_SECRETS permits proxy Secrets, never
-env delivery or guest residue. The skill forbids agents to set it. Doctor reads org metadata,
-warns for Secret names, and fails for env delivery or wildcard hosts. In-box checks print only
+env delivery, unknown delivery kinds or guest residue. The skill forbids agents to set it.
+Doctor reads org metadata, warns for Secret names, and fails for env or unknown delivery and
+for wildcard hosts, including a proxy Secret whose hosts are omitted or empty (SecretHosts:
+that means `["*"]`). In-box checks print only
 names and counts. No code creates or selects Secrets.
 
 Vault 403 remains unsafe, with an explanation for workspace keys or non-creators. Applied
@@ -104,8 +106,9 @@ one-hour tokens, binds both tunnel endpoints to loopback, runs in the foreground
 the token on exit. Whether a live tunnel outlasts token expiry is unverified. Sources are
 connection-info capabilities and llms-full.txt lines 374, 409 and 1080-1081.
 
-The agent-browser image already contains a guest-readable port-agent credential. Live result
-39 checked its existence, mode and structure without retaining its value. Guest code can
+On box-5 on 2026-10-27, the agent-browser image contained a guest-readable port-agent
+credential. Live result 39 checked its existence, mode and structure without retaining its
+value; other boxes were not checked. Guest code can
 publish unauthenticated ports. Release now removes ports created at or after ibx.claim.start,
 whatever their name, plus older ibx-prefixed ports. Renew leaves start unchanged. Older
 non-ibx ports remain with a warning. A process left running can republish after release.
@@ -123,12 +126,14 @@ five-box limit. Read usage limits rather than hard-coding that exception. Keys r
 boxes of their org, not other orgs. Paid workspaces form another boundary. Sources are
 info.md lines 84-86 and 118-134, llms-full.txt lines 1229-1235 and live results 1-2.
 
-CLI 0.7.1 includes exec streaming, background/jobs, argv, run, push/pull/cp, max-run, wake,
-logs, ps, restart, fork, port-forward and Secrets. SDK 0.5.3 was used for comparison. Official
-jobs hold no lease and bypass ibx's reservations and pool guard. Activity leases remain
-specified only in OpenAPI. Whole-map metadata updates from raw PATCH, SDK setMetadata and
-dashboard labels replace pool membership and reservations, so the docs now warn to preserve
-those keys. Sources are the PATCH description, SDK README line 142 and CLI reference lines
+CLI 0.7.1 includes exec streaming, background/jobs, argv, run, push/pull/cp, wake,
+logs, ps, restart, fork, port-forward and Secrets. Its CLI reference (llms-full.txt lines
+1011-1140) lists no max-run command, while the skill bundled with the CLI package shows
+`instabox max-run BOX N` for paid boxes; SDK 0.5.3 has no max-run setting. The README
+therefore names only the API for max-run. Official jobs hold no lease and bypass ibx's
+reservations and pool guard. Activity leases remain specified only in OpenAPI. Whole-map
+metadata updates from raw PATCH and SDK setMetadata replace pool membership and reservations,
+so the docs now warn to preserve those keys; no source says the dashboard's label editor does. Sources are the PATCH description, SDK README line 142 and CLI reference lines
 1011-1140. The sandbox NODE_OPTIONS preload remains documented in field notes section 11.
 
 ## Implemented plan scope
@@ -157,55 +162,38 @@ response body unread and verifies that no delayed side effect survives the comma
 Key-bearing shell variables clear inherited export attributes, so an exported variable with
 the same name cannot put the API key back into a child environment.
 
-## Plan inventory after recovery
+## Decisions from the review of the first 0.3.0
 
-The working-tree audit found implementations for every required item. No required item was
-not started. The remaining work was final verification of the SSE mock's timeout under a
-stalled reader, static checks and both complete offline suites. A public-URL wake probe is
-excluded by the instruction to avoid the real API.
+Two clean-context reviews of the first 0.3.0 commit found these; the choices and why:
 
-| Priority | Plan item | Status | Implementation evidence |
-|---|---|---|---|
-| Must | Keepalive cooldown is not a failure | Done | Known and raced cooldown branches; platform regressions |
-| Must | Exec refusal classification and never retry partly-run commands | Done | Shared auth classification, bounded safe waits, user host_unavailable refusal |
-| Must | Guard Org Secrets | Done | secrets_state, pool/claim/doctor checks, JSON risk field, mock fixtures |
-| Must | Max-run awareness | Done | Cooldown waits, candidate budget ordering, pause/cooldown output |
-| Must | Replace the ignored-idle-setting bug story | Done | Plan-specific settings and dated history; obsolete feedback removed |
-| Must | Clean up guest-published ports | Done | Stable claim.start, timestamp comparison, renew/release regressions |
-| Should | Official put/get routes | Done | Raw bounded file API, digest verification, explicit older-server fallback |
-| Should | Auth errors and safe hints | Done | Shared fatal record survives subshells; auth JSON regression |
-| Should | Account-wide billing refusals | Done | account_blocked stops candidates immediately and preserves server guidance |
-| Should | Doctor plan, budget and access audits | Done | Concrete org route, token/port/Secret checks and timer visibility |
-| Should | Prompt interruption and accurate messages | Done | Main-shell curl wait, cleanup, command-specific signal regressions |
-| Should | ExecResult fields | Done | UTF-8, signal, disk and timeout warnings preserve remote status |
-| Should | Current mock API | Done | Machine, lifecycle, Secrets, file and token routes; retry metadata |
-| Should | Private forward | Done | Shared SSH pinning/revocation, loopback listeners and capability check |
-| Should | Current exec facts | Done | Shared request limit, background writers and exec-only pkill findings |
-| Should | Platform documentation | Done | CLI/SDK table, limits, org boundary, fork and lifecycle guidance |
-| Should | Public-URL wake uncertainty | Done for authorized scope | Contradiction documented throughout; live probe not run |
-| Selected could | Live-suite run budget and own-box keepalive checks | Done | Preflight and actual-claim guards tested offline; live definitions updated |
-| Selected could | Whole-map metadata warning | Done | README and trust-model warn to preserve membership and reservation keys |
-| Selected could | Vault 403 and residue | Done | Fail-closed inspections include applied/kept files and actionable 403 advice |
-| Optional could | SSE exec | Done | Opt-in parser, real process streaming, disconnect and stalled-reader regressions |
-
-## Verification after recovery
-
-The final plain offline suite passed 968 assertions with zero failures in 629 seconds.
-The final MOCK_EXEC=real suite passed 1,022 assertions with zero failures in 652 seconds.
-Both ran on a separate Linux host with executable tmpfs scratch files after disk I/O stalls
-caused the normal scratch directory to exceed the unchanged test watchdogs. The helper,
-mock and test scripts matched the working tree by SHA-256 throughout these final runs.
-
-Shellcheck 0.11.0 produced no warnings and exited 0. The originally supplied executable path
-was absent, so verification used the pinned shellcheck-py 0.11.0.1 package, whose binary
-reports Shellcheck 0.11.0. Each shell file passed bash -n, the mock passed Python AST parsing,
-Markdown links resolved locally, and git diff --check passed. The installer was unchanged.
-
-The stalled-reader regression failed against the previous mock and passed after the
-independent timeout watchdog was added. The complete real-mode run includes that regression,
-real incremental SSE output, process-group cancellation and the existing transfer, locking,
-JSON, credential and installer checks. The live suite was edited but never run, and this
-implementation made no real API calls.
+- Unreadable dates. The jq date helper returned nothing, not null, for a date it could not
+  parse, which dropped whole rows. It now parses every RFC 3339 offset and returns null
+  otherwise. A cooldown ibx cannot read makes claim skip the box (fail closed), while
+  keepalive still asks for the lease and lets the server refuse it: skipping would let a held
+  box pause idle over a parsing problem, and a refused lease costs nothing.
+- Keepalive exit status. `max_run_disabled` is a skip like a cooldown, and so is a billing
+  block (402). The lease route does not list 402, but it wakes an idle-paused box first and
+  wake does, so a running box later in the list still needs its lease: keepalive goes on. A
+  billing block alone leaves the status at 0: install.sh's unit has Restart=on-failure,
+  RestartSec=60 and StartLimitBurst=3, and repeating it a minute later cannot help.
+- Claim start. Ports' createdAt is server time, so `ibx.claim.start` stores the `updatedAt`
+  of the claim's PATCH reply, with a second metadata write. The spec does not say whether a
+  metadata PATCH bumps `updatedAt` (it says it does not bump `revision`), so ibx uses it only
+  when it moved past the value read just before the PATCH, and keeps its own clock otherwise:
+  an old `updatedAt` would make release remove ports created before the claim. The HTTP Date
+  header was rejected because its one-second resolution misorders ports created in the same
+  second, which the offline tests do.
+- Org Secrets that cannot be inspected make claim exit 125 (API failure), not 75; a busy pool
+  and a broken inspection need different reactions from an agent.
+- In `--stream` mode the exec route says pre-start errors (400, 404, 409, 429, a 503 dial
+  failure) come back as plain JSON, so ibx reports a 4xx error envelope or a retryable 503
+  `host_unavailable` as "did not run" without retrying. Retrying them would be safe but is not
+  needed for correctness. The route does not say that every reply without a stream is one of
+  those: a 2xx cut off, a 500 or a gateway's page may come after the command started, so
+  they say "may have run".
+- The mock's exec answers `409 machine_not_running` for an idle-paused box, as the exec route
+  says, although the spec's lifecycle text and the prose docs say exec wakes it. ibx handles
+  both, and only the 409 path needs a test.
 
 ## Deferred and rejected options
 

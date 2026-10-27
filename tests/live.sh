@@ -241,7 +241,7 @@ for _ in 1 2 3 4 5; do
 done
 is "the public URL serves the page" "$body" hi
 ibx keepalive >"$L/keep" 2>&1
-# Other reservations may fail independently; verify only the two boxes held by this run.
+check "keepalive" 0 $?
 yes_ "keepalive leased A" grep -q "^$A: lease until" "$L/keep" || show "$L/keep"
 yes_ "keepalive leased B too" grep -q "^$B: lease until" "$L/keep"
 before=$(ibx ls --json | jq -r --arg a "$A" '.[] | select(.name == $a) | .since')

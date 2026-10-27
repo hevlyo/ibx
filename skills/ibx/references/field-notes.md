@@ -46,7 +46,7 @@ accounts. ibx never changes these settings; it renews an activity lease instead.
 Free boxes also pause after 480 continuous minutes. Leases cannot prevent this. Live probes
 on 2026-10-27 found runs of exactly 8 hours and cooldowns of 5-17 minutes. The spec default is
 10 minutes. `runtime.processesPreserved` was true in the observed resumptions. Check job PIDs
-after waking, keep checkpoints, and do not interpret a refused poll as a dead job.
+and `runtime.processesPreserved` (in `ibx ls --json`) after waking, keep checkpoints, and do not interpret a refused poll as a dead job.
 
 The prose docs say public visits wake idle-paused boxes and wait; the spec still says 503.
 This behavior was not verified on the pool. Manual pauses and stops still return 503.
@@ -67,7 +67,9 @@ sandbox is reserved, `ibx keepalive` renews it, and `ibx release` deletes it.
 
 | Request | Sandbox paused for idleness | Paused or stopped by hand, or archived |
 |---|---|---|
-| exec, `GET /files`, terminal | wakes it, then runs (`trigger: request`) | `409 machine_not_running` |
+| exec | wakes it, then runs (`trigger: request`), per the spec's lifecycle text and the prose docs; the exec route itself says `409 machine_not_running`. ibx handles both: on a 409 it wakes the sandbox and retries | `409 machine_not_running` |
+| `GET /files`, `PUT /files`, terminal | wakes it, then runs (`trigger: request`) | `409 machine_not_running` |
+| `GET /files/content` | the route says `409 machine_not_running`; ibx wakes it and retries | `409 machine_not_running` |
 | `POST /connections` (SSH certificate) | wakes it | `409 machine_not_running` |
 | `POST /wake` | wakes it, waits up to 45 s | not undone |
 | `PUT` activity lease | wakes it | do not rely on it |
@@ -128,7 +130,8 @@ Limits (timeout, `cmd`, stdin and output sizes, concurrency) are in
   while its loop survived. Use `setsid -f CMD </dev/null >LOG 2>&1` for detached work.
 - One slow exec took 71 s at the gateway while the command took 4 s in the VM. Keep
   the client timeout well above `timeoutSeconds`. ibx waits `-t` + 90 s, so an agent's tool
-  call needs `-t` + 120 s.
+  call needs `-t` + 120 s, plus any wait before the command starts (request slot, cooldown,
+  box start; see [recipes.md](recipes.md)).
 
 ## 6. TLS drops and slow replies
 
@@ -180,9 +183,10 @@ only your own processes. Keep bracket patterns in SSH commands. Never kill provi
   [api-notes.md](api-notes.md#7-limits).
 - A DELETE of a port that is not published returns 404. `ibx unport` and `ibx release` treat
   that as already unpublished.
-- The agent-browser template already contains `/usr/local/bin/instabox-port` and the
-  guest-readable 0600 credential `/run/instabox-port/agent.json`, refreshed on resume. Guest
-  code can publish an unauthenticated URL. Release removes ibx ports and ports created during
+- `/usr/local/bin/instabox-port` and the guest-readable 0600 credential
+  `/run/instabox-port/agent.json`, refreshed on resume, were found on box-5 on 2026-10-27
+  (agent-browser image); assume other boxes may have them. Guest code there can publish an
+  unauthenticated URL. Release removes ibx ports and ports created during
   the reservation; a process left running can publish again afterward.
 
 ## 10. SSH tokens and certificates
@@ -230,7 +234,7 @@ only your own processes. Keep bracket patterns in SSH commands. Never kill provi
 
 ## 12. Spec drift
 
-As of 2026-10-15:
+Checked through 2026-10-27:
 
 - The fork route was removed on 2026-10-15. CLI fork now exists, but cannot pass the two
   credential-disabling flags required for pool recreation. Use a clean snapshot and explicit create.
@@ -262,15 +266,17 @@ As of 2026-10-15:
 | Ingress | none: not reachable from the internet, IPv6 included; only published ports (through the proxy) and SSH (through the gateway) |
 
 The preinstalled tools in `agent-browser` 2026-10-15.4 include `claude`, `codex`, node 22, python 3.13, `uv`,
-`go`, rust, `gh`, `git`, docker with compose, chromium 154, `mosh-server`. Missing tools include `tmux`,
-`ripgrep`, `opencode`, `bun`, `strace`, `tcpdump`, `/usr/bin/time`. Install the Debian ones
+`go`, rust, `gh`, `git`, docker with compose, chromium 154, `mosh-server`. `bun` was missing then
+and is in the image as of 2026-10-27. Missing tools include `tmux`, `ripgrep`, `opencode`,
+`strace`, `tcpdump`, `/usr/bin/time`. Install the Debian ones
 with `sudo apt-get install -y tmux ripgrep strace tcpdump time`. Packages persist across
 stop/start, so the next holder of a pool sandbox sees them too. The preinstalled agent CLIs are
 not signed in; leave them that way ([trust-model.md](trust-model.md)).
 
 The shared egress IP means per-IP rate limits (for example anonymous container registry pulls)
-can run out sooner than you would expect. Account limits (5 sandboxes in any state, one fixed
-size, snapshots, keys) are in [api-notes.md](api-notes.md#7-limits).
+can run out sooner than you would expect. Account limits are in
+[api-notes.md](api-notes.md#7-limits): a free org normally gets one sandbox; this account's
+five sandboxes in any state are a grandfathered exception.
 
 ## 14. Timings
 
@@ -286,10 +292,14 @@ size, snapshots, keys) are in [api-notes.md](api-notes.md#7-limits).
 
 ## 15. Reporting provider bugs
 
-Draft a report for the user and let them send it. Include no keys, tokens, sandbox IDs or
-personal data. The idle-setting refusal on the free plan is expected and is not a bug.
+Problems with instabox itself (the API, sandboxes, the CLI, the docs) go to the instabox team,
+not to ibx. The user's instabox CLI sends them with `instabox feedback --type bug --component
+api --title ... --detail ... --expected ...`, which redacts emails, keys, tokens, home paths and
+public IPv4 addresses before sending. Agents draft the report and let the user send it.
+Include no keys, tokens, sandbox IDs or personal data. The idle-setting refusal on the free
+plan is expected and is not a bug.
 
 One current documentation discrepancy is that `machine_cooldown` and `max_run_disabled` are
 missing from the `Error.code` enum although the max-run schema documents them. The public-URL
 wake behavior also differs between the prose docs and spec; it needs an authorized probe.
-Problems with ibx belong in its repository; security reports follow [SECURITY.md](../../../SECURITY.md).
+Problems with ibx belong in its repository; security reports follow [the security policy](https://github.com/hevlyo/ibx/security/policy).

@@ -19,17 +19,44 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
 - Doctor shows the concrete org plan, free-hour usage and limits, run budgets, unsafe Secrets,
   public ports on unreserved boxes, and long-lived SSH tokens.
 - JSON errors distinguish auth and account_blocked, with cleaned server hints and scopes.
+- `ls --json` rows include the API's `runtime` (`ready`, `processesPreserved`), so agents can
+  check whether processes survived a wake. Every doctor FAIL line is followed by its next step,
+  and a failed audit shows the API's reason. A sandbox list doctor cannot read is reported as
+  such, never as an empty pool.
+- README tables of exit codes and environment variables, updated for 0.3.0.
 - Dated platform research and decisions in docs/research/2026-10-27-instabox-changes.md.
 
 ### Changed
 
 - Keepalive skips known or raced max-run cooldowns successfully while renewing other boxes.
   It preserves --all semantics. Leases do not prevent the free 480-minute max-run pause.
+  `409 max_run_disabled` is a skip too, and so is a billing block (402, from the wake of an
+  idle-paused box): one line for that box, the other boxes still get their leases, and on its
+  own it leaves the status at 0, so the timer unit's Restart=on-failure does not repeat it. A
+  cooldown ibx cannot read is left to the server.
+- Dates from the API are read as RFC 3339 with any offset. A date ibx cannot read is unknown,
+  never a reason to drop a row: claim skips a box whose cooldown it cannot read, ls and claim
+  report an unknown pause as null, doctor still lists such SSH tokens.
+- Claim exits 125 (an API failure), not 75, when it cannot inspect a box's Org Secrets; pool
+  add and doctor tell "could not inspect" apart from "Secrets are selected".
+- IBX_ALLOW_SECRETS accepts only proxy Secrets scoped to named hosts, in claim and pool add;
+  an unknown delivery kind, `*` or omitted or empty hosts (every host) fail closed. Doctor
+  fails for such a proxy Org Secret, and accepts a 404 from the org Secrets route when usage
+  says the server has no Org Secrets.
+- `ibx.claim.start` holds the server's time of the claim (the `updatedAt` of the claim's PATCH
+  reply, when the PATCH moved it), so release's port cleanup does not depend on the local clock.
+- An interrupt says whether the remote command had started or had finished. In `--stream`
+  mode only the exec route's pre-start refusals (a 4xx error envelope, a retryable 503
+  host_unavailable) mean the command did not run; any other reply without a stream (2xx cut
+  off, 500, a gateway's page) says it may have run.
 - User exec never retries host_unavailable, even when retryable. Cooldown and quota refusals
   remain safe to wait out. New and older credential codes are recognized.
 - Official streaming file routes replace base64 exec for put/get. Put accepts up to 5 GiB and
   verifies SHA-256; get stages output with IBX_GET_MAX, default 2G. Only route-not-found on an
   older server enables the previous 750 KB transport, with a warning. Upload follows symlinks.
+  File names reach curl literally (`-g`, `./` prefix): `{a,b}` and `[...]` are not expanded,
+  and a file named `-` is a file, not stdin. Put refuses `/dev/stdin` and fd names and hands
+  curl the file's physical path, so no alias of curl's stdin reaches it.
 - Release removes all ports created during the reservation, whatever their names, using stable
   ibx.claim.start. Renew changes only the activity timestamp. Older non-ibx ports remain warned.
 - Billing blocks stop claim after the first affected candidate. Interrupts promptly close exec
@@ -43,7 +70,9 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
   The obsolete ignored-idle-setting bug reports are removed. Public-URL wake behavior remains
   explicitly unverified because the prose docs and spec conflict.
 - Offline mock and live-test definitions track the current API. Live tests select enough run
-  budget and verify leases only for their own boxes.
+  budget, verify leases for their own boxes and check keepalive's exit status. The mock answers
+  exec on an idle-paused box with `409 machine_not_running`, as the spec says, so the wake path
+  ibx takes then stays tested.
 
 ## 0.2.0 - 2026-10-17
 
