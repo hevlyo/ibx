@@ -184,7 +184,12 @@ beyond it.
 (recipe 8), then `ibx exec BOX -- 'rm -rf ~/audit'`. **Tell the user** that BOX ran untrusted
 code with sudo available, and that it should be recreated before anyone trusts it again. That
 is the user's job, not yours ([trust-model.md](trust-model.md#10-recreating-a-sandbox-for-the-user)).
-Then `ibx release BOX`.
+Then `ibx release BOX`. Use the literal name printed by claim in every call. If you lost it,
+`ibx ls --mine` lists your live pool reservations and shows your identity/source on stderr.
+`ibx release --mine` releases all your live reservations, continuing after individual errors;
+a partial failure exits 125. Bulk release requires a session ID or explicit `IBX_AGENT_NAME`,
+since the per-host fallback may belong to several agents. With `--json`, inspect `released`
+(names) and `failed` (name/error objects) before retrying.
 
 ## 3. Running a local script
 

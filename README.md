@@ -135,7 +135,7 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
 | Command | Behavior |
 |---|---|
 | `ibx claim [--json] "purpose"` | Reserve a free box, at most 3 live claims per agent by default |
-| `ibx ls [--all] [--json]` | State, holder, next pause and cooldown; `--json` adds Vault/Secrets risk and `runtime` |
+| `ibx ls [--all \| --mine] [--json]` | State, holder, next pause and cooldown; --mine finds your live pool reservations; `--json` adds Vault/Secrets risk and `runtime` |
 | `ibx exec BOX [--stream] [-t SECS] [-i] -- CMD...` | Run up to 600 seconds; default 300, text stdin up to 1 MiB |
 | `ibx put [--force] BOX LOCAL REMOTE` | Atomic upload up to 5 GiB, credential guard and SHA-256 check |
 | `ibx get BOX REMOTE [LOCAL]` | Staged binary download, default cap 2G through `IBX_GET_MAX` |
@@ -144,7 +144,7 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
 | `ibx port BOX PORT [NAME]` | Public unauthenticated URL, only when the user needs sharing |
 | `ibx unport BOX PORT` | Unpublish a port |
 | `ibx renew [--json] BOX` | Renew reservation age without changing its start time |
-| `ibx release [--json] BOX` | Remove ibx ports and ports created during the reservation, drop lease and claim |
+| `ibx release [--json] BOX \| --mine` | Remove ibx ports and ports created during the reservation, drop lease and claim; --mine releases yours |
 | `ibx keepalive [--all]` | Renew reserved boxes, or every pool box with --all; cooldown, disabled max-run and billing refusals are skips |
 | `ibx pool add|rm BOX...` | User chooses pool membership |
 | `ibx doctor` | Dependencies, key, org plan and usage, run budgets, Secrets, ports and token audit; each FAIL names a next step |
@@ -165,6 +165,21 @@ Hold one box per active parallel job and release each when its part is done. `IB
 defaults to 3; 0 disables it, for the user only. Agents must never raise it or change
 `IBX_AGENT_NAME` or `IBX_STATE_DIR` to evade it. The default name hashes user, host and a known
 session ID (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`), with a per-host fallback.
+
+`ibx ls --mine` shows your live pool reservations and prints your identity and its source on
+stderr. Use the literal box name printed by claim in later calls; the claim hint goes to stderr.
+`ibx release --mine` releases each of your live pool reservations, continues after individual
+failures, and exits 125 if any failed. It requires a session ID or an explicit `IBX_AGENT_NAME`;
+the per-host fallback may identify several agents and is refused with `ambiguous_identity`.
+With none held, both commands succeed and say so on stderr.
+
+Work commands (`exec`, `put`, `get`, `ssh`, `forward`, `port`, `unport`) and `renew`/`release`
+refuse another agent's live reservation with `held_by_other` (125), including its holder,
+reservation time, purpose and the boxes you hold. An unreadable reservation date stays guarded.
+Unreserved or abandoned boxes allow work with a warning to claim first; another agent may
+otherwise take the box. Renew requires your live reservation (`not_held`, 125); release remains
+idempotent. The user-only `IBX_ALLOW_ANY=1` bypasses pool and holder checks. It does not override
+bulk release's identity requirement. `keepalive`, `ls` and `doctor` are unaffected.
 
 An atomic mkdir lock serializes writes and cap checks for one user sharing a state directory.
 A usable busy lock waits up to five minutes, then returns `lock_busy` without a write. An
@@ -248,10 +263,13 @@ pool recreation because it cannot pass `--no-vault --secrets none`. Keep deletio
 Claim, renew and release accept `--json` anywhere after the command and emit exactly one
 object with warnings. Error codes are `no_free_sandbox`, `claim_limit` and `lock_busy` (75),
 `auth` and `account_blocked` (125), `failed` (normally 125, or an unexpected command status),
-and `interrupted` (130/143). Check `error.held` and release any box it names. `ls --json`
+`held_by_other`, `not_held`, `ambiguous_identity` (125), and `interrupted` (130/143). Check `error.held` and release any box it names. `ls --json`
 rows carry `secrets` (true when Org Secrets are selected or could not be inspected), `vault`,
 `pausesAt`, `cooldownUntil` and the API's `runtime` (`ready`, `processesPreserved`). API
-strings in diagnostics are cleaned before printing.
+strings in diagnostics are cleaned before printing. `ls --mine --json` returns
+`{agent,agentSource,boxes}`, with the same box rows as `ls --json`. `release --mine --json`
+returns `{released:[names],failed:[{name,error}],warnings}`. A partial failure retains this
+result and exits 125, so callers can distinguish released boxes from those needing another try.
 
 | Exit | Meaning |
 |---|---|
@@ -277,7 +295,7 @@ strings in diagnostics are cleaned before printing.
 | `IBX_STALE_SECS` | Age at which a reservation counts as abandoned. Default 86400. |
 | `IBX_STATE_DIR` | Where the claim lock lives. Default `${XDG_STATE_HOME:-~/.local/state}/ibx`. |
 | `IBX_GET_MAX` | Largest download `ibx get` accepts: bytes, or a number with K, M or G. Default 2G. |
-| `IBX_ALLOW_ANY=1` | Let agent commands use sandboxes outside the pool. |
+| `IBX_ALLOW_ANY=1` | User-only: bypass pool and reservation-holder checks for agent commands. |
 | `IBX_ALLOW_VAULT=1` | Let `claim` hand out sandboxes that the Vault writes secrets into. |
 | `IBX_ALLOW_SECRETS=1` | Let `claim` hand out sandboxes with proxy Org Secrets scoped to named hosts. Proxy Secrets for every host (`*`, or no hosts), env Secrets, unknown delivery kinds, pending states and guest residue stay refused. |
 

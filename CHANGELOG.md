@@ -9,6 +9,15 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
 
 ### Added
 
+- Ownership-aware commands refuse another agent's live reservation with `held_by_other`;
+  unreserved work warns to claim first, renew requires a live owned reservation (`not_held`),
+  and release stays idempotent. The user-only IBX_ALLOW_ANY bypasses pool and holder checks.
+- `ls --mine [--json]` finds your live pool reservations and reports agent identity/source.
+  `release --mine [--json]` releases all yours, reports individual failures and exits 125 on
+  partial failure. It refuses a shared per-host fallback with `ambiguous_identity`.
+- Human claim output hints on stderr to use the literal name, release it and find it with
+  `ls --mine`; stdout remains only the box name.
+
 - Opt-in `ibx exec --stream` SSE output, uncapped and incremental. Stream errors retain partial
   output, kill the command on disconnect, and never repeat partly-run work. Buffered exec stays
   the default and the 600-second timeout still applies.

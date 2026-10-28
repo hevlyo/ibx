@@ -179,6 +179,14 @@ These are guards against accidents. None of them stops someone who holds the API
   output and print the key, and ibx runs under `umask 077`, so its temporary files are private.
 - **The API host** must be `https://api.instabox.sh` unless `IBX_ALLOW_CUSTOM_API=1`. Plain
   http is accepted only for `127.0.0.1` and `localhost` (tests).
+- **Holder checks.** Work commands, renew and release refuse another agent's live reservation
+  (`held_by_other`, exit 125), using the machine list already loaded. Unreserved/abandoned work
+  warns to claim first; renew refuses `not_held`, release stays idempotent. Unreadable dates
+  remain guarded. `ls --mine` finds your live pool reservations; `release --mine` requires a
+  session ID or explicit agent name (`ambiguous_identity` for the shared per-host fallback).
+  The user-only `IBX_ALLOW_ANY=1` bypasses pool and holder checks, but cannot make the per-host
+  identity unambiguous. Keepalive, ls and doctor are unaffected. These are advisory client
+  checks: another API client or a concurrent metadata change can bypass them.
 - **Pool only.** `exec`, `put`, `get`, `ssh`, `forward`, `port`, `unport`, `renew` and `release` refuse a
   sandbox outside the pool ("is not in the pool", exit 125) unless `IBX_ALLOW_ANY=1`, so an
   agent does not wander into the user's personal sandboxes.

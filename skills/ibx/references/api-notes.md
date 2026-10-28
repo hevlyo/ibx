@@ -319,3 +319,22 @@ is reported as "may have run". An error event, transport loss or missing exit ev
 terminal, with partial output retained and no retry.
 The server kills the process group when the stream closes. Timeouts stay at 1-600 seconds;
 streaming changes output delivery, not long-job lifecycle. Put/get never use SSE.
+
+## Ownership-aware commands (0.3.0)
+
+The holder check uses the machine list already loaded by resolve, without another API call.
+`exec`, `put`, `get`, `ssh`, `forward`, `port`, `unport`, `renew` and `release` refuse another
+agent's non-stale reservation with exit 125 (`held_by_other` in JSON). The shared gate also
+covers `run` and `job` when those commands are added. Invalid dates stay guarded. The message
+includes holder, since, purpose and your live pool reservations (`error.held`). Unreserved or
+abandoned work warns to claim first; renew refuses `not_held`, release stays idempotent.
+`IBX_ALLOW_ANY=1` is a user-only override for pool and holder checks. It does not grant an
+unambiguous identity for bulk release. `keepalive`, `ls` and `doctor` have no holder gate.
+
+`ls --mine [--json]` filters to your live pool reservations (no abandoned or unreadable dates).
+Plain output identifies you and the identity source on stderr; JSON is
+`{agent,agentSource,boxes}` with normal ls rows. None held is a successful empty result, with
+a stderr note. `release --mine [--json]` uses the normal release path for each live held box,
+rechecking ownership, and returns `{released:[names],failed:[{name,error}],warnings}`.
+Failures do not stop later releases; any failure exits 125. A per-host fallback identity
+refuses before API access with `ambiguous_identity`, even with IBX_ALLOW_ANY=1.

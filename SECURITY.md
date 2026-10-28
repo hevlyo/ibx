@@ -33,7 +33,9 @@ In scope, this repository:
 
 - The helper, `skills/ibx/scripts/ibx`. Examples include the API key reaching argv, the
   environment of a child process, a file or the output; an SSH token that leaks or is not
-  revoked; agent commands reaching a sandbox outside the pool without `IBX_ALLOW_ANY=1`;
+  revoked; agent commands reaching a sandbox outside the pool or another agent's live
+  reservation without the user-only `IBX_ALLOW_ANY=1`; bulk release accepting only the shared
+  per-host identity instead of requiring a session ID or explicit agent name;
   `ibx claim` handing out a sandbox that the Vault writes secrets into without
   `IBX_ALLOW_VAULT=1`; accepting selected, pending or residual Org Secrets without an explicit
   user proxy-only override, or accepting env Secrets, an unknown delivery or a proxy Secret for

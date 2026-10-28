@@ -52,10 +52,10 @@ Agents
   ibx port <box> <port> [name]           publish an HTTP port at a public URL (NO authentication)
   ibx unport <box> <port>                unpublish it
   ibx renew [--json] <box>               refresh your reservation (jobs that run past 24 h)
-  ibx release [--json] <box>             give it back: unpublish ibx and reservation-created ports,
-                                         drop its lease and reservation
-  ibx ls [--all] [--json]                pool sandboxes, state and holders (--all: every sandbox);
-                                         --json adds Vault/Secrets risk and runtime
+  ibx release [--json] <box> | --mine   give it back: unpublish ibx and reservation-created ports,
+                                         drop its lease and reservation (--mine: all yours; needs a session/name)
+  ibx ls [--all | --mine] [--json]       pool sandboxes, state and holders (--all: every sandbox);
+                                         --mine finds your live reservations; --json adds Vault/Secrets risk and runtime
 
 Humans
   ibx pool add [--allow-vault] <box>...  let agents claim these sandboxes (refuses Vault secrets
@@ -79,7 +79,7 @@ Environment: INSTABOX_API_KEY (else the file IBX_KEY_FILE, default
 ${XDG_CONFIG_HOME:-~/.config}/instabox/api-key), INSTABOX_API_URL (https://api.instabox.sh;
 another host needs IBX_ALLOW_CUSTOM_API=1), IBX_AGENT_NAME (shown in reservations; default a
 pseudonymous id of this user, host and known agent session), IBX_STALE_SECS (reservation age
-that counts as abandoned, 86400), IBX_ALLOW_ANY=1 (commands outside the pool), IBX_ALLOW_VAULT=1
+that counts as abandoned, 86400), IBX_ALLOW_ANY=1 (user-only: bypass pool and holder checks), IBX_ALLOW_VAULT=1
 (claim sandboxes that receive Vault secrets), IBX_ALLOW_SECRETS=1 (proxy Secrets scoped to
 named hosts only, user-only; env Secrets, unknown delivery and every-host proxy Secrets stay
 refused), IBX_GET_MAX (download cap, default 2G), IBX_MAX_CLAIMS (live reservations per agent,
@@ -87,8 +87,12 @@ default 3; 0 disables the cap), IBX_STATE_DIR (an atomic mkdir lock, default dir
 ${XDG_STATE_HOME:-~/.local/state}/ibx).
 claim, renew and release accept --json anywhere after the command. JSON includes warnings;
 errors have error.code (no_free_sandbox, claim_limit, lock_busy, auth, account_blocked, failed,
-interrupted) and error.message. lock_busy exits 75 after waiting up to 5 minutes for a usable
-local lock.
+interrupted, held_by_other, not_held, ambiguous_identity) and error.message. lock_busy exits 75
+after waiting up to 5 minutes for a usable local lock. Work commands refuse another agent's live reservation (held_by_other, 125).
+Unreserved or abandoned boxes warn: ibx claim first. Renew requires your live reservation
+(not_held, 125); release stays idempotent. ls, doctor and keepalive do not check ownership.
+ls --mine --json returns {agent,agentSource,boxes}; release --mine --json returns
+{released:[names],failed:[{name,error}],warnings}. Partial release failure exits 125.
 EOF
 }
 
@@ -470,6 +474,31 @@ resolve() { # [--pool] name-or-id -> id. With --pool, only pool sandboxes (agent
 	if [ -n "$pool" ] && [ "${IBX_ALLOW_ANY:-}" != 1 ] &&
 		[ "$(jq -r --arg i "$id" "$JQ_DEFS"' .[] | select(.id == $i) | inpool' <<<"$ms")" != true ]; then
 		die "$1 is not in the pool: agents only use pool sandboxes (ibx ls). Ask the user."
+	fi
+	if [ -n "$pool" ] && [ "${IBX_ALLOW_ANY:-}" != 1 ]; then
+		case $COMMAND in exec | put | get | ssh | forward | port | unport | renew | release | run | job)
+			local m owned held message
+			m=$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$ms")
+			owned=$(jq -r --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
+				age($now) as $age | .metadata["ibx.claim.by"] == $by and
+				$age != null and $age != "invalid" and $age <= $stale' <<<"$m")
+			if [ "$owned" != true ]; then
+				if jq -e --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
+					.metadata["ibx.claim.by"] != $by and (free($now; $stale) | not)' <<<"$m" >/dev/null; then
+					held=$(held_claims "$ms" "$AGENT")
+					message=$(jq -r "$JQ_DEFS"' "\(.name | clean) is held by \(.metadata["ibx.claim.by"] // "?" | clean) since \(.metadata["ibx.claim.at"] | clean): \(.metadata["ibx.claim.purpose"] // "" | clean)"' <<<"$m")
+					message+="; you hold: $(jq -r 'if length == 0 then "none" else map(.name) | join(", ") end' <<<"$held")"
+					json_error held_by_other "$message" "$held"
+					die "$message"
+				fi
+				if [ "$COMMAND" = renew ]; then
+					message="$1 is not reserved by you; ibx claim first (no live reservation to renew)"
+					json_error not_held "$message"
+					die "$message"
+				fi
+				[ "$COMMAND" = release ] || warn "$1 not reserved by you; ibx claim first or another agent may take it"
+			fi ;;
+		esac
 	fi
 	printf '%s' "$id"
 }
@@ -977,13 +1006,61 @@ looks_secret() { # path -> 0 when the file looks like a credential
 
 table() { if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi; }
 
+release_box() { # box: shared by literal and bulk release
+	id=$(resolve --pool "$1")
+	m=$(api GET "/v1/machines/$id") || die "could not read $1"
+	ports=$(public_ports "$id") || die "could not list the public ports of $1; nothing released, try again"
+	left='' unpublished='[]' left_alone='[]' reasons='[]'
+	start=$(jq -r '.metadata["ibx.claim.start"] // empty' <<<"$m")
+	while IFS=$'\037' read -r port name url created; do
+		[[ $port =~ ^[0-9]+$ ]] || continue
+		during=
+		if jq -en --arg s "$start" --arg c "$created" "$JQ_DEFS"' ($s | timestamp) as $s | ($c | timestamp) as $c | $s != null and $c != null and $c >= $s' >/dev/null; then during=1; fi
+		if [[ $name == ibx:* ]] || [ -n "$during" ]; then
+			if unpublish "$id" "$port"; then
+				unpublished=$(jq -c --argjson p "$port" '. + [$p]' <<<"$unpublished")
+				reasons=$(jq -c --argjson p "$port" --arg why "$(if [ -n "$during" ]; then echo 'created during the reservation'; else echo 'published by ibx'; fi)" '. + [{port:$p,reason:$why}]' <<<"$reasons")
+				[ -n "$JSON" ] || echo "unpublished port $port of $1"
+			else left+=" $url"; fi
+		else
+			left_alone=$(jq -c --argjson p "$port" --arg n "$name" --arg u "$url" '. + [{port:$p,name:$n,url:$u}]' <<<"$left_alone")
+			warn "left port $port alone ($url): it was not published by ibx"
+		fi
+	done <<<"$ports"
+	[ -z "$left" ] || die "these URLs are STILL PUBLIC:$left (nothing released; ibx unport $1 PORT, then release again)"
+	api DELETE "/v1/machines/$id/activity-leases/$LEASE" >/dev/null 2>&1 || true
+	set_claim "$id" '{}' || die "could not clear the reservation of $1"
+	if [ -n "$JSON" ]; then
+		jq -c --argjson u "$unpublished" --argjson l "$left_alone" --argjson reasons "$reasons" "$JQ_DEFS"'
+			{name:(.name | clean),id:(.id | clean),unpublished:$u,unpublishReasons:$reasons,leftAlone:$l,
+			was:(if (.metadata["ibx.claim.token"] // "") == "" then null else
+				{by:(.metadata["ibx.claim.by"] | clean),since:(.metadata["ibx.claim.at"] | clean),
+				purpose:(.metadata["ibx.claim.purpose"] | clean)} end)}' <<<"$m" >"$tmp/result"
+	else
+		echo "released $1 (was: $(jq -r "$JQ_DEFS"' "\(.metadata["ibx.claim.purpose"] // "no reservation" | clean) (\(.metadata["ibx.claim.by"] // "-" | clean), since \(.metadata["ibx.claim.at"] // "-" | clean))"' <<<"$m"))"
+	fi
+}
+
+# shellcheck disable=SC2030 # private subshell state must survive function unwinding at EXIT
+release_isolated() ( # box: private result/error files; AUTH stays a shell variable
+	set -e
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX") || die "could not stage release"
+	JSON=1 main_pid=$BASHPID
+	trap cleanup EXIT
+	exec {JSON_FD}>&1
+	: >"$tmp/warnings"
+	release_box "$1"
+)
+
 cmd=$1
 shift
 if [ "$cmd" = pool ] && [ "${1:-}" = ls ]; then cmd='ls'; shift; fi
+# shellcheck disable=SC2031 # release_isolated deliberately leaves parent tmp/JSON unchanged
 case "$cmd" in
 ls)
-	all='' json=''
-	for a in "$@"; do case "$a" in --all) all=1 ;; --json) json=1 ;; *) die "usage: ibx ls [--all] [--json]" ;; esac; done
+	all='' json='' mine=''
+	for a in "$@"; do case "$a" in --all) all=1 ;; --mine) mine=1 ;; --json) json=1 ;; *) die "usage: ibx ls [--all | --mine] [--json]" ;; esac; done
+	[ -z "$mine" ] || [ -z "$all" ] || die "--mine and --all cannot be combined"
 	ms=$(all_machines) || die "could not list sandboxes"
 	secrets_rows='{}'
 	while IFS= read -r id; do
@@ -1002,9 +1079,16 @@ ls)
 				elif $age > $stale then "abandoned" else "held" end),
 			by: (.metadata["ibx.claim.by"] | clean), since: (.metadata["ibx.claim.at"] | clean),
 			purpose: (.metadata["ibx.claim.purpose"] | clean)}]' <<<"$ms")
-	if [ -n "$json" ]; then
+	if [ -n "$mine" ]; then
+		rows=$(jq --arg by "$AGENT" '[.[] | select(.pool and .reservation == "held" and .by == $by)]' <<<"$rows")
+		[ -n "$json" ] || stderr printf 'you are %s (%s)\n' "$AGENT" "$AGENT_SOURCE"
+		[ "$(jq length <<<"$rows")" != 0 ] || warn "you hold no sandboxes"
+	fi
+	if [ -n "$json" ] && [ -n "$mine" ]; then
+		jq -n --arg agent "$AGENT" --arg source "$AGENT_SOURCE" --argjson boxes "$rows" '{agent:$agent,agentSource:$source,boxes:$boxes}'
+	elif [ -n "$json" ]; then
 		printf '%s\n' "$rows"
-	elif [ "$(jq length <<<"$rows")" = 0 ]; then
+	elif [ "$(jq length <<<"$rows")" = 0 ] && [ -z "$mine" ]; then
 		warn "the pool is empty. The user can add sandboxes with: ibx pool add <box> (ibx ls --all lists every sandbox)"
 	else
 		jq -r '.[] | [.name, .state, (if .reservation == "free" then "free"
@@ -1183,6 +1267,7 @@ claim)
 					purpose:$c["ibx.claim.purpose"],leaseUntil:$l,publicPorts:$p}' >"$tmp/result"
 			else
 				printf '%s\n' "$name"
+				stderr printf 'ibx: use the literal name %s in later calls; release with ibx release %s; find it again with ibx ls --mine\n' "$name" "$name"
 			fi
 			exit 0
 		done
@@ -1218,39 +1303,40 @@ renew)
 	fi
 	;;
 release)
-	[ $# -ge 1 ] || die "usage: ibx release <box>"
-	id=$(resolve --pool "$1")
-	m=$(api GET "/v1/machines/$id") || die "could not read $1"
-	ports=$(public_ports "$id") || die "could not list the public ports of $1; nothing released, try again"
-	left='' unpublished='[]' left_alone='[]' reasons='[]'
-	start=$(jq -r '.metadata["ibx.claim.start"] // empty' <<<"$m")
-	while IFS=$'\037' read -r port name url created; do
-		[[ $port =~ ^[0-9]+$ ]] || continue
-		during=
-		if jq -en --arg s "$start" --arg c "$created" "$JQ_DEFS"' ($s | timestamp) as $s | ($c | timestamp) as $c | $s != null and $c != null and $c >= $s' >/dev/null; then during=1; fi
-		if [[ $name == ibx:* ]] || [ -n "$during" ]; then
-			if unpublish "$id" "$port"; then
-				unpublished=$(jq -c --argjson p "$port" '. + [$p]' <<<"$unpublished")
-				reasons=$(jq -c --argjson p "$port" --arg why "$(if [ -n "$during" ]; then echo 'created during the reservation'; else echo 'published by ibx'; fi)" '. + [{port:$p,reason:$why}]' <<<"$reasons")
-				[ -n "$JSON" ] || echo "unpublished port $port of $1"
-			else left+=" $url"; fi
-		else
-			left_alone=$(jq -c --argjson p "$port" --arg n "$name" --arg u "$url" '. + [{port:$p,name:$n,url:$u}]' <<<"$left_alone")
-			warn "left port $port alone ($url): it was not published by ibx"
+	[ $# -eq 1 ] || die "usage: ibx release [--json] <box> | --mine"
+	if [ "$1" = --mine ]; then
+		if [ "$AGENT_SOURCE" = 'per host' ]; then
+			message='release --mine needs a session ID or IBX_AGENT_NAME; the per-host identity may be shared by other agents; release each literal name instead'
+			json_error ambiguous_identity "$message"
+			die "$message"
 		fi
-	done <<<"$ports"
-	[ -z "$left" ] || die "these URLs are STILL PUBLIC:$left (nothing released; ibx unport $1 PORT, then release again)"
-	api DELETE "/v1/machines/$id/activity-leases/$LEASE" >/dev/null 2>&1 || true
-	set_claim "$id" '{}' || die "could not clear the reservation of $1"
-	if [ -n "$JSON" ]; then
-		jq -c --argjson u "$unpublished" --argjson l "$left_alone" --argjson reasons "$reasons" "$JQ_DEFS"'
-			{name:(.name | clean),id:(.id | clean),unpublished:$u,unpublishReasons:$reasons,leftAlone:$l,
-			was:(if (.metadata["ibx.claim.token"] // "") == "" then null else
-				{by:(.metadata["ibx.claim.by"] | clean),since:(.metadata["ibx.claim.at"] | clean),
-				purpose:(.metadata["ibx.claim.purpose"] | clean)} end)}' <<<"$m" >"$tmp/result"
-	else
-		echo "released $1 (was: $(jq -r "$JQ_DEFS"' "\(.metadata["ibx.claim.purpose"] // "no reservation" | clean) (\(.metadata["ibx.claim.by"] // "-" | clean), since \(.metadata["ibx.claim.at"] // "-" | clean))"' <<<"$m"))"
+		ms=$(all_machines) || die "could not list sandboxes"
+		held=$(held_claims "$ms" "$AGENT")
+		released='[]' failed='[]'
+		while IFS= read -r id; do
+			name=$(jq -r --arg id "$id" "$JQ_DEFS"' .[] | select(.id == $id) | .name | clean' <<<"$ms")
+			# Do not put the helper in an if condition: that disables its errexit too.
+			set +e
+			release_isolated "$id" >"$tmp/release-result"
+			release_rc=$?
+			set -e
+			if [ "$release_rc" = 0 ]; then
+				released=$(jq -c --arg n "$name" "$JQ_DEFS"' . + [($n | clean)]' <<<"$released")
+				[ -n "$JSON" ] || printf 'released %s\n' "$name"
+			else
+				failed=$(jq -c --arg n "$name" --slurpfile r "$tmp/release-result" "$JQ_DEFS"'
+					. + [{name:($n | clean),error:($r[0].error // {code:"failed",message:"release failed"})}]' <<<"$failed")
+			fi
+			jq -c '.warnings[]?' "$tmp/release-result" >>"$tmp/warnings"
+		done < <(jq -r --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
+			.[] | select(inpool and .metadata["ibx.claim.by"] == $by) | age($now) as $age |
+			select($age != null and $age != "invalid" and $age <= $stale) | .id' <<<"$ms")
+		[ "$(jq length <<<"$held")" != 0 ] || warn "you hold no sandboxes"
+		jq -cn --argjson released "$released" --argjson failed "$failed" '{released:$released,failed:$failed}' >"$tmp/result"
+		[ "$(jq length <<<"$failed")" = 0 ] || exit 125
+		exit 0
 	fi
+	release_box "$1"
 	;;
 exec)
 	[ $# -ge 1 ] || die "usage: ibx exec <box> [-t SECS] [-i] -- <cmd>"

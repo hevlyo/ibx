@@ -397,6 +397,177 @@ t_ls() {
 	is "ls --json of an empty pool is []" "$(OUT)" '[]'
 }
 
+t_ownership() {
+	group "ownership-aware commands"
+	local command age id original=$IBX
+	printf 'public fixture\n' >"$S/public.txt"
+	for command in exec put get ssh forward port unport renew release; do
+		reset
+		hold box-1 60 other-agent
+		hold box-2 60 tester
+		case $command in
+		exec) run exec box-1 -- true ;;
+		put) run put box-1 "$S/public.txt" public.txt ;;
+		get) run get box-1 public.txt "$S/download" ;;
+		ssh) run ssh box-1 true ;;
+		forward) run forward box-1 18080:8080 ;;
+		port | unport) run "$command" box-1 8080 ;;
+		*) run "$command" --json box-1 ;;
+		esac
+		rc_is "$command refuses another agent's live reservation" 125
+		err_has "$command identifies holder, time, purpose and own boxes" 'held by other-agent since .*: earlier job; you hold: box-2'
+		if [ "$command" = renew ] || [ "$command" = release ]; then
+			is "$command JSON has held_by_other and own reservations" "$(jq -c '[.error.code, [.error.held[].name]]' "$S/out")" '["held_by_other",["box-2"]]'
+		fi
+		is "$command refuses before any box request or mutation" "$(ncalls)" 1
+	done
+	# run/job arrive in B2; exercise the shared resolve gate under those command names now.
+	python3 - "$IBX" "$S/future-commands" <<'PYCODE'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+source = source.replace('case "$cmd" in\nls)', 'case "$cmd" in\nrun | job) resolve --pool "$1" ;;\nls)')
+Path(sys.argv[2]).write_text(source)
+PYCODE
+	chmod +x "$S/future-commands"
+	for command in run job; do
+		reset
+		hold box-1 60 other-agent
+		IBX=$S/future-commands run "$command" box-1
+		rc_is "$command resolve gate refuses another holder" 125
+		err_has "$command resolve gate names the holder" 'held by other-agent'
+	done
+	IBX=$original
+	for age in free 90000; do
+		reset
+		[ "$age" = free ] || hold box-1 "$age" other-agent
+		run exec box-1 -- true
+		rc_is "$age box work proceeds" 0
+		err_has "$age box work warns" 'not reserved by you; ibx claim first or another agent may take it'
+		run renew --json box-1
+		rc_is "$age box renew refuses" 125
+		is "$age box renew has not_held" "$(jq -r .error.code "$S/out")" not_held
+		run release --json box-1
+		rc_is "$age box release succeeds" 0
+		err_lacks "$age release has no claim-first warning" 'not reserved by you'
+		run release --json box-1
+		rc_is "$age release remains idempotent" 0
+	done
+	reset
+	hold box-1 60 other-agent
+	run IBX_ALLOW_ANY=1 exec box-1 -- true
+	rc_is "user override permits work on another holder's box" 0
+	err_lacks "override has no ownership warning" 'not reserved by you'
+	run IBX_ALLOW_ANY=1 renew --json box-1
+	rc_is "user override permits renew of another holder's box" 0
+	run IBX_ALLOW_ANY=1 release --json box-1
+	rc_is "user override permits release of another holder's box" 0
+	hold box-1 60 other-agent
+	run keepalive
+	rc_is "keepalive still renews another holder's box" 0
+	out_has "keepalive reports the other holder's lease" '^box-1: lease until'
+	run ls --json
+	rc_is "ls remains unaffected by other holders" 0
+	run doctor
+	rc_is "doctor remains unaffected by other holders" 0
+	reset '"seed":{"count":5,"pool":[1,1,1,0,1]}'
+	hold box-1 60 tester
+	hold box-2 90000 tester
+	hold box-3 60 other-agent
+	hold box-4 60 tester
+	ctl "{\"set\":{\"box-5\":{\"mergeMetadata\":$(claim_md not-a-date tester)}}}"
+	run ls --mine
+	rc_is "ls --mine succeeds" 0
+	err_has "ls --mine identifies agent and source on stderr" '^you are tester \(IBX_AGENT_NAME\)$'
+	out_has "ls --mine shows the held pool box" '^box-1 '
+	out_lacks "ls --mine omits stale, foreign, non-pool and invalid reservations" 'box-[2345]'
+	run ls --json
+	jq '[.[] | select(.name == "box-1")]' "$S/out" >"$S/expected-rows"
+	run ls --mine --json
+	is "ls --mine JSON contains identity and normal ls rows" "$(jq -c '[.agent,.agentSource,.boxes]' "$S/out")" "$(jq -c '["tester","IBX_AGENT_NAME",.]' "$S/expected-rows")"
+	run IBX_AGENT_NAME=no-holdings ls --mine --json
+	rc_is "ls --mine none held succeeds" 0
+	is "ls --mine none held JSON is an empty box list" "$(jq -c .boxes "$S/out")" '[]'
+	err_has "ls --mine none held says so" 'you hold no sandboxes'
+	run IBX_AGENT_NAME=no-holdings ls --mine
+	is "ls --mine none held stdout is empty" "$(OUT)" ''
+	err_has "plain none held still identifies agent" '^you are no-holdings \(IBX_AGENT_NAME\)$'
+	run ls --mine --all
+	rc_is "ls rejects conflicting filters" 125
+	reset
+	hold box-1 60 tester
+	hold box-2 60 tester
+	hold box-3 60 other-agent
+	run release --mine --json
+	rc_is "release --mine releases all owned boxes" 0
+	is "release --mine result names released boxes" "$(jq -c '[.released,.failed]' "$S/out")" '[["box-1","box-2"],[]]'
+	is "release --mine keeps other agent's reservation" "$(claim_keys box-1):$(claim_keys box-2):$(claim_keys box-3)" 0:0:4
+	run release --mine --json
+	rc_is "release --mine none held succeeds" 0
+	is "release --mine none held result is empty" "$(jq -c '[.released,.failed]' "$S/out")" '[[],[]]'
+	reset
+	hold box-1 60 tester
+	hold box-2 60 tester
+	hold box-3 90000 tester
+	ctl '{"faults":[{"kind":"error","method":"GET","match":"/ports$","status":403,"code":"permission_denied","message":"test refusal"}]}'
+	run release --mine --json
+	rc_is "release --mine partial failure exits 125" 125
+	is "partial failure reports error and continues with the next box" "$(jq -c '[.released,[.failed[] | [.name,.error.code]]]' "$S/out")" '[["box-2"],[["box-1","failed"]]]'
+	is "partial failure preserves failed and stale reservations" "$(claim_keys box-1):$(claim_keys box-2):$(claim_keys box-3)" 4:0:4
+	reset '"seed":{"count":1},"faults":[{"kind":"delay","method":"GET","match":"^/v1/machines$","skip":1,"seconds":2}]'
+	hold box-1 60 tester
+	"$IBX" release --mine --json >"$S/out" 2>"$S/err" &
+	local releasing=$!
+	for _ in $(seq 100); do
+		[ "$(count GET '^/v1/machines$')" -ge 2 ] && break
+		sleep 0.05
+	done
+	hold box-1 60 other-agent
+	wait "$releasing"; RC=$?; TIMEDOUT=
+	rc_is "bulk release refuses a holder change before its per-box recheck" 125
+	is "bulk recheck reports held_by_other" "$(jq -r '.failed[0].error.code' "$S/out")" held_by_other
+	is "a refused recheck stops immediately without further requests" "$(ncalls)" 2
+	is "a raced foreign reservation survives" "$(box box-1 '.metadata["ibx.claim.by"]')" other-agent
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"^/v1/machines/m_[a-z2-7]+$","status":200,"body":"{\"metadata\":[]}"}]'
+	hold box-1 60 tester
+	run release --mine --json
+	rc_is "bulk release stops on malformed per-box data" 125
+	is "malformed data is an individual failure" "$(jq -c '[.released,[.failed[].name]]' "$S/out")" '[[],["box-1"]]'
+	is "malformed data causes no mutations" "$(count DELETE .):$(count PATCH .)" 0:0
+	reset
+	hold box-1 60 tester
+	ctl '{"set":{"box-1":{"name":"odd\u001b[2Jbox","ports":[{"port":8081,"name":"manual"}]}}}'
+	run release --mine --json
+	rc_is "bulk release handles hostile names by machine id" 0
+	is "bulk release cleans names and aggregates warnings" "$(jq -c '[.released,(.warnings | length)]' "$S/out")" '[["odd [2Jbox"],1]'
+	yes_ "bulk release JSON and stderr have no terminal controls" eval '! has_ctl "$S/out" "$S/err"'
+	reset
+	hold box-1 60 tester
+	run release --mine
+	rc_is "bulk release plain output succeeds" 0
+	out_has "bulk release plain output names each box" '^released box-1$'
+	reset
+	hold box-1 60 tester
+	ctl '{"set":{"box-1":{"name":"odd\u001b[2Jbox"}}}'
+	run release --mine
+	rc_is "plain bulk release handles hostile names" 0
+	yes_ "plain bulk release cleans terminal controls" eval '! has_ctl "$S/out" "$S/err"'
+	reset
+	run -u IBX_AGENT_NAME release --mine --json
+	rc_is "release --mine refuses the per-host fallback" 125
+	is "fallback refusal has ambiguous_identity" "$(jq -r .error.code "$S/out")" ambiguous_identity
+	is "fallback refusal makes no API calls" "$(ncalls)" 0
+	run -u IBX_AGENT_NAME IBX_ALLOW_ANY=1 release --mine --json
+	rc_is "pool/holder override cannot make bulk identity unambiguous" 125
+	run -u IBX_AGENT_NAME CODEX_THREAD_ID=b1-test release --mine --json
+	rc_is "release --mine accepts session identity" 0
+	reset '"seed":{"count":1}'
+	run claim ownership-test
+	rc_is "claim human output succeeds" 0
+	is "claim stdout stays the bare name" "$(OUT)" box-1
+	err_has "claim stderr teaches literal name, release and rediscovery" 'literal name box-1.*ibx release box-1.*ibx ls --mine'
+}
+
 t_claim() {
 	group claim
 	reset
@@ -1132,9 +1303,9 @@ t_claim_json() {
 	rc_is "hostile holder strings still give exit 75" 75
 	is "JSON holders are cleaned" "$(jq -c '.error.held[0] | [.name,.by,.purpose]' "$S/out")" '["evil [2Jbox","other ","job [31m"]'
 	yes_ "the holder message has no terminal controls" eval '! has_ctl "$S/out" "$S/err"'
-	run renew "$id" --json
+	run IBX_ALLOW_ANY=1 renew "$id" --json
 	is "renew JSON cleans API strings" "$(jq -c '[.name,.by]' "$S/out")" '["evil [2Jbox","other "]'
-	run release --json "$id"
+	run IBX_ALLOW_ANY=1 release --json "$id"
 	is "release JSON cleans previous holder and public ports" \
 		"$(jq -c '[.name,.was.by,.leftAlone[0].name,.leftAlone[0].url]' "$S/out")" \
 		'["evil [2Jbox","other ","manual ","https://a.mock.invalid/ [2J"]'
@@ -1322,7 +1493,7 @@ t_renew() {
 		"$(claim_md x tester | jq -cS '. + {"ibx.pool":"1","owner.note":"keep me"} | del(.["ibx.claim.at"])')"
 	run renew box-2
 	rc_is "renew of a free sandbox fails" 125
-	err_has "renew of a free sandbox says so" 'has no reservation to renew'
+	err_has "renew of a free sandbox says so" 'no live reservation to renew'
 	run renew
 	rc_is "renew without a sandbox is a usage error" 125
 }
@@ -1333,12 +1504,12 @@ t_release() {
 	setup='"set":{"box-1":{"mergeMetadata":{"owner.note":"keep me"},"leases":["ibx-keepalive","other-task"],
 		"ports":[{"port":8080,"name":"ibx:web"},{"port":8081,"name":"dashboard"},{"port":8082,"name":"ibx:port"}]}}'
 	reset "$setup"
-	hold box-1 60
+	hold box-1 60 tester
 	run release box-1
 	rc_is "release" 0
 	out_has "release unpublishes ibx ports" '^unpublished port 8080 of box-1$'
 	out_has "release unpublishes every ibx port" '^unpublished port 8082 of box-1$'
-	out_has "release says what was released" '^released box-1 \(was: earlier job \(someone@elsewhere, since 20'
+	out_has "release says what was released" '^released box-1 \(was: earlier job \(tester, since 20'
 	err_has "release leaves other ports alone, and says so" 'left port 8081 alone'
 	is "only the port ibx did not publish is left" "$(box box-1 '[.ports[].port]')" '[8081]'
 	is "release deletes only the ibx lease" "$(box box-1 '[.leases[].id]')" '["other-task"]'
@@ -1348,7 +1519,7 @@ t_release() {
 	out_has "release of a free sandbox says there was no reservation" 'was: no reservation'
 
 	reset "$setup,\"faults\":[{\"kind\":\"error\",\"method\":\"DELETE\",\"match\":\"/ports/\",\"count\":9,\"status\":403,\"code\":\"permission_denied\",\"message\":\"no\"}]"
-	hold box-1 60
+	hold box-1 60 tester
 	run release box-1
 	rc_is "release fails when a port cannot be unpublished" 125
 	err_has "it names the URLs that are still public" 'STILL PUBLIC: https://'
@@ -1356,7 +1527,7 @@ t_release() {
 	is "the lease is kept" "$(box box-1 '[.leases[].id]')" '["ibx-keepalive","other-task"]'
 
 	reset "$setup,\"faults\":[{\"kind\":\"error\",\"method\":\"GET\",\"match\":\"/ports$\",\"status\":403,\"code\":\"permission_denied\",\"message\":\"no\"}]"
-	hold box-1 60
+	hold box-1 60 tester
 	run release box-1
 	rc_is "release fails when the ports cannot be listed" 125
 	err_has "it says nothing was released" 'nothing released'
@@ -1364,7 +1535,7 @@ t_release() {
 
 	# A DELETE that is retried after the first one went through gets 404: already unpublished.
 	reset "$setup,\"faults\":[{\"kind\":\"error\",\"method\":\"DELETE\",\"match\":\"/ports/8080$\",\"status\":404,\"code\":\"not_found\",\"message\":\"port 8080 is not public\"}]"
-	hold box-1 60
+	hold box-1 60 tester
 	run release box-1
 	rc_is "release when a port DELETE answers 404" 0
 	out_has "that port counts as unpublished" '^unpublished port 8080 of box-1$'
@@ -1475,6 +1646,7 @@ t_exec() {
 	is "several arguments are sent as one quoted command" "$(last_exec .cmd)" "$(printf '%q ' printf '<%s>' 'a b' 'x;y')"
 	if [ -n "$REAL" ]; then
 		is "several arguments keep their boundaries" "$(OUT)" '<a b><x;y>'
+		hold box-1 60 tester
 		run exec box-1 -- 'echo out; echo err >&2; exit 3'
 		rc_is "one argument is a script" 3
 		is "stdout goes to stdout" "$(OUT)" out
@@ -1938,7 +2110,7 @@ t_hostile() {
 	out_has "but still the text around them" 'evil.\[2Jbox'
 	run keepalive
 	yes_ "keepalive prints none" eval '[ "$RC" = 0 ] && ! has_ctl "$S/out" "$S/err"'
-	run release "$id"
+	run IBX_ALLOW_ANY=1 release "$id"
 	rc_is "release" 0
 	yes_ "release prints none" eval '! has_ctl "$S/out" "$S/err"'
 	err_has "it shows the URL it left alone, cleaned" 'left port 8081 alone \(https://b\.mock\.invalid/.\[5m\)'
@@ -2220,6 +2392,7 @@ t_stream030() {
 	rc_is "buffered exec remains the default even with an unrelated STREAM environment variable" 0
 	is "buffered exec does not request SSE" "$(calls | jq -c '[.calls[] | select(.path | endswith("/exec")) | .accept]')" '["*/*"]'
 	reset '"execResults":[{"stdout":"hello é\n","stderr":"remote warning\n","exitCode":7}]'
+	hold box-1 60 tester
 	run exec box-1 --stream -- true
 	rc_is "streamed exec preserves the remote exit status" 7
 	is "stream stdout survives UTF-8 and ignores ping comments" "$(OUT)" 'hello é'
@@ -2444,6 +2617,7 @@ PYCODE
 	rm "$S/sparse030.bin"
 
 	head -c 5000000 /dev/urandom >"$S/file030.bin"
+	hold box-1 60 tester
 	run put box-1 "$S/file030.bin" 'sub/file with spaces..bin'
 	rc_is "official PUT streams five MB with spaces and dots in the path" 0
 	is "file upload uses no exec" "$(count POST '/exec$')" 0
@@ -2972,7 +3146,7 @@ PYCODE
 		"$(jq -c '.[] | select(.name == "box-1") | .runtime.processesPreserved' "$S/out")" false
 }
 
-for t in guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
+for t in ownership guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
 	put_guard poolonly vault hostile secrets ssh install cleanup; do
 	want "$t" && "t_$t"
 done
