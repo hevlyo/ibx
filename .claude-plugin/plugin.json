@@ -7,7 +7,7 @@
   },
   "homepage": "https://github.com/hevlyo/ibx",
   "repository": "https://github.com/hevlyo/ibx",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "MIT",
   "keywords": ["instabox", "sandbox", "cloud-vm", "agents", "skill", "isolation"]
 }

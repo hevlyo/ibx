@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "ibx",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "source": "./",
       "description": "Borrow a disposable instabox.sh cloud sandbox from a shared pool, safely: reservations between agents, idle-pause handling, exec that is never retried blindly, file copy, SSH with short-lived tokens, and cleanup on release."
     }

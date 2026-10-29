@@ -24,7 +24,7 @@ ENV_KEY=${INSTABOX_API_KEY:-}
 export -n ENV_KEY
 unset INSTABOX_API_KEY
 
-IBX_VERSION=0.3.0
+IBX_VERSION=0.3.1
 
 stderr() { "$@" >&2 || true; } # a closed stderr must not replace the intended exit status
 
@@ -1249,11 +1249,27 @@ printf '%s\n' "\$rc" >"\$4.part"
 mv -f "\$4.part" "\$4"
 RUN
 chmod 700 "\$root/runner"
-command -v setsid >/dev/null || { printf '%s\n' "setsid is not installed on the sandbox" >&2; exit 4; }
-setsid -f "\$root/runner" "\$root/pid" "\$root/cmd" "\$root/log" "\$root/rc" </dev/null >/dev/null 2>&1 || {
-	printf '%s\n' "could not start job \$name" >&2
+# Debian has setsid. The mock runs this script on the CI machine; macOS does not
+# ship setsid, so python calls setsid(2) and the job is still a new session.
+if command -v setsid >/dev/null; then
+	setsid -f "\$root/runner" "\$root/pid" "\$root/cmd" "\$root/log" "\$root/rc" </dev/null >/dev/null 2>&1 || {
+		printf '%s\n' "could not start job \$name" >&2
+		exit 4
+	}
+elif command -v python3 >/dev/null; then
+	python3 -c 'import os, sys
+pid = os.fork()
+if pid > 0:
+    os._exit(0)
+os.setsid()
+os.execv(sys.argv[1], sys.argv[1:])' "\$root/runner" "\$root/pid" "\$root/cmd" "\$root/log" "\$root/rc" </dev/null >/dev/null 2>&1 || {
+		printf '%s\n' "could not start job \$name" >&2
+		exit 4
+	}
+else
+	printf '%s\n' "setsid is not installed on the sandbox" >&2
 	exit 4
-}
+fi
 i=0
 while [ "\$i" -lt 50 ]; do
 	[ -s "\$root/pid" ] && break
@@ -1530,19 +1546,143 @@ mkdir -p -- $shell_dest && tar xzf $shell_arch -C $shell_dest && rm -f -- $shell
 	exit 0
 }
 
-inspect_tar() {
-	local name type
-	while IFS= read -r name; do
-		case $name in
-		/* | .. | ../* | */.. | */../*) die "refusing archive entry $name" ;;
-		esac
-	done < <(tar -tzf "$1")
-	while read -r type _; do
-		case $type in
-		-* | d*) ;;
-		*) die "refusing an archive entry that is not a regular file or directory" ;;
-		esac
-	done < <(tar -tvzf "$1")
+inspect_tar() { # refuse names and types from the stored headers, before extract
+	# tar -t is not the check: bsdtar can print a rewritten name (the .. dropped) and
+	# exit 0, and the extract then succeeds. python3 reads the ustar, pax and GNU headers.
+	local msg rc=0
+	command -v python3 >/dev/null || die "could not inspect the archive: python3 is missing"
+	msg=$(python3 - "$1" <<'IBX_TAR'
+import gzip, sys
+
+def fail(msg):
+    print(msg)
+    raise SystemExit(1)
+
+def cstr(field):
+    return field.split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+
+def tar_number(field):
+    if field[:1] and field[0] & 0x80:
+        if field[0] == 0xff:
+            return int.from_bytes(field, "big", signed=True)
+        return int.from_bytes(bytes([field[0] & 0x7f]) + field[1:], "big")
+    text = field.split(b"\0", 1)[0].strip()
+    if not text:
+        return 0
+    try:
+        return int(text, 8)
+    except ValueError:
+        fail("could not inspect the archive")
+
+def checksum_ok(block):
+    stored = block[148:156].split(b"\0", 1)[0].strip()
+    try:
+        want = int(stored or b"0", 8)
+    except ValueError:
+        return False
+    return sum(block[:148]) + 32 * 8 + sum(block[156:]) == want
+
+def header_name(block):
+    name = cstr(block[0:100])
+    if block[257:262] == b"ustar":
+        prefix = cstr(block[345:500])
+        if prefix:
+            name = prefix + "/" + name
+    return name
+
+def parse_pax(data):
+    out = {}
+    i, n = 0, len(data)
+    while i < n and data[i:i + 1] not in (b"\0", b""):
+        sp = data.find(b" ", i)
+        if sp <= i:
+            fail("could not inspect the archive")
+        try:
+            length = int(data[i:sp])
+        except ValueError:
+            fail("could not inspect the archive")
+        if length < 3 or i + length > n:
+            fail("could not inspect the archive")
+        rec = data[i:i + length]
+        if not rec.endswith(b"\n"):
+            fail("could not inspect the archive")
+        body = rec[sp - i + 1:-1]
+        key, sep, val = body.partition(b"=")
+        if sep != b"=":
+            fail("could not inspect the archive")
+        out[key.decode("utf-8", "surrogateescape")] = val.decode("utf-8", "surrogateescape")
+        i += length
+    return out
+
+def bad_name(name):
+    return name == "" or "\0" in name or name.startswith("/") or ".." in name.split("/")
+
+def read_exact(fh, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = fh.read(n - len(buf))
+        if not chunk:
+            return buf
+        buf += chunk
+    return buf
+
+path = sys.argv[1]
+pending = None
+global_path = None
+try:
+    with gzip.open(path, "rb") as fh:
+        while True:
+            block = read_exact(fh, 512)
+            if not block:
+                break
+            if len(block) != 512:
+                fail("could not inspect the archive")
+            if block == b"\0" * 512:
+                break
+            if not checksum_ok(block):
+                fail("could not inspect the archive")
+            size = tar_number(block[124:136])
+            if size < 0:
+                fail("could not inspect the archive")
+            blocks = (size + 511) // 512
+            payload = read_exact(fh, blocks * 512)
+            if len(payload) != blocks * 512:
+                fail("could not inspect the archive")
+            payload = payload[:size]
+            typ = block[156:157]
+            if typ == b"L":
+                pending = cstr(payload)
+                continue
+            if typ == b"K":
+                continue
+            if typ in (b"x", b"X"):
+                rec = parse_pax(payload)
+                if "path" in rec:
+                    pending = rec["path"]
+                continue
+            if typ == b"g":
+                rec = parse_pax(payload)
+                if "path" in rec:
+                    global_path = rec["path"]
+                continue
+            if pending is not None:
+                name = pending
+                pending = None
+            elif global_path is not None:
+                name = global_path
+            else:
+                name = header_name(block)
+            if bad_name(name):
+                fail("refusing archive entry " + name)
+            if typ not in (b"0", b"\0", b"5"):
+                fail("refusing an archive entry that is not a regular file or directory")
+except SystemExit:
+    raise
+except Exception:
+    fail("could not inspect the archive")
+IBX_TAR
+) || rc=$?
+	[ "$rc" = 0 ] || die "${msg:-could not inspect the archive}"
 }
 
 get_tree() { # box remote-src local-dst

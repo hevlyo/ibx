@@ -5,6 +5,21 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). The version is the one `ibx --version` prints.
 Plugin manifests carry the same version as `ibx --version`.
 
+## 0.3.1 - 2026-10-29
+
+### Fixed
+
+- `ibx run` still starts the job in a new session when `setsid` is not installed.
+  Debian sandboxes keep `setsid -f`. Otherwise `python3` calls `setsid(2)`, which is
+  what the offline mock needs on macOS, where that script runs on the CI machine.
+  If both are missing, the start fails with the setsid message.
+- `ibx get` of a directory reads each member's name and type from the tar headers
+  before extracting. `tar -t` can print a rewritten name and exit 0, so a `..` member
+  was copied. Absolute names, a `..` component, and anything other than a regular
+  file or directory are refused. The check uses python3.
+- The offline check for temporary files during a slow exec waits for that exec.
+  It was counting an earlier exec in the same group, so a busy runner looked too soon.
+
 ## 0.3.0 - 2026-10-28
 
 ### Added

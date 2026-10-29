@@ -151,7 +151,9 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
 | `ibx doctor` | Dependencies, key, org plan and usage, run budgets, Secrets, ports and token audit; each FAIL names a next step |
 
 Relative file paths live under `/data/home`; absolute paths pass through. Quote a leading
-`~/`. Upload follows a symlink at the destination. An older server with no file routes uses
+`~/`. Upload follows a symlink at the destination. A directory download reads tar headers
+with python3 and refuses an absolute name, a `..` component, or anything other than a
+regular file or directory before it extracts. An older server with no file routes uses
 the previous exec transport, warns, and keeps its 750 KB limit. A file-not-found response
 never triggers fallback. Use `git archive` or tar through SSH for directories after checking
 tracked files for secrets; never transfer `.git`, local config or credentials.

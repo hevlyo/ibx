@@ -2207,9 +2207,13 @@ t_secrets() {
 
 	rm -f "$S/spy.args"
 	ctl '{"execResults":[{"stdout":"slow\n","delay":3}]}'
+	# Earlier execs in this group already counted. Wait for this one: its reply is
+	# delayed, so the temporary directory still exists when the count moves.
+	local before
+	before=$(count POST '/exec$')
 	env PATH="$SPY:$PATH" "$IBX" exec box-1 -- 'slow job' >"$S/out" 2>"$S/err" </dev/null &
 	pid=$!
-	wait_exec 1 || bad "the slow exec did not start"
+	wait_exec $((before + 1)) || bad "the slow exec did not start"
 	yes_ "(ibx has its temporary files while the exec is in flight)" eval '[ -n "$(find "$TMPDIR" -type f -path "*/ibx.*/*")" ]'
 	yes_ "the key is in no file under TMPDIR meanwhile" eval '! grep -rqF -- "$KEY" "$TMPDIR"'
 	yes_ "and those files are private (umask 077)" eval '[ -z "$(find "$TMPDIR" -mindepth 1 \( -perm -040 -o -perm -004 \))" ]'
@@ -3402,17 +3406,56 @@ with tarfile.open(fileobj=buf, mode="w:gz") as tar:
     tar.addfile(info, io.BytesIO(data))
 open(sys.argv[1], "wb").write(buf.getvalue())
 PY
-	b64=$(base64 -w0 "$S/evil.tgz" 2>/dev/null || base64 "$S/evil.tgz" | tr -d '\n')
-	reset
-	home=$(box box-1 .home)
-	mkdir -p "$home/src"
-	printf 'x\n' >"$home/src/a.txt"
-	ctl "$(jq -n --arg b "$b64" '{faults:[{kind:"bytes",method:"GET",match:"/files/content",base64:$b,count:1}]}')" || bad "could not install the archive fault"
-	rm -rf "$S/evil-out"
-	run get box-1 src/ "$S/evil-out"
-	rc_is "a hostile archive is refused" 125
-	err_has "and names the bad entry" 'refusing archive entry'
-	yes_ "nothing was extracted" eval '[ ! -e "$S/evil-out" ] && [ ! -e "$S/evil" ]'
+	refuse_archive() { # tarball, rc description, err description, err regex, extraction description
+		local b64 home
+		if ! b64=$(base64 -w0 "$1" 2>/dev/null); then b64=$(base64 "$1" | tr -d '\n'); fi
+		reset
+		home=$(box box-1 .home)
+		mkdir -p "$home/src"
+		printf 'x\n' >"$home/src/a.txt"
+		ctl "$(jq -n --arg b "$b64" '{faults:[{kind:"bytes",method:"GET",match:"/files/content",base64:$b,count:1}]}')" || bad "could not install the archive fault"
+		rm -rf "$S/evil-out"
+		rm -f "$S/evil"
+		run get box-1 src/ "$S/evil-out"
+		rc_is "$2" 125
+		err_has "$3" "$4"
+		yes_ "$5" eval '[ ! -e "$S/evil-out" ] && [ ! -e "$S/evil" ]'
+	}
+	refuse_archive "$S/evil.tgz" "a hostile archive is refused" "and names the bad entry" 'refusing archive entry' "nothing was extracted"
+	python3 - "$S/pax.tgz" <<'PY'
+import io, tarfile, sys
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
+    info = tarfile.TarInfo("ok.txt")
+    info.pax_headers = {"path": "../evil"}
+    data = b"nope"
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+open(sys.argv[1], "wb").write(buf.getvalue())
+PY
+	refuse_archive "$S/pax.tgz" "a pax path outside the directory is refused" "and names the pax entry" 'refusing archive entry' "a pax entry extracts nothing"
+	python3 - "$S/long.tgz" <<'PY'
+import io, tarfile, sys
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tar:
+    info = tarfile.TarInfo("../" + ("e" * 120))
+    data = b"nope"
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+open(sys.argv[1], "wb").write(buf.getvalue())
+PY
+	refuse_archive "$S/long.tgz" "a GNU long name outside the directory is refused" "and names the long entry" 'refusing archive entry' "a long name extracts nothing"
+	python3 - "$S/link.tgz" <<'PY'
+import io, tarfile, sys
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    info = tarfile.TarInfo("link")
+    info.type = tarfile.SYMTYPE
+    info.linkname = "elsewhere"
+    tar.addfile(info)
+open(sys.argv[1], "wb").write(buf.getvalue())
+PY
+	refuse_archive "$S/link.tgz" "a symlink entry is refused" "and says it is not a regular file" 'not a regular file or directory' "a symlink extracts nothing"
 	run -u IBX_UPDATE_CHECK IBX_UPDATE_URL="$BASE/_release" doctor
 	rc_is "an update check does not fail doctor" 0
 	out_has "and names the newer version" '9.9.9 is available'
