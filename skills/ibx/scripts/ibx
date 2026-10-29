@@ -1551,7 +1551,9 @@ inspect_tar() { # refuse names and types from the stored headers, before extract
 	# exit 0, and the extract then succeeds. python3 reads the ustar, pax and GNU headers.
 	local msg rc=0
 	command -v python3 >/dev/null || die "could not inspect the archive: python3 is missing"
-	msg=$(python3 - "$1" <<'IBX_TAR'
+	# A here-document on python's stdin can be skipped by the shell, and python
+	# then exits 0 without reading the archive. The copy would succeed.
+	cat >"$tmp/inspect-tar.py" <<'IBX_TAR'
 import gzip, sys
 
 def fail(msg):
@@ -1680,9 +1682,10 @@ except SystemExit:
     raise
 except Exception:
     fail("could not inspect the archive")
+print("ok")
 IBX_TAR
-) || rc=$?
-	[ "$rc" = 0 ] || die "${msg:-could not inspect the archive}"
+	msg=$(python3 "$tmp/inspect-tar.py" "$1") || rc=$?
+	[ "$rc" = 0 ] && [ "$msg" = ok ] || die "${msg:-could not inspect the archive}"
 }
 
 get_tree() { # box remote-src local-dst

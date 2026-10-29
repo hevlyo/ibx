@@ -19,6 +19,9 @@ Plugin manifests carry the same version as `ibx --version`.
   file or directory are refused. The check uses python3.
 - The offline check for temporary files during a slow exec waits for that exec.
   It was counting an earlier exec in the same group, so a busy runner looked too soon.
+- Directory get writes its archive check to a program file and refuses the copy
+  unless that check finishes. Feeding the check on standard input can be skipped,
+  and the copy then succeeds.
 
 ## 0.3.0 - 2026-10-28
 

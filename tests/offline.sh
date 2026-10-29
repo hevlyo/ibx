@@ -3396,24 +3396,70 @@ t_b030() {
 	else
 		skip "directory round trip needs MOCK_EXEC=real"
 	fi
-	python3 - "$S/evil.tgz" <<'PY'
-import io, tarfile, sys
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-    info = tarfile.TarInfo("../evil")
-    data = b"nope"
-    info.size = len(data)
-    tar.addfile(info, io.BytesIO(data))
-open(sys.argv[1], "wb").write(buf.getvalue())
+	# Raw ustar bytes, not tarfile: a Python that rewrites ".." on write would
+	# make this test download a safe archive and then accept it.
+	python3 - "$S" <<'PY'
+import gzip, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+
+def header(name, size=0, typeflag=b"0", linkname=b""):
+    name_b = name.encode()
+    if len(name_b) > 100:
+        raise SystemExit("fixture name does not fit a ustar header")
+    h = bytearray(512)
+    h[0:len(name_b)] = name_b
+    def octal(off, length, value):
+        text = f"{value:0{length - 1}o}".encode()
+        h[off:off + len(text)] = text
+    octal(100, 8, 0o644)
+    octal(108, 8, 0)
+    octal(116, 8, 0)
+    octal(124, 12, size)
+    octal(136, 12, 0)
+    h[156:157] = typeflag
+    h[157:157 + len(linkname)] = linkname
+    h[257:262] = b"ustar"
+    h[263:265] = b"00"
+    for i in range(148, 156):
+        h[i] = 32
+    checksum = sum(h)
+    text = f"{checksum:06o}\x00 ".encode()
+    h[148:156] = text
+    return bytes(h)
+
+def chunk(data):
+    extra = (512 - (len(data) % 512)) % 512
+    return data + b"\0" * extra
+
+def pax(key, value):
+    n = 1
+    while n < 10000:
+        rec = f"{n} {key}={value}\n".encode()
+        if len(rec) == n:
+            return rec
+        n = len(rec)
+    raise SystemExit("pax record did not converge")
+
+def save(name, blocks):
+    (out / name).write_bytes(gzip.compress(blocks + b"\0" * 1024))
+
+data = b"nope"
+save("evil.tgz", header("../evil", len(data)) + chunk(data))
+payload = pax("path", "../evil")
+save("pax.tgz", header("././@PaxHeader", len(payload), b"x") + chunk(payload) + header("ok.txt", len(data)) + chunk(data))
+long_name = b"../" + b"e" * 120 + b"\0"
+save("long.tgz", header("././@LongLink", len(long_name), b"L") + chunk(long_name) + header("short", len(data)) + chunk(data))
+save("link.tgz", header("link", 0, b"2", b"elsewhere"))
 PY
 	refuse_archive() { # tarball, rc description, err description, err regex, extraction description
 		local b64 home
-		if ! b64=$(base64 -w0 "$1" 2>/dev/null); then b64=$(base64 "$1" | tr -d '\n'); fi
+		b64=$(python3 -c 'import base64, pathlib, sys; print(base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode())' "$1")
 		reset
 		home=$(box box-1 .home)
 		mkdir -p "$home/src"
 		printf 'x\n' >"$home/src/a.txt"
-		ctl "$(jq -n --arg b "$b64" '{faults:[{kind:"bytes",method:"GET",match:"/files/content",base64:$b,count:1}]}')" || bad "could not install the archive fault"
+		# count stays above 1: a retried GET must not fall through to the real archive
+		ctl "$(jq -n --arg b "$b64" '{faults:[{kind:"bytes",method:"GET",match:"/files/content",base64:$b,count:8}]}')" || bad "could not install the archive fault"
 		rm -rf "$S/evil-out"
 		rm -f "$S/evil"
 		run get box-1 src/ "$S/evil-out"
@@ -3422,39 +3468,8 @@ PY
 		yes_ "$5" eval '[ ! -e "$S/evil-out" ] && [ ! -e "$S/evil" ]'
 	}
 	refuse_archive "$S/evil.tgz" "a hostile archive is refused" "and names the bad entry" 'refusing archive entry' "nothing was extracted"
-	python3 - "$S/pax.tgz" <<'PY'
-import io, tarfile, sys
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.PAX_FORMAT) as tar:
-    info = tarfile.TarInfo("ok.txt")
-    info.pax_headers = {"path": "../evil"}
-    data = b"nope"
-    info.size = len(data)
-    tar.addfile(info, io.BytesIO(data))
-open(sys.argv[1], "wb").write(buf.getvalue())
-PY
 	refuse_archive "$S/pax.tgz" "a pax path outside the directory is refused" "and names the pax entry" 'refusing archive entry' "a pax entry extracts nothing"
-	python3 - "$S/long.tgz" <<'PY'
-import io, tarfile, sys
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tar:
-    info = tarfile.TarInfo("../" + ("e" * 120))
-    data = b"nope"
-    info.size = len(data)
-    tar.addfile(info, io.BytesIO(data))
-open(sys.argv[1], "wb").write(buf.getvalue())
-PY
 	refuse_archive "$S/long.tgz" "a GNU long name outside the directory is refused" "and names the long entry" 'refusing archive entry' "a long name extracts nothing"
-	python3 - "$S/link.tgz" <<'PY'
-import io, tarfile, sys
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-    info = tarfile.TarInfo("link")
-    info.type = tarfile.SYMTYPE
-    info.linkname = "elsewhere"
-    tar.addfile(info)
-open(sys.argv[1], "wb").write(buf.getvalue())
-PY
 	refuse_archive "$S/link.tgz" "a symlink entry is refused" "and says it is not a regular file" 'not a regular file or directory' "a symlink extracts nothing"
 	run -u IBX_UPDATE_CHECK IBX_UPDATE_URL="$BASE/_release" doctor
 	rc_is "an update check does not fail doctor" 0
