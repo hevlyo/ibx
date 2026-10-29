@@ -2769,8 +2769,11 @@ PYCODE
 		rc_is "unsafe Org Secret selection $fixture fails closed" 75
 		is "unsafe Secret selections receive no reservation PATCH" "$(count PATCH .)" 0
 		run IBX_ALLOW_SECRETS=1 claim --json x
-		if [ "$fixture" = '[]' ]; then rc_is "env Secrets cannot be overridden" 75
-		else rc_is "the user can explicitly allow proxy selections" 0; fi
+		case $fixture in
+		'[]') rc_is "env Secrets cannot be overridden" 75 ;;
+		'"all"') rc_is "all proxy Secrets cannot be overridden" 75 ;;
+		*) rc_is "the user can explicitly allow named proxy selections" 0 ;;
+		esac
 		if [ "$fixture" = '"all"' ]; then
 			run IBX_ALLOW_SECRETS=1 ls --json
 			is "ls still reports proxy selection risk when override is set" "$(jq -r '.[0].secrets' "$S/out")" true
@@ -2889,7 +2892,7 @@ t_guards030() {
 	run PATH="$fake:$SPY:$PATH" forward box-1 18080:8080
 	rc_is "(spied forward)" 0
 	# Each kind of curl call: api(), the stream, the upload, the download, the token revoke.
-	for h in ' -X GET -H @- .*/v1/machines' ' -X POST -H @- .*/exec$' ' -N .* -H @- .*/exec$' \
+	for h in ' -X GET -H @- .*/v1/machines' ' -w %\{http_code\} -X POST -H @- .*/exec$' ' -N .* -H @- .*/exec$' \
 		' -H @- -T ' ' -H @- --max-filesize ' ' -X DELETE -H @- .*/ssh-tokens/'; do
 		yes_ "(the spy saw the curl call /$h/)" grep -Eq -- "$h" "$S/spy.args"
 	done
@@ -2974,7 +2977,7 @@ t_guards030() {
 		rc_is "pool add with the override refuses a wildcard proxy Secret ($h)" 125
 		is "and leaves the box out of the pool" "$(box box-1 '.metadata["ibx.pool"] // "none"')" none
 	done
-	reset '"seed":{"count":1},"set":{"box-1":{"secrets":{"secrets":"all","envSecrets":[],"items":[{"name":"SCOPED","delivery":"proxy","hosts":["api.example.com"]}],"version":0}}}'
+	reset '"seed":{"count":1},"set":{"box-1":{"secrets":{"secrets":["SCOPED"],"envSecrets":[],"items":[{"name":"SCOPED","delivery":"proxy","hosts":["api.example.com"]}],"version":0}}}'
 	run IBX_ALLOW_SECRETS=1 claim --json x
 	rc_is "the proxy override still allows a proxy Secret for named hosts" 0
 	for h in null '[]' '["*"]' '"*"'; do
@@ -3082,18 +3085,18 @@ t_guards030() {
 	is "then the start falls back to this computer's clock, never an old updatedAt" \
 		"$(box box-1 '.metadata["ibx.claim.start"] != .updatedAt')" true
 
-	# A stream answered with a refusal the exec route sends before the command starts (plain
-	# JSON 4xx, a retryable 503 host_unavailable dial failure) never started the command.
-	for code in '503,"code":"host_unavailable","retryable":true' '409,"code":"operation_conflict"'; do
-		reset "\"faults\":[{\"kind\":\"error\",\"method\":\"POST\",\"match\":\"/exec\$\",\"status\":$code}]"
-		run exec box-1 --stream -- true
-		rc_is "a plain JSON stream refusal fails with 125 (${code%%,*})" 125
-		err_has "and says the command did not run" 'exec did not run: the API'
-		is "without a retry" "$(count POST '/exec$')" 1
-	done
-	# Any other reply without a stream may come after the command started: a 500, a 503 that
-	# says it cannot be retried, a gateway's page, a buffered result cut off mid-body.
-	for f in '"kind":"error","status":500,"code":"internal"' '"kind":"error","status":503,"code":"host_unavailable","retryable":false' \
+	# A stream answered with a 4xx error envelope never started the command.
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict"}]'
+	run exec box-1 --stream -- true
+	rc_is "a plain JSON stream refusal fails with 125 (409)" 125
+	err_has "and says the command did not run" 'exec did not run: the API'
+	is "without a retry" "$(count POST '/exec$')" 1
+
+	# Any other reply without a stream may come after the command started, including every
+	# 503: retryable host_unavailable can also mean an API restart killed a running command.
+	for f in '"kind":"error","status":500,"code":"internal"' '"kind":"error","status":503,"code":"host_unavailable","retryable":true' \
+		'"kind":"error","status":503,"code":"host_unavailable","retryable":false' '"kind":"error","status":403,"body":"<html>Forbidden</html>"' \
+		'"kind":"error","status":401,"body":"<html>Unauthorized</html>"' \
 		'"kind":"error","status":502,"body":"<html><body>502 Bad Gateway</body></html>"' '"kind":"drop","plain":true'; do
 		reset "\"execResults\":[{\"stdout\":\"hi\\n\"}],\"faults\":[{\"method\":\"POST\",\"match\":\"/exec\$\",$f}]"
 		run exec box-1 --stream -- 'echo hi'
@@ -3146,7 +3149,125 @@ PYCODE
 		"$(jq -c '.[] | select(.name == "box-1") | .runtime.processesPreserved' "$S/out")" false
 }
 
-for t in ownership guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
+t_review_a_r2() {
+	group "part A round 2: physical paths, named Secrets and doctor failure reasons"
+	local cwd=$PWD home selected items action route label pid source
+	reset '"seed":{"count":1}'
+	home=$(box box-1 .home)
+	printf 'original\n' >"$S/notes"
+	printf 'newline file\n' >"$S/notes"$'\n'
+	printf 'keep remote\n' >"$home/newline"
+	mkdir "$S/cdpath-src"
+	cp "$S/notes" "$S/cdpath-src/notes"
+	cd "$S" || return
+	run CDPATH="$S" put box-1 cdpath-src/notes cdpath
+	cd "$cwd" || return
+	rc_is "put accepts relative paths with exported CDPATH" 0
+	yes_ "CDPATH does not change the uploaded file" cmp -s "$S/notes" "$home/cdpath"
+	run put box-1 "$S/notes"$'\n' newline
+	rc_is "put refuses a physical path that lost a trailing newline" 125
+	yes_ "a truncated source path cannot replace the remote file" grep -qx 'keep remote' "$home/newline"
+	ln -s "$S/notes" "$S/regular-link"
+	run put box-1 "$S/regular-link" regular-link
+	rc_is "put still accepts a symlink to a regular file" 0
+	yes_ "and uploads its target" cmp -s "$S/notes" "$home/regular-link"
+	ln -s "$S/notes"$'\n' "$S/newline-link"
+	run put box-1 "$S/newline-link" newline
+	rc_is "put refuses a symlink whose target lost a trailing newline" 125
+	yes_ "a truncated symlink target cannot replace the remote file" grep -qx 'keep remote' "$home/newline"
+	cd "$(dirname "$here")/.." || return
+	# A relative script path exercises install.sh's source-directory lookup.
+	env CDPATH="$PWD" bash "$(basename "$(dirname "$here")")/install.sh" --agents none --no-bin --dry-run >"$S/out" 2>"$S/err"
+	RC=$? TIMEDOUT=
+	cd "$cwd" || return
+	rc_is "install accepts a relative script path with exported CDPATH" 0
+
+	if [ -f /proc/self/environ ]; then
+		# This stable process contains only public, synthetic values. /proc/self is also checked
+		# separately because phys resolves it through a short-lived command-substitution shell.
+		env -i PATH="$PATH" IBX_TEST_VALUE=synthetic sleep 60 &
+		pid=$!
+		ln -s "/proc/$pid/environ" "$S/pseudo-link"
+		for action in true false; do
+			for source in /proc/self/environ "/proc/$pid/environ" "$S/pseudo-link"; do
+				reset "\"seed\":{\"count\":1},\"filesEnabled\":$action"
+				home=$(box box-1 .home)
+				printf 'keep remote\n' >"$home/pseudo"
+				# Only synthetic values reach this child, even when testing the unfixed helper.
+				env -i PATH="$PATH" HOME="$HOME" TMPDIR="$TMPDIR" IBX_STATE_DIR="$IBX_STATE_DIR" \
+					IBX_KEY_FILE="$IBX_KEY_FILE" IBX_AGENT_NAME=tester INSTABOX_API_URL="$BASE" \
+					INSTABOX_API_KEY="$KEY" "$IBX" put --force box-1 "$source" pseudo >"$S/out" 2>"$S/err" </dev/null
+				RC=$? TIMEDOUT=
+				rc_is "put refuses pseudo-files and aliases even with --force ($source, file routes $action)" 125
+				err_has "and asks for a named file" 'put copies a named file'
+				is "pseudo-files are refused before any API request" "$(ncalls)" 0
+				yes_ "and preserve the remote file" grep -qx 'keep remote' "$home/pseudo"
+			done
+		done
+		kill "$pid" 2>/dev/null
+		wait "$pid" 2>/dev/null
+	else skip "pseudo-file guard needs Linux /proc/self/environ"; fi
+
+	for items in '[]' '[{"name":"SCOPED","delivery":"proxy","hosts":["api.example.com"]}]'; do
+		for action in claim pool; do
+			reset '"seed":{"count":1,"pool":[0]}'
+			selected=$(jq -cn --argjson items "$items" '{secrets:"all",envSecrets:[],items:$items,version:0}')
+			ctl "$(jq -cn --argjson s "$selected" '{set:{"box-1":{secrets:$s}}}')"
+			if [ "$action" = claim ]; then
+				ctl '{"set":{"box-1":{"mergeMetadata":{"ibx.pool":"1"}}}}'
+				run IBX_ALLOW_SECRETS=1 claim --json x
+				rc_is "claim refuses all future proxy Secrets even when current items are $items" 75
+			else
+				run IBX_ALLOW_SECRETS=1 pool add box-1
+				rc_is "pool add refuses all future proxy Secrets even when current items are $items" 125
+			fi
+			is "all selection causes no metadata write" "$(count PATCH .)" 0
+		done
+	done
+	reset '"seed":{"count":1,"pool":[0]},"set":{"box-1":{"secrets":{"secrets":["SCOPED"],"envSecrets":[],"items":[{"name":"SCOPED","delivery":"proxy","hosts":["api.example.com"]}],"version":0}}}'
+	run IBX_ALLOW_SECRETS=1 pool add box-1
+	rc_is "pool add accepts an explicitly named scoped proxy Secret with the override" 0
+	is "and admits that box" "$(box box-1 '.metadata["ibx.pool"]')" 1
+	reset '"seed":{"count":1},"set":{"box-1":{"secrets":{"secrets":[],"envSecrets":[],"items":[{"name":"WIDE","delivery":"proxy","hosts":["*"]}],"version":0}}}'
+	run IBX_ALLOW_SECRETS=1 claim --json x
+	rc_is "empty selections cannot hide an effective wildcard proxy Secret" 75
+	is "and reserve nothing" "$(count PATCH .)" 0
+
+	reset '"seed":{"count":1},"faults":[{"kind":"drop","method":"GET","match":"/machines/.*/secrets$","before":true,"count":20}]'
+	run doctor
+	rc_is "doctor fails for a dropped Secret inspection connection" 125
+	out_has "and extracts the envelope after curl's own diagnostic lines" '^FAIL +could not inspect the Org Secrets of box-1 \(transport: curl exit 52 on GET /v1/machines/.*/secrets\)$'
+	for route in '^/v1/orgs/[^/]+$' '/ssh-tokens$' '^/v1/ports$'; do
+		case $route in
+		'^/v1/orgs/[^/]+$') label='could not read the org plan' ;;
+		'/ssh-tokens$') label='could not audit SSH tokens for box-1' ;;
+		*) label='could not audit public ports' ;;
+		esac
+		reset "\"seed\":{\"count\":1},\"faults\":[{\"kind\":\"error\",\"method\":\"GET\",\"match\":\"$route\",\"status\":403,\"code\":\"missing_scope\",\"message\":\"mock: audit denied\",\"count\":10}]"
+		run doctor
+		rc_is "doctor fails for a refused audit ($route)" 125
+		out_has "and includes that audit's API reason" "^FAIL +$label \\(missing_scope: mock: audit denied\\)$"
+		yes_ "and supplies a next step" fail_next
+	done
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"/machines/.*/secrets$","status":502,"body":"<html>Bad\u001bGateway</html>","count":10}]'
+	run doctor
+	rc_is "doctor fails for an HTML gateway error" 125
+	out_has "and falls back to cleaned raw text" '^FAIL +could not inspect the Org Secrets of box-1 \(<html>BadGateway</html>\)$'
+	yes_ "raw diagnostics print no control characters" eval '! has_ctl "$S/out"'
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/machines$","status":403,"code":"missing_scope","message":"mock: machines:read required","count":10}]'
+	run doctor
+	rc_is "doctor fails when a key cannot read the sandbox list" 125
+	out_has "and names the missing list scope" '^FAIL +could not list sandboxes \(missing_scope: mock: machines:read required\)'
+	out_has "with the fatal key-replacement next step" '^      next: the user fixes or replaces this key'
+	out_lacks "without reporting an empty pool" 'pool is empty|pool add'
+	is "and skips the public-port audit" "$(count GET '^/v1/ports$')" 0
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":403,"code":"missing_scope","message":"mock: machines:write required","count":10}]'
+	run keepalive --all
+	rc_is "a key that can list boxes but cannot write leases exits 1" 1
+	out_has "and reports a failed lease" '^box-1: FAILED .*missing_scope'
+}
+
+for t in review_a_r2 ownership guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
 	put_guard poolonly vault hostile secrets ssh install cleanup; do
 	want "$t" && "t_$t"
 done

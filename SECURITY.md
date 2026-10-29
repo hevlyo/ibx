@@ -39,9 +39,12 @@ In scope, this repository:
   `ibx claim` handing out a sandbox that the Vault writes secrets into without
   `IBX_ALLOW_VAULT=1`; accepting selected, pending or residual Org Secrets without an explicit
   user proxy-only override, or accepting env Secrets, an unknown delivery or a proxy Secret for
-  every host with that override;
+  every host or the future-inclusive `all` selection with that override (proxy Secrets must
+  be selected by name and scoped to named hosts);
   `ibx put` accepting a file that its credential rules should refuse, or uploading another
-  file than the one named (curl globbing, `-` or `/dev/stdin` read as curl's stdin);
+  file than the one named (curl globbing, truncated newline paths, `-` or `/dev/stdin` read as
+  curl's stdin), or accepting a physical source under `/proc`, `/sys` or `/dev`, even with
+  `--force`;
   the key going to a host other than `api.instabox.sh` without `IBX_ALLOW_CUSTOM_API=1`;
   control characters from the API reaching the terminal; command injection through names,
   paths or API replies.

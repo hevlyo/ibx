@@ -15,6 +15,7 @@ if [ -z "${BASH_VERSION:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ] ||
 	printf 'ibx: needs bash >= 4.4 (this is %s). macOS: brew install bash\n' "${BASH_VERSION:-not bash}" >&2 || true
 	exit 125
 fi
+unset CDPATH
 set -euo pipefail
 shopt -s inherit_errexit
 umask 077
@@ -42,6 +43,7 @@ Agents
                                          --stream opts into SSE; a dropped stream kills the command
   ibx put [--force] <box> <local> <remote>
                                          copy a file in (up to 5 GiB; relative paths under HOME).
+                                         Named regular files only; refuses /proc, /sys, /dev even with --force.
                                          Refuses files that look like credentials unless --force
   ibx get <box> <remote> [local]         copy a file out (binary safe; IBX_GET_MAX defaults to 2G)
   ibx ssh <box> [--] [cmd...]          ssh through a 1-hour token revoked on exit; streams stdio:
@@ -80,10 +82,10 @@ ${XDG_CONFIG_HOME:-~/.config}/instabox/api-key), INSTABOX_API_URL (https://api.i
 another host needs IBX_ALLOW_CUSTOM_API=1), IBX_AGENT_NAME (shown in reservations; default a
 pseudonymous id of this user, host and known agent session), IBX_STALE_SECS (reservation age
 that counts as abandoned, 86400), IBX_ALLOW_ANY=1 (user-only: bypass pool and holder checks), IBX_ALLOW_VAULT=1
-(claim sandboxes that receive Vault secrets), IBX_ALLOW_SECRETS=1 (proxy Secrets scoped to
-named hosts only, user-only; env Secrets, unknown delivery and every-host proxy Secrets stay
-refused), IBX_GET_MAX (download cap, default 2G), IBX_MAX_CLAIMS (live reservations per agent,
-default 3; 0 disables the cap), IBX_STATE_DIR (an atomic mkdir lock, default directory
+(claim sandboxes that receive Vault secrets), IBX_ALLOW_SECRETS=1 (proxy Secrets selected by
+name and scoped to named hosts only, user-only; the "all" selection, env Secrets, unknown
+delivery and every-host proxy Secrets stay refused), IBX_GET_MAX (download cap, default 2G),
+IBX_MAX_CLAIMS (live reservations per agent, default 3; 0 disables the cap), IBX_STATE_DIR (an atomic mkdir lock, default directory
 ${XDG_STATE_HOME:-~/.local/state}/ibx).
 claim, renew and release accept --json anywhere after the command. JSON includes warnings;
 errors have error.code (no_free_sandbox, claim_limit, lock_busy, auth, account_blocked, failed,
@@ -526,7 +528,7 @@ org_secrets_off() { # 0 when GET /v1/usage says this server has no Org Secrets; 
 # secrets_state id: 0 clean, only on an explicit empty selection; 1 Secrets are selected, pending or
 # left behind; 2 they could not be inspected (API error, unexpected reply). Never prints values.
 # A 404 counts as a server without Org Secrets only when usage says so. IBX_ALLOW_SECRETS=1 also
-# accepts selected proxy Secrets scoped to named hosts, nothing else.
+# accepts proxy Secrets selected by name and scoped to named hosts, never "all".
 secrets_state() {
 	local r rc=0
 	if ! r=$(api GET "/v1/machines/$1/secrets" 2>"$tmp/serr"); then
@@ -539,7 +541,7 @@ secrets_state() {
 		((.items // []) | type == "array") and ((.guest.items // []) | type == "array" and length == 0) and
 		(.proxy.state != "pending") and (.guest.state != "pending") and
 		(if $allow == "1" then all(.items[]?; scoped_proxy) else (.items // []) == [] end)
-		or ($allow == "1" and (.secrets | type == "array" or . == "all") and
+		or ($allow == "1" and (.secrets | type == "array" and all(.[]; type == "string")) and
 		 ((.envSecrets // []) == []) and ((.guest.items // []) == []) and
 		 (.guest.state != "pending") and (.proxy.state != "pending") and
 		 (.items | type == "array") and all(.items[]; scoped_proxy))' <<<"$r" >/dev/null || rc=$?
@@ -833,16 +835,13 @@ stream_exec() { # id timeout: stdout/stderr pass through; only pre-start JSON re
 		[ "$rc" = 0 ] && [ -n "$exit_seen" ] || die "exec stream closed without a complete result; the command was killed and may have run partly; check before retrying"
 		return 0
 	fi
-	# The exec route answers errors found before the command starts (400, 404, 409, 429, a 503
-	# dial failure) as plain JSON instead of a stream, and auth (401, 403) comes before that too.
-	# Only those mean "did not run": a 2xx, a 500, a 503 the API says cannot be retried, a
-	# gateway's page or a reply cut off may come after the command started.
-	if { [[ $status == 4[0-9][0-9] ]] && jq -e '.error.code | type == "string"' "$tmp/sse-body" >/dev/null 2>&1; } ||
-		{ [ "$status" = 503 ] && jq -e '.error.code == "host_unavailable" and .error.retryable == true' "$tmp/sse-body" >/dev/null 2>&1; }; then
+	# Only a 4xx error envelope establishes that the command did not run. Every 503 is
+	# ambiguous: host_unavailable also covers an API restart that kills a running command.
+	if [[ $status == 4[0-9][0-9] ]] && jq -e '.error.code | type == "string"' "$tmp/sse-body" >/dev/null 2>&1; then
 		exec_phase=not_started
 	fi
 	cp "$tmp/sse-body" "$tmp/err"
-	api_refusal "$status" "$tmp/err"
+	[ "$exec_phase" != not_started ] || api_refusal "$status" "$tmp/err"
 	case $status in
 	2??) if [ "$rc" = 0 ] && jq -e 'has("exitCode")' "$tmp/sse-body" >/dev/null; then R=$(cat "$tmp/sse-body"); return 0; fi ;;
 	esac
@@ -867,6 +866,10 @@ exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call i
 			exec_phase=yes
 			return 0
 		fi
+		if [ -n "$STREAM" ] && [ "$exec_phase" != not_started ]; then
+			stderr cat "$tmp/err"
+			die "exec failed (the command may or may not have run; check before retrying)"
+		fi
 		code=$(err_code "$tmp/err")
 		# These refusals come before the command starts: an interrupt from here on says so.
 		case $code in quota_exceeded | machine_not_running | machine_cooldown | max_run_disabled | bad_request | not_found | permission_denied | bad_path) exec_phase=not_started ;; esac
@@ -888,7 +891,6 @@ exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call i
 		bad_request | unauthenticated | api_key_expired | api_key_revoked | permission_denied | insufficient_scope | not_found | bad_path)
 			stderr cat "$tmp/err"; die "exec rejected (the command did not run)" ;;
 		host_unavailable)
-			if [ -n "$STREAM" ] && [ "$exec_phase" = not_started ]; then stderr cat "$tmp/err"; die "exec did not run: the API could not reach the sandbox before the stream started"; fi
 			[ -n "$safe" ] || die "exec was cut off (the API server restarted; the command may have run partly and was killed; check before retrying)"
 			if [ "$(jq -r '.error.retryable // false' <"$tmp/err")" = true ] && [ $SECONDS -lt $end ]; then sleep_for 5; continue; fi
 			stderr cat "$tmp/err"; die "exec failed (the command may or may not have run; check before retrying)" ;;
@@ -1394,12 +1396,13 @@ put)
 	[ -r "$src" ] || die "cannot read $src"
 	# /dev/stdin and the fd names are whatever stdin and fds the process opening them has (curl's
 	# stdin carries the key header): refuse names that stay such an alias, and use the physical
-	# path for every read below, so the bytes checked are the bytes sent.
+	# path for every read below. Pseudo-files can expose process environments or lie about size;
+	# the identity check also refuses paths that phys truncated at a trailing newline.
 	path=$(phys "$src")
 	for p in "$src" "$path"; do
-		case $p in /dev/stdin | /dev/stdout | /dev/stderr | /dev/fd/* | /proc/*/fd/*) die "put copies a named file, not $src: give the file's own path" ;; esac
+		case $p in /proc | /proc/* | /sys | /sys/* | /dev | /dev/*) die "put copies a named file, not $src: give the file's own path" ;; esac
 	done
-	[ -f "$path" ] && [ -r "$path" ] || die "cannot read $src"
+	[ -f "$path" ] && [ -r "$path" ] && [ "$src" -ef "$path" ] || die "cannot read $src"
 	if [ -z "$force" ] && { looks_secret "$src" || looks_secret "$path"; }; then
 		die "$src looks like a credential; credentials never go to a sandbox (--force if it is really not one)"
 	fi
@@ -1602,10 +1605,14 @@ doctor)
 		bad=1
 	}
 	note() { printf 'warn  %s\n' "$*"; }
-	why() { # error-file -> " (code: message)" of the API error in it, or nothing
+	why() { # error-file -> " (code: message)", or cleaned raw text if no envelope was found
 		local e
-		e=$(jq -r "$JQ_DEFS"' try ([.error.code, .error.message] | map(select(type == "string") | clean) | join(": ")) catch ""' "$1" 2>/dev/null | head -c 300 | printable)
-		[ -z "$e" ] || printf ' (%s)' "$e"
+		[ -s "$1" ] || return 0
+		e=$(jq -Rr "$JQ_DEFS"' fromjson? | .error? | [.code?, .message?] |
+			map(select(type == "string") | clean) | join(": ") | select(length > 0)' "$1" 2>/dev/null | printable)
+		[ -n "$e" ] || e=$(head -c 300 "$1" | printable)
+		e=${e//$'\n'/ } e=${e//$'\r'/ } e=${e//$'\t'/ }
+		[ -z "$e" ] || printf ' (%s)' "${e:0:300}"
 	}
 	ok "ibx $IBX_VERSION, bash $BASH_VERSION"
 	ok "agent: $AGENT ($AGENT_SOURCE); IBX_MAX_CLAIMS=$MAX_CLAIMS"
@@ -1652,7 +1659,7 @@ doctor)
 				fi
 			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | [.id, (.name | clean), (vaulton | tostring)] | join("\u001f")' <<<"$ms")
 			orgid=$(jq -r '.orgId // empty' <<<"$me")
-			if [[ $orgid =~ ^[A-Za-z0-9_-]+$ ]] && org=$(api GET "/v1/orgs/$orgid"); then
+			if [[ $orgid =~ ^[A-Za-z0-9_-]+$ ]] && org=$(api GET "/v1/orgs/$orgid" 2>"$tmp/orgplanerr"); then
 				ok "org: $(jq -c '{tier,freeSandboxHoursLimit:.limits.freeSandboxHours,freeSandboxHoursUsed:.usage.freeSandboxHours,startsPerMinute:.limits.startsPerMinute,cardMissingAt,disabledAt}' <<<"$org" | printable); 0 free hours means no cap"
 				if [ "$(jq -r .tier <<<"$org")" = free ] && command -v systemctl >/dev/null &&
 					systemctl --user cat ibx-keepalive.service 2>/dev/null | grep -q -- '--all'; then note "keepalive --all cycles every free box through 8-hour max-run pauses and uses free hours"; fi
@@ -1667,7 +1674,7 @@ doctor)
 					case $(err_code "$tmp/orgerr") in missing_scope | insufficient_scope) next="the user gives this key the machines:read scope" ;; esac
 					no "could not audit Org Secrets$(why "$tmp/orgerr")" "$next"
 				fi
-			else no "could not read the org plan" "run ibx doctor again; the key needs to belong to the org (GET /v1/orgs/ID)"; fi
+			else no "could not read the org plan$(why "$tmp/orgplanerr")" "run ibx doctor again; the key needs to belong to the org (GET /v1/orgs/ID)"; fi
 			while IFS=$'\037' read -r id name; do
 				[ -n "$id" ] || continue
 				secret_rc=0
@@ -1677,17 +1684,17 @@ doctor)
 				2) no "could not inspect the Org Secrets of $name$(why "$tmp/serr")" "run ibx doctor again; claim skips the box until it can be inspected" ;;
 				esac
 				ok "$name run budget: $(jq -c --arg id "$id" "$JQ_DEFS"' .[] | select(.id == $id) | {maxRunMinutes,pausesAt:pauses,cooldownUntil}' <<<"$ms" | printable)"
-				if tokens=$(api GET "/v1/machines/$id/ssh-tokens"); then
+				if tokens=$(api GET "/v1/machines/$id/ssh-tokens" 2>"$tmp/tokenerr"); then
 					while IFS= read -r token_name; do [ -z "$token_name" ] || note "$name has a long-lived SSH token: $token_name"; done < <(jq -r "$JQ_DEFS"' .tokens[]? | select(.revokedAt == null) | (.expiresAt | timestamp) as $e | select($e == null or $e > now + 3600) | .name | clean' <<<"$tokens")
-				else no "could not audit SSH tokens for $name" "run ibx doctor again"; fi
+				else no "could not audit SSH tokens for $name$(why "$tmp/tokenerr")" "run ibx doctor again"; fi
 			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | [.id,(.name | clean)] | join("\u001f")' <<<"$ms")
 			if [ -z "$ms" ]; then :
-			elif allports=$(api GET /v1/ports); then
+			elif allports=$(api GET /v1/ports 2>"$tmp/porterr"); then
 				while IFS=$'\037' read -r name port reserved; do
 					[ -n "$name" ] || continue
 					if [ "$reserved" = false ]; then no "$name has a public port without a reservation: $port" "if nobody needs it: ibx unport $name $port"; else note "$name has a non-ibx public port: $port"; fi
 				done < <(jq -r --argjson ms "$ms" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"' .ports[]? as $p | $ms[] | select(inpool and .id == $p.machineId) | (free($now;$stale) | not) as $held | select($held == false or (($p.name // "") | startswith("ibx:") | not)) | [(.name | clean),($p.port | tostring),($held | tostring)] | join("\u001f")' <<<"$allports")
-			else no "could not audit public ports" "run ibx doctor again"; fi
+			else no "could not audit public ports$(why "$tmp/porterr")" "run ibx doctor again"; fi
 
 			if r=$(api GET /v1/usage 2>/dev/null); then ok "limits: $(jq -c '.limits | {maxMachines, machineSpec}' <<<"$r")"; fi
 		else

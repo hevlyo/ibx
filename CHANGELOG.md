@@ -22,7 +22,8 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
   output, kill the command on disconnect, and never repeat partly-run work. Buffered exec stays
   the default and the 600-second timeout still applies.
 - Fail-closed Org Secret selection, application-state and guest-residue checks in claim,
-  pool add and doctor. The user-only IBX_ALLOW_SECRETS permits proxy Secrets, never env Secrets.
+  pool add and doctor. The user-only IBX_ALLOW_SECRETS permits proxy Secrets selected by name
+  and scoped to named hosts, never the `all` selection or env Secrets.
 - Claim and list output include pausesAt and cooldownUntil. Claim prefers larger run budgets.
 - Private `ibx forward` localhost tunnels share SSH host pinning and one-hour token cleanup.
 - Doctor shows the concrete org plan, free-hour usage and limits, run budgets, unsafe Secrets,
@@ -30,7 +31,8 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
 - JSON errors distinguish auth and account_blocked, with cleaned server hints and scopes.
 - `ls --json` rows include the API's `runtime` (`ready`, `processesPreserved`), so agents can
   check whether processes survived a wake. Every doctor FAIL line is followed by its next step,
-  and a failed audit shows the API's reason. A sandbox list doctor cannot read is reported as
+  and a failed audit shows the API's reason, even after curl diagnostics, or cleaned raw text
+  for a gateway error. A sandbox list doctor cannot read is reported as
   such, never as an empty pool.
 - README tables of exit codes and environment variables, updated for 0.3.0.
 - Dated platform research and decisions in docs/research/2026-10-27-instabox-changes.md.
@@ -48,24 +50,27 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
   report an unknown pause as null, doctor still lists such SSH tokens.
 - Claim exits 125 (an API failure), not 75, when it cannot inspect a box's Org Secrets; pool
   add and doctor tell "could not inspect" apart from "Secrets are selected".
-- IBX_ALLOW_SECRETS accepts only proxy Secrets scoped to named hosts, in claim and pool add;
-  an unknown delivery kind, `*` or omitted or empty hosts (every host) fail closed. Doctor
+- IBX_ALLOW_SECRETS accepts only proxy Secrets selected by name and scoped to named hosts,
+  in claim and pool add; `all` remains refused because it includes future Secrets, even when
+  today's effective items are empty or scoped. An unknown delivery kind, `*` or omitted or empty hosts (every host) fail closed. Doctor
   fails for such a proxy Org Secret, and accepts a 404 from the org Secrets route when usage
   says the server has no Org Secrets.
 - `ibx.claim.start` holds the server's time of the claim (the `updatedAt` of the claim's PATCH
   reply, when the PATCH moved it), so release's port cleanup does not depend on the local clock.
 - An interrupt says whether the remote command had started or had finished. In `--stream`
-  mode only the exec route's pre-start refusals (a 4xx error envelope, a retryable 503
-  host_unavailable) mean the command did not run; any other reply without a stream (2xx cut
-  off, 500, a gateway's page) says it may have run.
+  mode only a 4xx reply with an error envelope means the command did not run. Every 503,
+  including retryable host_unavailable, and other replies without a stream (2xx cut off, 500,
+  a gateway's page) say it may have run: an API restart can kill partly-run work and return 503.
 - User exec never retries host_unavailable, even when retryable. Cooldown and quota refusals
   remain safe to wait out. New and older credential codes are recognized.
 - Official streaming file routes replace base64 exec for put/get. Put accepts up to 5 GiB and
   verifies SHA-256; get stages output with IBX_GET_MAX, default 2G. Only route-not-found on an
   older server enables the previous 750 KB transport, with a warning. Upload follows symlinks.
   File names reach curl literally (`-g`, `./` prefix): `{a,b}` and `[...]` are not expanded,
-  and a file named `-` is a file, not stdin. Put refuses `/dev/stdin` and fd names and hands
-  curl the file's physical path, so no alias of curl's stdin reaches it.
+  and a file named `-` is a file, not stdin. Put verifies that its physical path names the
+  same file, refusing paths that lose trailing newlines. The helper and installer ignore
+  exported CDPATH. Put refuses `/dev/stdin`, fd names and physical paths under `/proc`,
+  `/sys` or `/dev`, even with --force, and hands curl the file's physical path.
 - Release removes all ports created during the reservation, whatever their names, using stable
   ibx.claim.start. Renew changes only the activity timestamp. Older non-ibx ports remain warned.
 - Billing blocks stop claim after the first affected candidate. Interrupts promptly close exec

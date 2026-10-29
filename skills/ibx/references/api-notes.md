@@ -303,19 +303,21 @@ diagnostic audits ignore the proxy override. `ls --json` rows also carry the Mac
 Claim reports a box whose Secrets it could not inspect as an API failure (125), not as busy.
 Doctor treats an Org Secret as unsafe unless it has proxy delivery and a non-empty host list
 without `*` (omitted or empty hosts mean every host, per schemas.SecretHosts); with
-`IBX_ALLOW_SECRETS=1`, claim and pool add accept only such scoped proxy Secrets. A 404 from
-GET /v1/orgs/{id}/secrets is clean only when usage says the server has no Org Secrets.
+`IBX_ALLOW_SECRETS=1`, claim and pool add accept only such scoped proxy Secrets selected by
+name. The `all` selection is refused even when its current items are empty or scoped, because
+it also selects future Secrets. A 404 from GET /v1/orgs/{id}/secrets is clean only when usage
+says the server has no Org Secrets.
 
 ## 11. Opt-in exec streaming
 
 `ibx exec BOX --stream -- CMD` sends `Accept: text/event-stream`. The parser ignores ping
 comments, forwards stdout/stderr data, and takes status and diagnostic fields from the exit
-event. A 4xx error envelope, or a retryable 503 `host_unavailable` (a dial failure), instead
-of a stream is a refusal from before the command started (per the exec route): quota,
-cooldown and not-running refusals are waited out as in buffered exec, and any other is
-reported as "did not run". Any other reply without a stream (a 2xx, a 500, a 503 the API says
-cannot be retried, a gateway's page, a reply cut off) may come after the command started and
-is reported as "may have run". An error event, transport loss or missing exit event is
+event. Only a 4xx reply with an error envelope (`.error.code` a string) means the command
+did not run: quota, cooldown and not-running refusals are waited out as in buffered exec,
+and any other is reported as "did not run". Every 503, retryable or not, is ambiguous: the
+exec route uses `host_unavailable` both for dial failure and an API restart that kills a
+running command. Those and other replies without a stream (a 2xx, a 500, a gateway's page,
+a reply cut off) are reported as "may have run". An error event, transport loss or missing exit event is
 terminal, with partial output retained and no retry.
 The server kills the process group when the stream closes. Timeouts stay at 1-600 seconds;
 streaming changes output delivery, not long-job lifecycle. Put/get never use SSE.

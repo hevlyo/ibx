@@ -143,9 +143,11 @@ Secrets. The official basic setup also creates Org Secrets; never run it in the 
 ibx checks both selections, effective items, guest residue and pending application states.
 A failed read is unsafe: claim skips the box and, if nothing else is free, exits 125 as an API
 failure rather than 75. A 404 counts as an older server only when `/v1/usage` says Org Secrets
-are disabled. The user-only `IBX_ALLOW_SECRETS` permits proxy Secrets scoped to named hosts,
-never a proxy Secret for every host, env Secrets, an unknown delivery kind or guest residue. Keep the pool org free of Org Secrets. Create pool boxes with
-`--no-vault --secrets none`; clearing proxy selection alone leaves env selection unchanged.
+are disabled. The user-only `IBX_ALLOW_SECRETS` permits proxy Secrets selected by name and
+scoped to named hosts. The `all` selection stays refused, even when today's effective items
+are empty or scoped, because it includes future Secrets. The override never permits a proxy
+Secret for every host, env Secrets, an unknown delivery kind or guest residue. Keep the pool
+org free of Org Secrets. Create pool boxes with `--no-vault --secrets none`; clearing proxy selection alone leaves env selection unchanged.
 Vault inspection also checks `applied.files` and `applied.kept`. A 403 stays unsafe, including
 workspace keys and boxes created by another member.
 
@@ -197,6 +199,10 @@ These are guards against accidents. None of them stops someone who holds the API
   `id_ed25519*`, `.netrc`, `.npmrc`, `.pypirc`, `.pgpass`, `.git-credentials`, `credentials*`,
   `*secret*`, `*token*`, `api-key`, `*.ovpn`, and anything under `.ssh/`, `.aws/`, `.gnupg/`,
   `.kube/`, `gcloud/`, `.claude/`, `.codex/` or `instabox/`, or named `.docker/config.json`.
+  Put follows symlinks and checks that the physical path still names the same regular file;
+  a path that loses trailing newlines is refused. Physical paths under `/proc`, `/sys` or
+  `/dev`, including `/dev/stdin` and fd aliases, are refused even with `--force`: pseudo-files
+  can expose process environments or report a misleading size.
   `ibx ssh` and `ibx exec -i` copy whatever they are given, and `git archive` copies every
   versioned file. The rules in section 8 still apply.
 - **SSH.** `ibx ssh` pins the host certificate authority the API returns, asks for a 1-hour

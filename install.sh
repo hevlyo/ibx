@@ -7,6 +7,7 @@
 # Written for the bash 3.2 that macOS ships (the ibx helper itself needs bash 4.4+).
 # Test hook: IBX_INSTALL_OS=Linux|Darwin overrides `uname -s`, e.g. to preview the launchd plist
 # with --dry-run on Linux.
+unset CDPATH
 set -eu
 
 usage() {

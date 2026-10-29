@@ -137,7 +137,7 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
 | `ibx claim [--json] "purpose"` | Reserve a free box, at most 3 live claims per agent by default |
 | `ibx ls [--all \| --mine] [--json]` | State, holder, next pause and cooldown; --mine finds your live pool reservations; `--json` adds Vault/Secrets risk and `runtime` |
 | `ibx exec BOX [--stream] [-t SECS] [-i] -- CMD...` | Run up to 600 seconds; default 300, text stdin up to 1 MiB |
-| `ibx put [--force] BOX LOCAL REMOTE` | Atomic upload up to 5 GiB, credential guard and SHA-256 check |
+| `ibx put [--force] BOX LOCAL REMOTE` | Atomic upload of named regular files up to 5 GiB, credential guard and SHA-256 check |
 | `ibx get BOX REMOTE [LOCAL]` | Staged binary download, default cap 2G through `IBX_GET_MAX` |
 | `ibx ssh BOX [--] [CMD...]` | Stream over SSH with a 1-hour token revoked on exit |
 | `ibx forward BOX [LOCAL:]REMOTE...` | Private localhost tunnel, held in the foreground |
@@ -242,9 +242,15 @@ SSH keys, cloud sessions and third-party personal data stay off the pool.
 Vault delivery and Org Secrets are separate. Proxy Secrets can inject credentials against
 their allowed hosts; env Secrets expose values in the VM. Wildcard hosts are unsafe, and no
 hosts means every host. Claim, pool add and doctor inspect selections and residue, failing
-closed. `IBX_ALLOW_SECRETS` is a user-only override for proxy Secrets scoped to named hosts;
+closed. `IBX_ALLOW_SECRETS` is a user-only override for proxy Secrets selected by name and
+scoped to named hosts. The `all` selection stays refused because it includes future Secrets;
 wildcard and env Secrets remain refused. All `IBX_ALLOW_*` variables
 are user decisions. See the [trust model](skills/ibx/references/trust-model.md).
+
+Put follows symlinks to regular files and checks that the physical path still names the
+original file. Paths that lose trailing newlines are refused. Sources under `/proc`, `/sys`
+or `/dev` are always refused, even with `--force`; pseudo-files can expose process environments
+or report a misleading size. The helper and installer ignore exported `CDPATH`.
 
 A preinstalled port agent (`instabox-port`, with a guest-readable credential) was found on
 box-5 on 2026-10-27, so guest code there can publish ports; assume other boxes may have it.
@@ -275,7 +281,7 @@ result and exits 125, so callers can distinguish released boxes from those needi
 |---|---|
 | The remote command's own | `exec` and `ssh` pass it through. |
 | 0 | Success. `keepalive` also exits 0 when it skips a box in cooldown, with max-run disabled, or blocked by billing (402). |
-| 1 | `keepalive` could not renew at least one lease for another reason (the lease request was refused or cut off). A bad key or an unreachable API exits 125. |
+| 1 | `keepalive` could not renew at least one lease for another reason (the lease request was refused or cut off). Failure of the initial sandbox list (for example, a bad key or unreachable API) exits 125. A key that can list boxes but lacks `machines:write` fails each lease with `missing_scope` and exits 1. |
 | 75 | No free sandbox, the agent already holds `IBX_MAX_CLAIMS` sandboxes, or another claim on this computer held the lock for 5 minutes. |
 | 124 | `exec` timed out. |
 | 125 | ibx failed: API, network, usage, a guard (credential file, Vault, Org Secrets), or a sandbox outside the pool. A claim that could not inspect a box's Secrets exits 125, not 75. |
@@ -297,7 +303,7 @@ result and exits 125, so callers can distinguish released boxes from those needi
 | `IBX_GET_MAX` | Largest download `ibx get` accepts: bytes, or a number with K, M or G. Default 2G. |
 | `IBX_ALLOW_ANY=1` | User-only: bypass pool and reservation-holder checks for agent commands. |
 | `IBX_ALLOW_VAULT=1` | Let `claim` hand out sandboxes that the Vault writes secrets into. |
-| `IBX_ALLOW_SECRETS=1` | Let `claim` hand out sandboxes with proxy Org Secrets scoped to named hosts. Proxy Secrets for every host (`*`, or no hosts), env Secrets, unknown delivery kinds, pending states and guest residue stay refused. |
+| `IBX_ALLOW_SECRETS=1` | Let `claim` and `pool add` accept proxy Org Secrets selected by name and scoped to named hosts. The `all` selection stays refused, including when its current effective items are empty. Proxy Secrets for every host (`*`, or no hosts), env Secrets, unknown delivery kinds, pending states and guest residue stay refused. |
 
 The `IBX_ALLOW_*` variables switch off safety checks. They are yours to set, and the skill tells
 agents never to set them.

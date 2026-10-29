@@ -75,8 +75,9 @@ Sources are MachineSecrets, SecretSelection, Machine.vault and llms-full.txt lin
 
 Claim, pool add and doctor now fail closed for unsafe or uninspectable selections. A 404 is
 clean only when usage says orgSecrets is disabled; result 23 showed route-not-found and
-machine-not-found share a code. The user-only IBX_ALLOW_SECRETS permits proxy Secrets, never
-env delivery, unknown delivery kinds or guest residue. The skill forbids agents to set it.
+machine-not-found share a code. The user-only IBX_ALLOW_SECRETS requires proxy Secrets
+selected by name and scoped to named hosts; `all` remains refused because it includes future
+Secrets. It never permits env delivery, unknown delivery kinds or guest residue. The skill forbids agents to set it.
 Doctor reads org metadata, warns for Secret names, and fails for env or unknown delivery and
 for wildcard hosts, including a proxy Secret whose hosts are omitted or empty (SecretHosts:
 that means `["*"]`). In-box checks print only
@@ -185,12 +186,11 @@ Two clean-context reviews of the first 0.3.0 commit found these; the choices and
   second, which the offline tests do.
 - Org Secrets that cannot be inspected make claim exit 125 (API failure), not 75; a busy pool
   and a broken inspection need different reactions from an agent.
-- In `--stream` mode the exec route says pre-start errors (400, 404, 409, 429, a 503 dial
-  failure) come back as plain JSON, so ibx reports a 4xx error envelope or a retryable 503
-  `host_unavailable` as "did not run" without retrying. Retrying them would be safe but is not
-  needed for correctness. The route does not say that every reply without a stream is one of
-  those: a 2xx cut off, a 500 or a gateway's page may come after the command started, so
-  they say "may have run".
+- In `--stream` mode only a 4xx reply with an error envelope (`.error.code` a string)
+  establishes that the command did not run. Every 503, retryable or not, says "may have run":
+  the exec route uses `host_unavailable` both for dial failure and for an API restart that
+  kills partly-run work. A 4xx HTML page, a 2xx cut off, a 500 or a gateway's page is also
+  ambiguous. Quota, cooldown and not-running refusals remain safe to wait out.
 - The mock's exec answers `409 machine_not_running` for an idle-paused box, as the exec route
   says, although the spec's lifecycle text and the prose docs say exec wakes it. ibx handles
   both, and only the 409 path needs a test.
