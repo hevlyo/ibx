@@ -97,6 +97,9 @@ jobs:
           printf '%s\n' "$out"
           [ "$out" = "ibx $(sed -n 's/^IBX_VERSION=//p' skills/ibx/scripts/ibx)" ]
 
+      - name: Version agreement
+        run: bash tests/versions.sh
+
       - name: Offline tests
         env:
           MOCK_EXEC: ${{ matrix.mock_exec }}

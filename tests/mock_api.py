@@ -77,7 +77,7 @@ import sys
 import tempfile
 import threading
 import time
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -333,7 +333,7 @@ class State:
         return out
 
     # ---- faults ----------------------------------------------------------------------------
-    def take_fault(self, method, path, kinds=("drop", "error", "delay")):
+    def take_fault(self, method, path, kinds=("drop", "error", "delay", "bytes")):
         for f in self.faults:
             if f["kind"] not in kinds or f["count"] <= 0:
                 continue
@@ -425,7 +425,7 @@ class State:
         for f in c.get("faults") or []:
             f = dict(f)
             f.setdefault("count", 1)
-            if f.get("kind") not in ("drop", "error", "delay", "conflict", "failop"):
+            if f.get("kind") not in ("drop", "error", "delay", "conflict", "failop", "bytes"):
                 raise bad_request("unknown fault kind %r" % f.get("kind"))
             self.faults.append(f)
         shortcuts = {
@@ -698,6 +698,11 @@ class Handler(BaseHTTPRequestHandler):
                 with S.lock:
                     call["status"], call["dropped"] = 0, True
                 return self.cut()
+            if fault and fault["kind"] == "bytes":
+                data = b64decode(fault.get("base64") or "")
+                with S.lock:
+                    call["status"] = 200
+                return self.reply(200, data)
             if fault and fault["kind"] == "error" and "body" in fault:
                 with S.lock:
                     call["status"] = int(fault.get("status", 502))
@@ -873,6 +878,12 @@ class Handler(BaseHTTPRequestHandler):
                         for m in S.machines.values()]})
                 if path == "/_health":
                     return self.reply(200, {"ok": True})
+                if path == "/_release":
+                    self.send_response(302)
+                    self.send_header("Location", "https://github.com/hevlyo/ibx/releases/tag/v9.9.9")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
             raise not_found()
         except ApiError as e:
             self.reply(e.status, e.body())
@@ -1208,7 +1219,7 @@ class Handler(BaseHTTPRequestHandler):
                 r = {"stdout": "", "stderr": "", "exitCode": 0, "timedOut": False,
                      "truncated": False}
                 r.update(queued)
-            elif S.exec_real:
+            elif S.exec_real or "# ibx-remote" in cmd[:800]:
                 if "text/event-stream" in self.headers.get("Accept", ""):
                     self.reply_real_stream(home, cmd, stdin, t, cwd, envs)
                     return 0, None

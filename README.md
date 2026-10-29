@@ -1,5 +1,7 @@
 # ibx
 
+![A small box returned, with the work it held set beside it](docs/readme-banner.jpg)
+
 Borrow a disposable [instabox.sh](https://instabox.sh) sandbox from a shared pool, use it, and
 give it back clean. ibx is an MIT agent skill and one bash script. It tells agents to move
 unvetted tools, public builds and tests, Docker, headless browsers, video rendering, large
@@ -46,9 +48,8 @@ The agent runs the script from the skill's directory as `bash <skill-dir>/script
 /plugin install ibx@ibx
 ```
 
-The skill shows up as `/ibx:ibx`. The plugin manifests carry no version number, so plugin
-updates follow the repository's commits. Do not also link the skill into `~/.claude/skills`, or
-Claude Code loads it twice.
+The skill shows up as `/ibx:ibx`. The plugin version matches `ibx --version`. Do not also
+link the skill into `~/.claude/skills`, or Claude Code loads it twice.
 
 > [!TIP]
 > Claude Code started with `CLAUDE_CONFIG_DIR` reads skills from `$CLAUDE_CONFIG_DIR/skills`, not

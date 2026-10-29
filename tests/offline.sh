@@ -34,6 +34,7 @@ export IBX_KEY_FILE=$S/no-key-file IBX_AGENT_NAME=tester IBX_CLAIM_SETTLE='0.2 0
 unset INSTABOX_KEY_FILE IBX_STALE_SECS IBX_MAXTIME IBX_EXEC_MAXTIME IBX_REEXEC CURL_HOME \
 	IBX_ALLOW_ANY IBX_ALLOW_VAULT IBX_ALLOW_SECRETS IBX_GET_MAX IBX_ALLOW_CUSTOM_API CODEX_HOME IBX_MAX_CLAIMS CLAUDE_CONFIG_DIR \
 	CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID IBX_TEST_CLAIM_LOCK_SECS
+export IBX_UPDATE_CHECK=0
 
 # The key reaches the mock through its environment, so no process has it in its arguments.
 TMPDIR=$S/mock MOCK_API_KEY=$KEY python3 "$MOCK" --port 0 --exec "$EXEC_MODE" >"$S/mock.port" 2>"$S/mock.log" &
@@ -3331,8 +3332,94 @@ t_review_a_r2() {
 	out_has "and reports a failed lease" '^box-1: FAILED .*missing_scope'
 }
 
+t_b030() {
+	group "jobs, exec json, directory copy, versions"
+	reset
+	run run box-1 'Bad_Name' -- true
+	rc_is "a job name outside the pattern is refused" 125
+	is "before any API call" "$(ncalls)" 0
+	run run box-1 sleep30 -- sleep 30
+	rc_is "run starts a detached job" 0
+	out_has "and prints its process group" '^started sleep30 pgid [0-9]+$'
+	pid=$(sed -n 's/^started sleep30 pgid //p' "$S/out")
+	kill -0 "$pid"
+	yes_ "the job process is alive" kill -0 "$pid"
+	run job box-1 sleep30
+	rc_is "job status succeeds" 0
+	out_has "a live job is running" '^sleep30	running	'
+	run job --json box-1
+	is "job list json names it" "$(jq -r '.jobs[0].name' "$S/out")" sleep30
+	run job box-1 sleep30 --kill
+	rc_is "kill succeeds" 0
+	out_has "kill marks the job killed" '^sleep30	killed	'
+	yes_ "the process is gone" eval '! kill -0 '"$pid"' 2>/dev/null'
+	run run box-1 sleep30 -- true
+	rc_is "a finished job is refused without --replace" 125
+	err_has "and says to pass --replace" 'pass --replace'
+	run run box-1 sleep30 --replace -- true
+	rc_is "--replace starts it again" 0
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":503,"code":"host_unavailable","retryable":true,"count":1}]'
+	run run box-1 other -- true
+	rc_is "an ambiguous start is not retried as a start" 125
+	is "one start plus one status lookup" "$(count POST '/exec$')" 2
+	run exec --json box-1 -- true
+	rc_is "exec --json succeeds" 0
+	is "exec --json reports that it ran" "$(jq -c '[.box,.ran,.exitCode]' "$S/out")" '["box-1","yes",0]'
+	reset
+	run exec --json --stream box-1 -- true
+	rc_is "--json and --stream are refused" 125
+	is "and makes no request" "$(ncalls)" 0
+	mkdir -p "$S/tree"
+	printf 'hello\n' >"$S/tree/readme.txt"
+	printf 'secret\n' >"$S/tree/.env"
+	run put --json box-1 "$S/tree" app
+	rc_is "a credential in a directory is refused" 125
+	is "with looks_secret" "$(jq -r .error.code "$S/out")" looks_secret
+	rm -f "$S/tree/.env"
+	ln -s /etc/hostname "$S/tree/escape"
+	run put box-1 "$S/tree" app
+	rc_is "a symlink out of the directory is refused" 125
+	err_has "and names the escape" 'resolves outside'
+	rm -f "$S/tree/escape"
+	if [ -n "$REAL" ]; then
+		run put --json box-1 "$S/tree" app
+		rc_is "directory put succeeds" 0
+		is "directory put json counts the file" "$(jq -r .files "$S/out")" 1
+		rm -rf "$S/got"
+		run get box-1 app/ "$S/got"
+		rc_is "directory get succeeds" 0
+		yes_ "the file came back" cmp -s "$S/tree/readme.txt" "$S/got/readme.txt"
+	else
+		skip "directory round trip needs MOCK_EXEC=real"
+	fi
+	python3 - "$S/evil.tgz" <<'PY'
+import io, tarfile, sys
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+    info = tarfile.TarInfo("../evil")
+    data = b"nope"
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+open(sys.argv[1], "wb").write(buf.getvalue())
+PY
+	b64=$(base64 -w0 "$S/evil.tgz" 2>/dev/null || base64 "$S/evil.tgz" | tr -d '\n')
+	reset
+	home=$(box box-1 .home)
+	mkdir -p "$home/src"
+	printf 'x\n' >"$home/src/a.txt"
+	ctl "$(jq -n --arg b "$b64" '{faults:[{kind:"bytes",method:"GET",match:"/files/content",base64:$b,count:1}]}')" || bad "could not install the archive fault"
+	rm -rf "$S/evil-out"
+	run get box-1 src/ "$S/evil-out"
+	rc_is "a hostile archive is refused" 125
+	err_has "and names the bad entry" 'refusing archive entry'
+	yes_ "nothing was extracted" eval '[ ! -e "$S/evil-out" ] && [ ! -e "$S/evil" ]'
+	run -u IBX_UPDATE_CHECK IBX_UPDATE_URL="$BASE/_release" doctor
+	rc_is "an update check does not fail doctor" 0
+	out_has "and names the newer version" '9.9.9 is available'
+}
+
 for t in review_a_r2 ownership guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
-	put_guard poolonly vault hostile secrets ssh install cleanup; do
+	put_guard poolonly vault hostile secrets ssh install cleanup b030; do
 	want "$t" && "t_$t"
 done
 printf '\n%d passed, %d failed in %ds\n' "$passed" "$failed" $(($(date +%s) - start))

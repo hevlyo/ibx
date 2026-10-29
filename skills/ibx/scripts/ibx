@@ -37,15 +37,25 @@ Agents
                                          The purpose must be ONE quoted argument. Write the name
                                          down: shell variables do not survive between calls.
                                          Metadata is public to the account: keep the purpose generic
-  ibx exec <box> [--stream] [-t SECS] [-i] -- <cmd> run as the sandbox user with bash -lc (HOME /data/home).
+  ibx exec [--json] <box> [--stream] [-t SECS] [-i] [--tail N] -- <cmd>
+                                         run as the sandbox user with bash -lc (HOME /data/home).
                                          Default 300 s, max 600; -i sends stdin (up to 1 MiB).
-                                         One argument = a bash script; several = one quoted command
-                                         --stream opts into SSE; a dropped stream kills the command
-  ibx put [--force] <box> <local> <remote>
-                                         copy a file in (up to 5 GiB; relative paths under HOME).
-                                         Named regular files only; refuses /proc, /sys, /dev even with --force.
-                                         Refuses files that look like credentials unless --force
-  ibx get <box> <remote> [local]         copy a file out (binary safe; IBX_GET_MAX defaults to 2G)
+                                         One argument = a bash script; several = one quoted command.
+                                         --stream opts into SSE; a dropped stream kills the command.
+                                         --json prints one object (not with --stream). --tail N keeps the
+                                         full output on the box and prints the last N lines.
+  ibx run <box> <name> [--replace] -- <cmd>
+                                         start a detached job. Prints "started NAME pgid P".
+                                         A start is never retried.
+  ibx job <box> [name] [--tail N] [--wait S] [--kill]
+                                         list jobs, or one job. --wait polls inside the box.
+                                         --kill stops its process group.
+  ibx put [--force] [--untracked] [--exclude GLOB] <box> <local> <remote>
+                                         copy a file or directory in (up to 5 GiB).
+                                         A directory is archived; credential-looking paths are refused.
+                                         --force is single-file only. Refuses /proc, /sys and /dev.
+  ibx get <box> <remote> [local]         copy a file or directory out (a remote directory ends in /).
+                                         IBX_GET_MAX defaults to 2G. Archives are checked before extract.
   ibx ssh <box> [--] [cmd...]          ssh through a 1-hour token revoked on exit; streams stdio:
                                            ibx ssh BOX 'bash -s' <script.sh
                                            tar c dir | ibx ssh BOX 'tar x'
@@ -54,9 +64,12 @@ Agents
   ibx port <box> <port> [name]           publish an HTTP port at a public URL (NO authentication)
   ibx unport <box> <port>                unpublish it
   ibx renew [--json] <box>               refresh your reservation (jobs that run past 24 h)
-  ibx release [--json] <box> | --mine   give it back: unpublish ibx and reservation-created ports,
-                                         drop its lease and reservation (--mine: all yours; needs a session/name;
-                                         a signal stops the rest and names boxes already released)
+  ibx release [--no-check] [--json] <box> | --mine
+                                         give it back: unpublish ibx and reservation-created ports,
+                                         drop its lease and reservation, stop ibx jobs and warn about
+                                         processes still running (--no-check skips that report).
+                                         --mine: all yours; needs a session/name; a signal stops the rest
+                                         and names boxes already released.
   ibx ls [--all | --mine] [--json]       pool sandboxes, state and holders (--all: every sandbox);
                                          --mine finds your live reservations; --json adds Vault/Secrets risk and runtime
 
@@ -148,8 +161,10 @@ AGENT=${AGENT//[^A-Za-z0-9@._:-]/_}
 AGENT=${AGENT:0:64}
 
 JSON=
+EXEC_JSON=
+RELEASE_NO_CHECK=
 case "$1" in
-claim | renew | release)
+claim | renew | release | exec | run | job | put | get)
 	args=()
 	for a in "$@"; do
 		if [ "$a" = --json ]; then JSON=1; else args+=("$a"); fi
@@ -159,6 +174,7 @@ claim | renew | release)
 esac
 [ -z "$JSON" ] || exec {JSON_FD}>&1 # die can run inside a command substitution
 COMMAND=$1
+[ "$COMMAND" != exec ] || [ -z "$JSON" ] || EXEC_JSON=1
 STREAM=
 EXEC_SAFE=
 SIGNAL_FD=
@@ -272,10 +288,31 @@ json_error() { # commit one complete object; only the main EXIT cleanup prints i
 	ln "$candidate" "$tmp/error" 2>/dev/null || true
 }
 fatal_check() { [ ! -s "$tmp/fatal" ] || die "API refused the request"; }
+exec_json_fail() { # api-code message: one exec --json object, then exit 125
+	local err=$1 message=$2 ran=partial
+	case $message in
+	*"did not run"* | *"did not start"* | *"rejected"*) ran=no; err=not_started ;;
+	esac
+	case $1 in
+	auth) ran=no; err=auth ;;
+	account_blocked) ran=no; err=account_blocked ;;
+	esac
+	case $message in
+	*"may have run"* | *"may or may not"* | *"cut off"* | *"was killed"*) ran=partial; err=cut_off ;;
+	esac
+	jq -n --arg box "${LABEL:-}" --arg ran "$ran" --arg err "$err" --arg m "$message" \
+		'{box:$box,ran:$ran,exitCode:null,timedOut:false,signal:null,truncated:false,invalidUtf8:false,stdout:"",stderr:"",warnings:[],error:{code:$err,message:$m}}' >"$tmp/result"
+	stderr printf 'ibx: %s\n' "$message"
+	exit 125
+}
 die() { # fatal API refusals survive command substitutions and outer handlers
 	local code=failed message="$*"
 	if [ -s "$tmp/fatal" ]; then
 		code=$(jq -r .code "$tmp/fatal") message=$(jq -r .message "$tmp/fatal")
+	fi
+	if [ -n "$EXEC_JSON" ]; then
+		EXEC_JSON=
+		exec_json_fail "$code" "$message"
 	fi
 	stderr printf 'ibx: %s\n' "$message"
 	json_error "$code" "$message" "$kept_claim"
@@ -979,7 +1016,7 @@ file_api() { # METHOD id remote-path local-file: raw bytes, bounded storage, rep
 		machine_cooldown)
 			m=$(api GET "/v1/machines/$id") || die "could not read cooldown"
 			cooldown_wait "$tmp/file-body" "$m" "$end" || die "file transfer did not run: max-run cooldown" ;;
-		not_a_file) die "destination is a directory: give the file name too" ;;
+		not_a_file) return 3 ;;
 		no_space) die "file transfer failed: disk full" ;;
 		too_large) die "file transfer failed: server limit is 5 GiB" ;;
 		*) die "file transfer failed: $(jq -r '.error.message // "API error"' "$tmp/file-body" | printable)" ;;
@@ -1095,6 +1132,11 @@ release_box() { # box: shared by literal and bulk release
 		fi
 	done <<<"$ports"
 	[ -z "$left" ] || die "these URLs are STILL PUBLIC:$left (nothing released; ibx unport $1 PORT, then release again)"
+	if [ "$(jq -r '.state // ""' <<<"$m")" = running ]; then
+		LABEL=$1
+		sweep_jobs "$id" release
+		[ -n "$RELEASE_NO_CHECK" ] || report_leftovers "$id" "$1" "$start"
+	fi
 	api DELETE "/v1/machines/$id/activity-leases/$LEASE" >/dev/null 2>&1 || true
 	set_claim "$id" '{}' || die "could not clear the reservation of $1"
 	if [ -n "$JSON" ]; then
@@ -1108,6 +1150,446 @@ release_box() { # box: shared by literal and bulk release
 	fi
 }
 
+exec_shot() { # id timeout cmd [stdin-file]: one exec, no retry. Sets R. Does not die.
+	local id=$1 t=$2
+	if [ $# -ge 4 ]; then
+		jq -n --arg c "$3" --argjson t "$t" --rawfile s "$4" '{cmd:$c, timeoutSeconds:$t, stdin:$s}' >"$tmp/exec"
+	else
+		jq -n --arg c "$3" --argjson t "$t" '{cmd:$c, timeoutSeconds:$t}' >"$tmp/exec"
+	fi
+	exec_phase=partial
+	if IBX_EXEC_MAXTIME=$((t + 30)) api POST "/v1/machines/$id/exec" "$tmp/exec" >"$tmp/exec-result" 2>"$tmp/err"; then
+		R=$(cat "$tmp/exec-result")
+		exec_phase=yes
+		return 0
+	fi
+	return 1
+}
+
+home_has() { # id absolute-path -> 0 when the file API does not answer 404
+	local code path
+	path=$(jq -rn --arg p "$2" '$p | @uri')
+	code=$(printf '%s\n' "$AUTH" | curl -q -g -sS -m 20 -o "$tmp/probe-body" -w '%{http_code}' -H @- \
+		"$API/v1/machines/$1/files/content?path=$path") || return 1
+	[ "$code" != 404 ]
+}
+
+lexnorm() { # lexical absolute path; the target need not exist
+	local IFS=/ x
+	local -a parts=()
+	for x in ${1#/}; do
+		case $x in
+		'' | .) ;;
+		..) [ "${#parts[@]}" -eq 0 ] || unset 'parts[${#parts[@]}-1]' ;;
+		*) parts+=("$x") ;;
+		esac
+	done
+	if [ "${#parts[@]}" -eq 0 ]; then printf '/\n'; else printf '/%s\n' "$(IFS=/; printf '%s' "${parts[*]}")"; fi
+}
+
+link_escapes() { # root relative-path -> 0 when a symlink resolves outside root
+	local root=$1 rel=$2 dest base norm
+	[ -L "$root/$rel" ] || return 1
+	dest=$(readlink -- "$root/$rel") || return 0
+	case $dest in
+	/*) ;;
+	*) dest=$(dirname -- "$root/$rel")/$dest ;;
+	esac
+	base=$(cd -- "$root" && pwd -P)
+	norm=$(lexnorm "$dest")
+	case "$norm/" in
+	"$base"/*) return 1 ;;
+	*) return 0 ;;
+	esac
+}
+
+job_name_ok() { [[ $1 =~ ^[a-z0-9][a-z0-9._-]{0,39}$ ]]; }
+
+job_controller() { # name replace token. The script's stdin is the user command.
+	cat <<EOF
+#!/bin/bash
+# ibx-remote
+set -u
+name=$(printf %q "$1")
+replace=$(printf %q "$2")
+token=$(printf %q "$3")
+root="\$HOME/.ibx/jobs/\$name"
+mkdir -p -- "\$HOME/.ibx/jobs"
+cmdfile=\$(mktemp "\$HOME/.ibx/jobs/.cmd.XXXXXX")
+cat >"\$cmdfile"
+boot=\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf '%s\n' noboot)
+if [ -d "\$root" ] && [ -s "\$root/pid" ] && [ ! -f "\$root/rc" ]; then
+	pid=\$(cat "\$root/pid")
+	old=\$(cat "\$root/boot" 2>/dev/null || printf '%s\n' missing)
+	if [ "\$old" = "\$boot" ] && kill -0 "\$pid" 2>/dev/null; then
+		printf '%s\n' "job \$name is already running" >&2
+		rm -f -- "\$cmdfile"
+		exit 3
+	fi
+fi
+if [ -f "\$root/rc" ] && [ "\$replace" != 1 ]; then
+	printf '%s\n' "job \$name already finished; pass --replace to run it again" >&2
+	rm -f -- "\$cmdfile"
+	exit 3
+fi
+rm -rf -- "\$root"
+mkdir -p -- "\$root"
+mv -- "\$cmdfile" "\$root/cmd"
+chmod 700 "\$root/cmd"
+date -u +%Y-%m-%dT%H:%M:%SZ >"\$root/started"
+printf '%s\n' "\$token" >"\$root/token"
+printf '%s\n' "\$boot" >"\$root/boot"
+: >"\$root/log"
+cat >"\$root/runner" <<'RUN'
+#!/bin/bash
+echo \$\$ >"\$1"
+rc=0
+bash "\$2" </dev/null >"\$3" 2>&1 || rc=\$?
+printf '%s\n' "\$rc" >"\$4.part"
+mv -f "\$4.part" "\$4"
+RUN
+chmod 700 "\$root/runner"
+command -v setsid >/dev/null || { printf '%s\n' "setsid is not installed on the sandbox" >&2; exit 4; }
+setsid -f "\$root/runner" "\$root/pid" "\$root/cmd" "\$root/log" "\$root/rc" </dev/null >/dev/null 2>&1 || {
+	printf '%s\n' "could not start job \$name" >&2
+	exit 4
+}
+i=0
+while [ "\$i" -lt 50 ]; do
+	[ -s "\$root/pid" ] && break
+	i=\$((i + 1))
+	sleep 0.05
+done
+[ -s "\$root/pid" ] || { printf '%s\n' "job \$name produced no process id" >&2; exit 4; }
+printf 'started %s pgid %s\n' "\$name" "\$(cat "\$root/pid")"
+EOF
+}
+
+job_remote() { # mode [arg] [arg]
+	cat <<EOF
+#!/bin/bash
+# ibx-remote
+set -u
+mode=$(printf %q "$1")
+arg1=$(printf %q "${2:-}")
+arg2=$(printf %q "${3:-}")
+boot_now=\$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf '%s\n' noboot)
+job_state() {
+	local d=\$1 pid old
+	if [ -f "\$d/killed" ]; then printf '%s\n' killed; return; fi
+	if [ -f "\$d/rc" ]; then printf '%s\n' exited; return; fi
+	pid=\$(cat "\$d/pid" 2>/dev/null || true)
+	old=\$(cat "\$d/boot" 2>/dev/null || printf '%s\n' missing)
+	if [ -n "\$pid" ] && [ "\$old" = "\$boot_now" ] && kill -0 "\$pid" 2>/dev/null; then printf '%s\n' running; return; fi
+	printf '%s\n' lost
+}
+job_line() {
+	local d=\$1 name st rc started elapsed= now s
+	name=\$(basename -- "\$d")
+	st=\$(job_state "\$d")
+	rc=\$(cat "\$d/rc" 2>/dev/null || true)
+	started=\$(cat "\$d/started" 2>/dev/null || true)
+	if [ -n "\$started" ]; then
+		s=\$(date -u -d "\$started" +%s 2>/dev/null || true)
+		now=\$(date -u +%s)
+		if [ -n "\$s" ]; then elapsed=\$((now - s)); fi
+	fi
+	printf '%s\t%s\t%s\t%s\t%s\n' "\$name" "\$st" "\$rc" "\$started" "\$elapsed"
+}
+stop_pid() {
+	local pid=\$1 i=0
+	[ -n "\$pid" ] || return 0
+	kill -TERM -- -"\$pid" 2>/dev/null || kill -TERM "\$pid" 2>/dev/null || true
+	while [ "\$i" -lt 10 ] && kill -0 "\$pid" 2>/dev/null; do sleep 1; i=\$((i + 1)); done
+	if kill -0 "\$pid" 2>/dev/null; then kill -KILL -- -"\$pid" 2>/dev/null || kill -KILL "\$pid" 2>/dev/null || true; fi
+}
+shopt -s nullglob
+case "\$mode" in
+list)
+	for d in "\$HOME"/.ibx/jobs/*/; do [ -d "\$d" ] && job_line "\$d"; done ;;
+status)
+	d="\$HOME/.ibx/jobs/\$arg1"
+	if [ -d "\$d" ] && { [ -s "\$d/pid" ] || [ -f "\$d/rc" ]; }; then
+		pid=\$(cat "\$d/pid" 2>/dev/null || printf '%s\n' 0)
+		printf 'started %s pgid %s\n' "\$arg1" "\$pid"
+	else printf '%s\n' absent; fi ;;
+show)
+	d="\$HOME/.ibx/jobs/\$arg1"
+	[ -d "\$d" ] || { printf '%s\n' "no job \$arg1" >&2; exit 3; }
+	job_line "\$d"
+	if [ -n "\$arg2" ] && [ -f "\$d/log" ]; then printf '\n'; tail -n "\$arg2" "\$d/log"; fi ;;
+wait)
+	d="\$HOME/.ibx/jobs/\$arg1"
+	[ -d "\$d" ] || { printf '%s\n' "no job \$arg1" >&2; exit 3; }
+	end=\$((SECONDS + arg2))
+	while [ "\$SECONDS" -lt "\$end" ]; do
+		[ "\$(job_state "\$d")" = running ] || break
+		sleep 1
+	done
+	job_line "\$d" ;;
+kill)
+	d="\$HOME/.ibx/jobs/\$arg1"
+	[ -d "\$d" ] || { printf '%s\n' "no job \$arg1" >&2; exit 3; }
+	stop_pid "\$(cat "\$d/pid" 2>/dev/null || true)"
+	: >"\$d/killed"
+	printf '%s\n' 143 >"\$d/rc"
+	job_line "\$d" ;;
+sweep)
+	for d in "\$HOME"/.ibx/jobs/*/; do
+		[ -d "\$d" ] || continue
+		if [ "\$(job_state "\$d")" = running ]; then
+			stop_pid "\$(cat "\$d/pid" 2>/dev/null || true)"
+			printf 'killed job %s\n' "\$(basename -- "\$d")"
+		fi
+	done
+	rm -rf -- "\$HOME/.ibx" ;;
+claim)
+	for d in "\$HOME"/.ibx/jobs/*/; do
+		[ -d "\$d" ] || continue
+		t=\$(cat "\$d/token" 2>/dev/null || true)
+		[ "\$t" = "\$arg1" ] && continue
+		[ "\$(job_state "\$d")" = running ] && stop_pid "\$(cat "\$d/pid" 2>/dev/null || true)"
+		printf 'stopped leftover job %s\n' "\$(basename -- "\$d")"
+	done
+	rm -rf -- "\$HOME/.ibx" ;;
+left)
+	[ -d /proc ] || exit 0
+	epoch=\$(date -u -d "\$arg1" +%s 2>/dev/null || true)
+	if [ -z "\$epoch" ] && command -v python3 >/dev/null; then
+		epoch=\$(python3 -c 'import datetime,sys; print(int(datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")).timestamp()))' "\$arg1" 2>/dev/null || true)
+	fi
+	[ -n "\$epoch" ] || exit 0
+	btime=\$(awk '/^btime /{print \$2}' /proc/stat)
+	hz=\$(getconf CLK_TCK 2>/dev/null || echo 100)
+	home=\$(cd -- "\$HOME" && pwd -P)
+	for piddir in /proc/[0-9]*; do
+		pid=\${piddir##*/}
+		cwd=\$(readlink "\$piddir/cwd" 2>/dev/null || true)
+		case "\$cwd/" in "\$home"/*) ;; *) continue ;; esac
+		cmd=\$(tr '\0' ' ' <"\$piddir/cmdline" 2>/dev/null || true)
+		case "\$cmd" in
+		*sshd*|*Xvnc*|*xfce*|*xfwm*|*xfdesktop*|*xfsettings*|*instabox-guest-agent*|*instabox-port*|*dbus*|*pulseaudio*|*pipewire*|*systemd*|*gnome-keyring*|*ibx-remote*) continue ;;
+		esac
+		[ -n "\$cmd" ] || continue
+		ticks=\$(awk '{print \$22}' "\$piddir/stat" 2>/dev/null || echo 0)
+		born=\$((btime + ticks / hz))
+		[ "\$born" -ge "\$epoch" ] || continue
+		port=
+		if command -v ss >/dev/null; then
+			port=\$(ss -H -ltnp 2>/dev/null | awk -v p="\$pid" 'index(\$0, "pid=" p ",") {print \$4; exit}')
+			port=\${port##*:}
+		fi
+		if [ -n "\$port" ]; then printf '%s (pid %s, :%s) still running; it was not stopped\n' "\$cmd" "\$pid" "\$port"
+		else printf '%s (pid %s) still running; it was not stopped\n' "\$cmd" "\$pid"; fi
+	done ;;
+esac
+EOF
+}
+
+warn_remote_lines() {
+	local line
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		warn "$(printf '%s' "$line" | printable)"
+	done <<<"$1"
+}
+
+sweep_jobs() { # id release|claim [token]
+	local script text
+	home_has "$1" /data/home/.ibx/jobs || return 0
+	case $2 in
+	release) script=$(job_remote sweep) ;;
+	claim) script=$(job_remote claim "$3") ;;
+	*) return 0 ;;
+	esac
+	if exec_shot "$1" 30 "$script"; then
+		text=$(jq -r '.stdout // ""' <<<"$R")
+		warn_remote_lines "$text"
+	else
+		fatal_check
+		warn "could not sweep ibx jobs on ${LABEL:-$1}"
+	fi
+}
+
+report_leftovers() { # id box claim-start   uses the machine object in m
+	local script text
+	[ -n "$3" ] || return 0
+	[ "$(jq -r '.state // ""' <<<"$m")" = running ] || return 0
+	script=$(job_remote left "$3")
+	if exec_shot "$1" 15 "$script"; then
+		text=$(jq -r '.stdout // ""' <<<"$R")
+		warn_remote_lines "$text"
+	else
+		fatal_check
+		warn "could not list processes left running on $2"
+	fi
+}
+
+tail_wrapper() { # n command
+	cat <<EOF
+#!/bin/bash
+# ibx-remote
+n=$(printf %q "$1")
+log="\$HOME/.ibx/out/\$(date +%s)-\$\$.log"
+mkdir -p -- "\$(dirname -- "\$log")"
+set +e
+bash -c $(printf %q "$2") >"\$log" 2>&1
+rc=\$?
+set -e
+lines=\$(wc -l <"\$log" | tr -d ' ')
+tail -n "\$n" "\$log" >&2
+printf '[ibx: full output %s, %s lines]\\n' "\$log" "\$lines" >&2
+exit "\$rc"
+EOF
+}
+
+put_tree() { # box src dst. untracked, excludes and force are in scope.
+	local box=$1 src=$2 dst=$3 top='' here='' prefix='' rel n=0 secret secret_n=0 bytes sha id remote arch rand file_rc skip glob shell_dest shell_arch
+	local -a secrets=()
+	[ -z "$force" ] || die "--force applies to a single file, not a directory"
+	src=$(cd -- "$src" && pwd -P)
+	: >"$tmp/tree-raw"
+	if top=$(git -C "$src" rev-parse --show-toplevel 2>/dev/null); then
+		top=$(cd -- "$top" && pwd -P)
+		here=$src
+		case "$here/" in
+		"$top"/* | "$top/") ;;
+		*) top= ;;
+		esac
+	fi
+	if [ -n "$top" ]; then
+		prefix=
+		[ "$here" = "$top" ] || prefix=${here#"$top"/}/
+		git -C "$top" ls-files -z -- "${prefix:-.}" >"$tmp/tree-raw" || die "could not list tracked files in $src"
+		if [ -n "$untracked" ]; then
+			git -C "$top" ls-files -z -o --exclude-standard -- "${prefix:-.}" >>"$tmp/tree-raw" || die "could not list untracked files in $src"
+		fi
+	else
+		(cd -- "$src" && find . \( -name .git -o -name node_modules \) -prune -o \( -type f -o -type l \) -print0) >"$tmp/tree-raw"
+	fi
+	: >"$tmp/tree-list"
+	while IFS= read -r -d '' rel; do
+		[ -n "$rel" ] || continue
+		rel=${rel#./}
+		rel=${rel#"$prefix"}
+		[ -n "$rel" ] || continue
+		skip=
+		for glob in "${excludes[@]+"${excludes[@]}"}"; do
+			# shellcheck disable=SC2254
+			case $rel in $glob) skip=1 ;; esac
+		done
+		[ -z "$skip" ] || continue
+		[ -e "$src/$rel" ] || [ -L "$src/$rel" ] || continue
+		if link_escapes "$src" "$rel"; then die "refusing $rel: that symlink resolves outside $src"; fi
+		if looks_secret "$rel" || looks_secret "$src/$rel"; then
+			secret_n=$((secret_n + 1))
+			[ "$secret_n" -gt 20 ] || secrets+=("$rel")
+			continue
+		fi
+		printf '%s\0' "$rel" >>"$tmp/tree-list"
+		n=$((n + 1))
+	done <"$tmp/tree-raw"
+	if [ "$secret_n" -gt 0 ]; then
+		secret="refusing $src: $secret_n path(s) look like credentials"
+		[ "$secret_n" -le 20 ] || secret="$secret (showing 20)"
+		secret="$secret: ${secrets[*]}"
+		json_error looks_secret "$secret"
+		die "$secret"
+	fi
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	if [ "$n" -eq 0 ]; then
+		if [ -n "$JSON" ]; then jq -n '{files:0,bytes:0,sha256:null}' >"$tmp/result"; else echo "copied 0 files to $box:$dst"; fi
+		exit 0
+	fi
+	tar -C "$src" --null -T "$tmp/tree-list" -czf "$tmp/tree.tgz" || die "could not archive $src"
+	bytes=$(size_of "$tmp/tree.tgz")
+	[ "$bytes" -le 5368709120 ] || die "directory archive exceeds the server limit of 5 GiB"
+	sha=$(file_sha "$tmp/tree.tgz")
+	rand=$(idem)
+	case $dst in
+	/*) remote=$dst ;;
+	*) remote=/data/home/${dst#\~/} ;;
+	esac
+	arch=/data/home/.ibx/in/$rand.tgz
+	file_rc=0
+	file_api PUT "$id" "$arch" "$tmp/tree.tgz" || file_rc=$?
+	[ "$file_rc" != 2 ] || die "this server has no file routes; directory copy needs them"
+	[ "$file_rc" = 0 ] || die "could not upload $src"
+	[ "$sha" = "$(jq -r .sha256 "$tmp/file-body")" ] || die "uploaded archive SHA-256 does not match"
+	shell_dest=$(printf '$HOME/%q' "${dst#\~/}")
+	shell_arch=$(printf '$HOME/.ibx/in/%s.tgz' "$rand")
+	EXEC_SAFE=1 exec_in "$id" 120 "# ibx-remote
+mkdir -p -- $shell_dest && tar xzf $shell_arch -C $shell_dest && rm -f -- $shell_arch"
+	[ "$(jq -r .exitCode <<<"$R")" = 0 ] || die "could not extract on $box: $(jq -r .stderr <<<"$R" | printable)"
+	if [ -n "$JSON" ]; then
+		jq -n --argjson files "$n" --argjson bytes "$bytes" --arg sha "$sha" '{files:$files,bytes:$bytes,sha256:$sha}' >"$tmp/result"
+	else
+		echo "copied $n files ($bytes bytes) to $box:$dst"
+	fi
+	exit 0
+}
+
+inspect_tar() {
+	local name type
+	while IFS= read -r name; do
+		case $name in
+		/* | .. | ../* | */.. | */../*) die "refusing archive entry $name" ;;
+		esac
+	done < <(tar -tzf "$1")
+	while read -r type _; do
+		case $type in
+		-* | d*) ;;
+		*) die "refusing an archive entry that is not a regular file or directory" ;;
+		esac
+	done < <(tar -tvzf "$1")
+}
+
+get_tree() { # box remote-src local-dst
+	local box=$1 src=$2 dst=$3 id rand arch stage rel shell_src shell_arch
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	ensure_running "$id" || die "could not start $box for file transfer"
+	rel=${src%/}
+	rel=${rel#\~/}
+	if [ -e "$dst" ]; then
+		if [ -d "$dst" ]; then
+			[ -z "$(find "$dst" -mindepth 1 -print -quit)" ] || die "$dst is not empty"
+		else
+			die "$dst exists"
+		fi
+	fi
+	rand=$(idem)
+	case $rel in
+	/*) shell_src=$(printf '%q' "$rel"); arch=$rel.ibx.tgz ;;
+	*) shell_src=$(printf '$HOME/%q' "$rel"); arch=/data/home/.ibx/out/$rand.tgz ;;
+	esac
+	shell_arch=$(printf '$HOME/.ibx/out/%s.tgz' "$rand")
+	EXEC_SAFE=1 exec_in "$id" 120 "# ibx-remote
+mkdir -p -- \$HOME/.ibx/out && tar czf $shell_arch -C $shell_src ."
+	[ "$(jq -r .exitCode <<<"$R")" = 0 ] || die "could not archive $box:$src: $(jq -r .stderr <<<"$R" | printable)"
+	stage=$(mktemp "${TMPDIR:-/tmp}/ibx-get.XXXXXX") || die "could not stage download"
+	remove_download() { rm -f "$stage"; }
+	cleanup_fns+=(remove_download)
+	file_api GET "$id" "$arch" "$stage" || die "could not download $box:$src"
+	EXEC_SAFE=1 exec_shot "$id" 30 "# ibx-remote
+rm -f -- $shell_arch" || warn "could not remove the temporary archive on $box"
+	inspect_tar "$stage"
+	rm -rf -- "${dst}.ibx-part"
+	mkdir -p -- "${dst}.ibx-part" || die "could not stage $dst"
+	if ! tar -xzf "$stage" -C "${dst}.ibx-part" --no-same-owner --no-same-permissions; then
+		rm -rf -- "${dst}.ibx-part"
+		die "could not extract $box:$src"
+	fi
+	if [ -d "$dst" ]; then rmdir -- "$dst" || die "could not replace $dst"; fi
+	mv -- "${dst}.ibx-part" "$dst" || die "could not write $dst"
+	if [ -n "$JSON" ]; then
+		jq -n --arg src "$src" --arg dst "$dst" '{src:$src,dst:$dst}' >"$tmp/result"
+	else
+		echo "copied $box:$src -> $dst"
+	fi
+	exit 0
+}
 # shellcheck disable=SC2030 # private subshell state must survive function unwinding at EXIT
 release_isolated() ( # status-file box: private result/error files; AUTH stays a shell variable
 	set -e
@@ -1303,6 +1785,8 @@ claim)
 			IBX_MAXTIME=''
 			[ -n "$ok" ] || continue
 			ensure_running "$id" || { fatal_check; warn "$name would not start; trying another"; set_claim "$id" '{}' || true; continue; }
+			LABEL=$name
+			sweep_jobs "$id" claim "$token"
 			m=$(api GET "/v1/machines/$id") || die "could not read the claimed sandbox"
 			pauses=$(jq -c "$JQ_DEFS"' pauses' <<<"$m")
 			cooldown=$(jq -c '.cooldownUntil // null' <<<"$m")
@@ -1373,7 +1857,15 @@ renew)
 	fi
 	;;
 release)
-	[ $# -eq 1 ] || die "usage: ibx release [--json] <box> | --mine"
+	args=()
+	for a in "$@"; do
+		case $a in
+		--no-check) RELEASE_NO_CHECK=1 ;;
+		*) args+=("$a") ;;
+		esac
+	done
+	set -- "${args[@]}"
+	[ $# -eq 1 ] || die "usage: ibx release [--no-check] [--json] <box> | --mine"
 	if [ "$1" = --mine ]; then
 		if [ "$AGENT_SOURCE" = 'per host' ]; then
 			message='release --mine needs a session ID or IBX_AGENT_NAME; the per-host identity may be shared by other agents; release each literal name instead'
@@ -1441,12 +1933,13 @@ exec)
 	[ $# -ge 1 ] || die "usage: ibx exec [--stream] <box> [-t SECS] [-i] -- <cmd>"
 	box=$1
 	shift
-	t=300 stdin=''
+	t=300 stdin='' tailn=
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		-t) t=${2:-}; shift 2 || shift ;;
 		-i) stdin=1; shift ;;
 		--stream) STREAM=1; shift ;;
+		--tail) tailn=${2:-}; shift 2 || shift ;;
 		--) shift; break ;;
 		*) break ;;
 		esac
@@ -1454,17 +1947,46 @@ exec)
 	[[ $t =~ ^[0-9]+$ ]] || die "-t must be 1-600 seconds"
 	t=$((10#$t))
 	[ "$t" -ge 1 ] && [ "$t" -le 600 ] || die "-t must be 1-600 seconds"
-	[ $# -gt 0 ] || die "usage: ibx exec <box> [-t SECS] [-i] -- <cmd>"
+	if [ -n "$tailn" ]; then
+		[[ $tailn =~ ^[0-9]+$ ]] || die "--tail must be 1-2000 lines"
+		tailn=$((10#$tailn))
+		[ "$tailn" -ge 1 ] && [ "$tailn" -le 2000 ] || die "--tail must be 1-2000 lines"
+	fi
+	[ -z "$STREAM" ] || [ -z "$EXEC_JSON" ] || die "--json cannot be combined with --stream"
+	[ -z "$STREAM" ] || [ -z "$tailn" ] || die "--tail cannot be combined with --stream"
+	[ $# -gt 0 ] || die "usage: ibx exec [--json] [--stream] <box> [-t SECS] [-i] [--tail N] -- <cmd>"
 	id=$(resolve --pool "$box")
 	LABEL=$box
+	cmd=$(remote_cmd "$@")
+	[ -z "$tailn" ] || cmd=$(tail_wrapper "$tailn" "$cmd")
 	if [ -n "$stdin" ]; then
 		head -c 1048577 >"$tmp/stdin"
 		[ "$(size_of "$tmp/stdin")" -le 1048576 ] || die "stdin is over 1 MiB: use ibx ssh"
-		exec_in "$id" "$t" "$(remote_cmd "$@")" "$tmp/stdin"
+		exec_in "$id" "$t" "$cmd" "$tmp/stdin"
 	else
-		exec_in "$id" "$t" "$(remote_cmd "$@")"
+		exec_in "$id" "$t" "$cmd"
 	fi
 	r=$R
+	if [ -n "$EXEC_JSON" ]; then
+		full=$(jq -r '.stderr // ""' <<<"$r" | sed -n 's/^\[ibx: full output \(.*\), [0-9][0-9]* lines\]$/\1/p' | head -n 1)
+		timed=$(jq -r '.timedOut // false' <<<"$r")
+		[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && warn "output truncated (1 MiB per stream)"
+		[ "$(jq -r '.invalidUtf8 // false' <<<"$r")" = true ] && warn "output was not UTF-8 and was altered (bytes became U+FFFD); copy files with ibx get"
+		signal=$(jq -r "$JQ_DEFS"' .signal // empty | clean' <<<"$r" | printable)
+		[ -z "$signal" ] || warn "the remote command was killed by SIG$signal"
+		disk=$(jq -r "$JQ_DEFS"' .diskWarning.message // empty | clean' <<<"$r" | printable)
+		[ -z "$disk" ] || warn "$disk"
+		[ "$timed" = true ] && warn "timed out after ${t}s; the command may have run partly"
+		jq -n --arg box "$box" --argjson r "$r" --arg full "$full" --arg timed "$timed" --arg t "$t" '
+			{box:$box, ran:(if $timed == "true" then "partial" else "yes" end),
+			 exitCode:$r.exitCode, timedOut:($timed == "true"), signal:($r.signal // null),
+			 truncated:($r.truncated // false), invalidUtf8:($r.invalidUtf8 // false),
+			 stdout:($r.stdout // ""), stderr:($r.stderr // ""), warnings:[]}
+			+ (if $full == "" then {} else {fullLog:$full} end)
+			+ (if $timed == "true" then {error:{code:"timed_out", message:("timed out after " + $t + "s; the command may have run partly")}} else {} end)' >"$tmp/result"
+		[ "$timed" = true ] && exit 124
+		exit "$(jq -r '.exitCode // 125' <<<"$r")"
+	fi
 	jq -j '.stdout // ""' <<<"$r"
 	stderr jq -j '.stderr // ""' <<<"$r"
 	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && warn "output truncated (1 MiB per stream)"
@@ -1481,11 +2003,20 @@ exec)
 	exit "$rc"
 	;;
 put)
-	force=''
-	[ "${1:-}" = --force ] && { force=1; shift; }
-	[ $# -eq 3 ] || die "usage: ibx put [--force] <box> <local> <remote>"
+	force='' untracked=''
+	excludes=()
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--force) force=1; shift ;;
+		--untracked) untracked=1; shift ;;
+		--exclude) [ $# -ge 2 ] || die "--exclude needs a glob"; excludes+=("$2"); shift 2 ;;
+		*) break ;;
+		esac
+	done
+	[ $# -eq 3 ] || die "usage: ibx put [--force] [--untracked] [--exclude GLOB] <box> <local> <remote>"
 	box=$1 src=$2 dst=${3#\~/} # remote paths are relative to HOME already
 	[ "$dst" != '~' ] && [ -n "$dst" ] || die "give a file path for the sandbox (relative to HOME)"
+	if [ -d "$src" ]; then put_tree "$box" "$src" "$dst"; fi
 	[ -f "$src" ] || die "no file $src"
 	[ -r "$src" ] || die "cannot read $src"
 	# /dev/stdin and the fd names are whatever stdin and fds the process opening them has (curl's
@@ -1506,6 +2037,7 @@ put)
 	case $dst in /*) remote=$dst ;; *) remote=/data/home/$dst ;; esac
 	file_rc=0
 	file_api PUT "$id" "$remote" "$path" || file_rc=$?
+	[ "$file_rc" != 3 ] || die "destination is a directory: give the file name too"
 	if [ "$file_rc" = 0 ]; then
 		[ "$(file_sha "$path")" = "$(jq -r .sha256 "$tmp/file-body")" ] || die "uploaded file SHA-256 does not match the local file"
 		echo "copied $src -> $box:$dst"
@@ -1528,6 +2060,7 @@ get)
 	[ $# -ge 2 ] || die "usage: ibx get <box> <remote> [local]"
 	box=$1 src=${2#\~/} dst=${3:-$(basename -- "$2")}
 	[ "$src" != '~' ] && [ -n "$src" ] || die "give a file path in the sandbox (relative to HOME)"
+	[[ $src == */ ]] && get_tree "$box" "$src" "$dst"
 	[ -d "$dst" ] && dst=${dst%/}/$(basename -- "$src")
 	LABEL=$box
 	id=$(resolve --pool "$box")
@@ -1538,6 +2071,7 @@ get)
 	cleanup_fns+=(remove_download)
 	file_rc=0
 	file_api GET "$id" "$remote" "$stage" || file_rc=$?
+	[ "$file_rc" != 3 ] || get_tree "$box" "$src" "$dst"
 	if [ "$file_rc" = 0 ]; then
 		mv -f -- "$stage" "$dst" || die "could not write $dst"
 		echo "copied $box:$src -> $dst"
@@ -1808,7 +2342,196 @@ doctor)
 	else
 		note "no keepalive timer: a reserved sandbox can pause after its 1-hour lease runs out (see references/keepalive.md)"
 	fi
+	version_newer() { # $1 is newer than $2
+		local IFS=. i x y
+		local -a a b
+		read -r -a a <<<"$1"
+		read -r -a b <<<"$2"
+		for i in 0 1 2; do
+			x=${a[$i]:-0} y=${b[$i]:-0}
+			[ "$x" -gt "$y" ] && return 0
+			[ "$x" -lt "$y" ] && return 1
+		done
+		return 1
+	}
+	update_command() {
+		local real dir gitroot
+		real=$(phys "$0")
+		dir=$(dirname -- "$real")
+		if gitroot=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+			printf 'git -C %q pull --ff-only' "$gitroot"
+			return 0
+		fi
+		case $real in
+		*/plugins/*) printf '%s' 'update the ibx plugin from its marketplace' ;;
+		*) printf '%s' 'from a clone of https://github.com/hevlyo/ibx: ./install.sh --copy' ;;
+		esac
+	}
+	if [ "${IBX_UPDATE_CHECK:-1}" != 0 ]; then
+		cache=${STATE_DIR:-}/update-check
+		now=$(date +%s)
+		remote=
+		if [ -n "$cache" ] && [ -s "$cache" ]; then
+			read -r stamp remote <"$cache" || true
+			[ -n "${stamp:-}" ] && [ "$((now - stamp))" -lt 86400 ] || remote=
+		fi
+		if [ -z "$remote" ]; then
+			url=${IBX_UPDATE_URL:-https://github.com/hevlyo/ibx/releases/latest}
+			redir=$(curl -q -sS -o /dev/null -w '%{redirect_url}' -m 5 "$url" 2>/dev/null) || redir=
+			remote=$(printf '%s\n' "$redir" | sed -n 's|.*/v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*|\1|p' | head -n 1)
+			if [ -n "$remote" ] && [ -n "$cache" ] && mkdir -p -- "$(dirname -- "$cache")" 2>/dev/null; then
+				printf '%s %s\n' "$now" "$remote" >"$cache" 2>/dev/null || true
+			fi
+		fi
+		if [ -z "$remote" ]; then
+			printf 'info  could not check for updates\n'
+		elif version_newer "$remote" "$IBX_VERSION"; then
+			note "ibx $remote is available; $(update_command)"
+		fi
+	fi
+	declare -A skill_copies=()
+	for root in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" "$HOME/.claude/skills" "$HOME/.agents/skills" \
+		"${CODEX_HOME:-$HOME/.codex}/skills" "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/skills"; do
+		[ -f "$root/ibx/SKILL.md" ] || continue
+		real=$(cd -- "$root/ibx" && pwd -P) || continue
+		skill_copies[$real]=1
+	done
+	if [ -d "$HOME/.claude/plugins" ]; then
+		while IFS= read -r skillfile; do
+			real=$(cd -- "$(dirname -- "$skillfile")" && pwd -P) || continue
+			skill_copies[$real]=1
+		done < <(find "$HOME/.claude/plugins" -path '*/ibx/SKILL.md' -type f 2>/dev/null)
+	fi
+	[ "${#skill_copies[@]}" -le 1 ] || note "more than one ibx skill is visible (${#skill_copies[@]} copies); keep a single copy so agents do not follow two versions"
+	if other=$(command -v ibx 2>/dev/null); then
+		other_version=$("$other" --version 2>/dev/null || true)
+		[ "$other_version" = "ibx $IBX_VERSION" ] || [ -z "$other_version" ] || note "ibx on PATH ($other) reports ${other_version:-nothing}, this script is ibx $IBX_VERSION"
+	fi
 	exit $((bad ? 125 : 0))
+	;;
+run)
+	[ $# -ge 2 ] || die "usage: ibx run <box> <name> [--replace] -- <cmd>"
+	box=$1 name=$2
+	shift 2
+	replace=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--replace) replace=1; shift ;;
+		--) shift; break ;;
+		*) break ;;
+		esac
+	done
+	job_name_ok "$name" || die "job name must match [a-z0-9][a-z0-9._-]{0,39}"
+	[ $# -gt 0 ] || die "usage: ibx run <box> <name> [--replace] -- <cmd>"
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	m=$(api GET "/v1/machines/$id") || die "could not read $box"
+	token=$(jq -r '.metadata["ibx.claim.token"] // "-"' <<<"$m")
+	[[ $token =~ ^[-A-Za-z0-9_]+$ ]] || token=-
+	script=$(job_controller "$name" "$replace" "$token")
+	remote_cmd "$@" >"$tmp/job-cmd"
+	line=
+	if exec_shot "$id" 60 "$script" "$tmp/job-cmd"; then
+		ec=$(jq -r '.exitCode // 1' <<<"$R")
+		line=$(jq -r '.stdout // ""' <<<"$R" | head -n 1)
+		if [ "$ec" != 0 ]; then
+			stderr jq -j '.stderr // ""' <<<"$R"
+			die "run did not start: $(jq -r '.stderr // "the job was not started"' <<<"$R" | head -n 1 | printable)"
+		fi
+	else
+		code=$(err_code "$tmp/err")
+		case $code in
+		quota_exceeded | machine_not_running | machine_cooldown | max_run_disabled | bad_request | not_found | permission_denied | bad_path | unauthenticated | api_key_expired | api_key_revoked | insufficient_scope | missing_scope)
+			stderr cat "$tmp/err"
+			die "run did not start" ;;
+		esac
+		fatal_check
+		if exec_shot "$id" 30 "$(job_remote status "$name")"; then
+			line=$(jq -r '.stdout // ""' <<<"$R" | head -n 1)
+			[ "$line" != absent ] || die "run did not start"
+		else
+			die "run may have started; check with ibx job $box $name"
+		fi
+	fi
+	[[ $line =~ ^started\ [a-z0-9][a-z0-9._-]{0,39}\ pgid\ ([0-9]+)$ ]] || die "run did not start"
+	pgid=${BASH_REMATCH[1]}
+	if [ -n "$JSON" ]; then
+		jq -n --arg name "$name" --argjson pgid "$pgid" '{name:$name,pgid:$pgid}' >"$tmp/result"
+	else
+		printf 'started %s pgid %s\n' "$name" "$pgid"
+	fi
+	exit 0
+	;;
+job)
+	[ $# -ge 1 ] || die "usage: ibx job <box> [name] [--tail N] [--wait S] [--kill]"
+	box=$1
+	shift
+	name='' tail='' wait='' kill=''
+	if [ $# -gt 0 ] && [[ $1 != --* ]]; then name=$1; shift; fi
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--tail) tail=${2:-}; shift 2 || shift ;;
+		--wait) wait=${2:-}; shift 2 || shift ;;
+		--kill) kill=1; shift ;;
+		*) die "usage: ibx job <box> [name] [--tail N] [--wait S] [--kill]" ;;
+		esac
+	done
+	[ -z "$name" ] || job_name_ok "$name" || die "job name must match [a-z0-9][a-z0-9._-]{0,39}"
+	if [ -n "$tail" ]; then
+		[[ $tail =~ ^[0-9]+$ ]] || die "--tail must be 1-2000 lines"
+		tail=$((10#$tail))
+		[ "$tail" -ge 1 ] && [ "$tail" -le 2000 ] || die "--tail must be 1-2000 lines"
+	fi
+	if [ -n "$wait" ]; then
+		[[ $wait =~ ^[0-9]+$ ]] || die "--wait must be 1-540 seconds"
+		wait=$((10#$wait))
+		[ "$wait" -ge 1 ] && [ "$wait" -le 540 ] || die "--wait must be 1-540 seconds"
+	fi
+	if [ -z "$name" ]; then
+		[ -z "$tail" ] && [ -z "$wait" ] && [ -z "$kill" ] || die "name the job to use --tail, --wait or --kill"
+		mode='list'
+		tout=30
+		script=$(job_remote list)
+	elif [ -n "$kill" ]; then
+		mode='kill'
+		tout=30
+		script=$(job_remote kill "$name")
+	elif [ -n "$wait" ]; then
+		mode='wait'
+		tout=$((wait + 30))
+		script=$(job_remote wait "$name" "$wait")
+	else
+		mode='show'
+		tout=30
+		script=$(job_remote show "$name" "$tail")
+	fi
+	id=$(resolve --pool "$box")
+	LABEL=$box
+	exec_shot "$id" "$tout" "$script" || die "could not read jobs on $box"
+	[ "$(jq -r '.exitCode // 1' <<<"$R")" = 0 ] || die "$(jq -r '.stderr // "could not read the job"' <<<"$R" | head -n 1 | printable)"
+	text=$(jq -r '.stdout // ""' <<<"$R")
+	if [ "$mode" = show ] || [ "$mode" = wait ] || [ "$mode" = kill ]; then
+		status_line=${text%%$'\n'*}
+		tail_text=
+		if [ "$text" != "$status_line" ]; then tail_text=${text#*$'\n'}; tail_text=${tail_text#$'\n'}; fi
+	else
+		status_line=$text
+		tail_text=
+	fi
+	if [ -n "$JSON" ]; then
+		printf '%s\n' "$status_line" | jq -Rsc --arg tail "$tail_text" --arg mode "$mode" '
+			[split("\n")[] | select(length > 0) | split("\t") | {name:.[0], state:.[1],
+				rc:(if .[2] == "" then null else (.[2] | tonumber? // .[2]) end),
+				started:(if .[3] == "" then null else .[3] end),
+				elapsed:(if .[4] == "" then null else (.[4] | tonumber? // null) end)}] as $rows |
+			if $mode == "list" then {jobs:$rows} else ($rows[0] + {tail:$tail}) end' >"$tmp/result"
+	elif [ "$mode" = list ]; then
+		if [ -z "$status_line" ]; then echo "no jobs"; else printf '%s\n' "$status_line" | table; fi
+	else
+		printf '%s\n' "$status_line"
+		[ -z "$tail_text" ] || printf '%s\n' "$tail_text"
+	fi
+	exit 0
 	;;
 *) stderr usage; exit 125 ;;
 esac

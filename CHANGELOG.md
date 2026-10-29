@@ -3,9 +3,9 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/). The version is the one `ibx --version` prints.
-The Claude Code plugin manifests carry no version. Plugin users get every commit.
+Plugin manifests carry the same version as `ibx --version`.
 
-## 0.3.0 - 2026-10-27
+## 0.3.0 - 2026-10-28
 
 ### Added
 
@@ -39,6 +39,19 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
   such, never as an empty pool.
 - README tables of exit codes and environment variables, updated for 0.3.0.
 - Dated platform research and decisions in docs/research/2026-10-27-instabox-changes.md.
+- `ibx run` and `ibx job` for named detached jobs. A start is never retried; if it may have
+  run, one read-only status check says whether it started. `release` stops running ibx jobs.
+  `claim` stops leftover jobs from a previous holder and clears `~/.ibx`.
+- `ibx exec --json` prints one object with `ran` of `yes`, `no` or `partial`. `--tail N` keeps
+  the full merged output on the box and prints the last lines. `--json` and `--stream` cannot
+  be combined.
+- `ibx put` copies a directory (git tracked files, or `find` outside a work tree), refuses
+  credential-looking paths and symlinks that resolve outside it, and extracts through the file
+  API. `ibx get` of a remote directory checks the archive before extracting it.
+- `release` warns about guest processes and listeners still running after the job sweep.
+  `--no-check` skips that report. An exec failure is a warning, not a failed release.
+- `doctor` checks GitHub for a newer release (cached 24 hours, `IBX_UPDATE_CHECK=0` disables it)
+  and warns when more than one ibx skill, or a different `ibx` on `PATH`, is visible.
 
 ### Changed
 

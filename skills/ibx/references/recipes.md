@@ -241,9 +241,17 @@ sha256sum big.bin; ibx exec BOX -- 'sha256sum big.bin'                    # veri
 
 ## 5. Long jobs, detached
 
-Anything that may take more than ~8 minutes goes here. exec stops at 600 s and kills the
-process group, and your tool call may stop sooner. Start long work in its own session, record
-its process group and exit code, and poll.
+Anything that may take more than ~8 minutes goes here. `ibx run` starts it in its own session
+and `ibx job` polls or stops it. exec stops at 600 s and kills the process group, and your tool
+call may stop sooner.
+
+```bash
+ibx run BOX build -- 'cd src && make -j4'
+ibx job BOX build --wait 300 --tail 20
+ibx job BOX build --kill
+```
+
+The same shape, written out, is what those commands run:
 
 ```bash
 # start: returns at once
