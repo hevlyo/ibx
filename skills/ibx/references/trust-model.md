@@ -182,9 +182,11 @@ These are guards against accidents. None of them stops someone who holds the API
 - **The API host** must be `https://api.instabox.sh` unless `IBX_ALLOW_CUSTOM_API=1`. Plain
   http is accepted only for `127.0.0.1` and `localhost` (tests).
 - **Holder checks.** Work commands, renew and release refuse another agent's live reservation
-  (`held_by_other`, exit 125), using the machine list already loaded. Unreserved/abandoned work
-  warns to claim first; renew refuses `not_held`, release stays idempotent. Unreadable dates
-  remain guarded. `ls --mine` finds your live pool reservations; `release --mine` requires a
+  (`held_by_other`, exit 125), using the machine list already loaded. `release` and `renew`
+  apply that rule again to a fresh read before they write; a later write can still win.
+  Unreserved/abandoned work warns to claim first; renew refuses `not_held`, release stays
+  idempotent. An unreadable date is a live hold for that same agent and a refusal for anyone
+  else. `ls --mine` finds your live pool reservations; `release --mine` requires a
   session ID or explicit agent name (`ambiguous_identity` for the shared per-host fallback).
   The user-only `IBX_ALLOW_ANY=1` bypasses pool and holder checks, but cannot make the per-host
   identity unambiguous. Keepalive, ls and doctor are unaffected. These are advisory client

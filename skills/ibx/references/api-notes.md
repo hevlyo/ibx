@@ -324,12 +324,16 @@ streaming changes output delivery, not long-job lifecycle. Put/get never use SSE
 
 ## Ownership-aware commands (0.3.0)
 
-The holder check uses the machine list already loaded by resolve, without another API call.
-`exec`, `put`, `get`, `ssh`, `forward`, `port`, `unport`, `renew` and `release` refuse another
-agent's non-stale reservation with exit 125 (`held_by_other` in JSON). The shared gate also
-covers `run` and `job` when those commands are added. Invalid dates stay guarded. The message
-includes holder, since, purpose and your live pool reservations (`error.held`). Unreserved or
-abandoned work warns to claim first; renew refuses `not_held`, release stays idempotent.
+The holder check uses the machine list already loaded by resolve. `exec`, `put`, `get`, `ssh`,
+`forward`, `port` and `unport` do not fetch the machine again. `release` and `renew` do, and
+apply the same rule before any port delete or metadata write. A change after that read can
+still win: metadata has no compare-and-swap. `exec`, `put`, `get`, `ssh`, `forward`, `port`,
+`unport`, `renew` and `release` refuse another agent's non-stale reservation with exit 125
+(`held_by_other` in JSON). The shared gate also covers `run` and `job` when those commands
+are added. An unreadable date is a live hold for that same agent and a refusal for anyone
+else. The message includes holder, since, purpose and your live pool reservations
+(`error.held`). Unreserved or abandoned work warns to claim first; renew refuses `not_held`,
+release stays idempotent.
 `IBX_ALLOW_ANY=1` is a user-only override for pool and holder checks. It does not grant an
 unambiguous identity for bulk release. `keepalive`, `ls` and `doctor` have no holder gate.
 
@@ -338,5 +342,6 @@ Plain output identifies you and the identity source on stderr; JSON is
 `{agent,agentSource,boxes}` with normal ls rows. None held is a successful empty result, with
 a stderr note. `release --mine [--json]` uses the normal release path for each live held box,
 rechecking ownership, and returns `{released:[names],failed:[{name,error}],warnings}`.
-Failures do not stop later releases; any failure exits 125. A per-host fallback identity
+Failures do not stop later releases; any failure exits 125. A signal does stop the rest, and
+the interrupt names any box already released. A per-host fallback identity
 refuses before API access with `ambiguous_identity`, even with IBX_ALLOW_ANY=1.

@@ -454,6 +454,26 @@ PYCODE
 		rc_is "$age release remains idempotent" 0
 	done
 	reset
+	ctl "{\"set\":{\"box-1\":{\"mergeMetadata\":$(claim_md not-a-date other-agent)}}}"
+	run exec box-1 -- true
+	rc_is "another agent's unreadable date is still refused" 125
+	err_has "and names that holder" 'held by other-agent'
+	is "before any mutation" "$(ncalls)" 1
+	reset
+	ctl "{\"set\":{\"box-1\":{\"mergeMetadata\":$(claim_md not-a-date tester)}}}"
+	run exec box-1 -- true
+	rc_is "your own unreadable date still runs" 0
+	err_lacks "and is not described as unowned" 'not reserved by you'
+	run renew --json box-1
+	rc_is "your own unreadable date can be renewed" 0
+	is "renew replaced the unreadable date" "$(jq -r .since "$S/out" | grep -c '^[0-9]\{4\}-')" 1
+	reset
+	ctl "{\"set\":{\"box-1\":{\"mergeMetadata\":$(claim_md not-a-date tester)}}}"
+	run release --json box-1
+	rc_is "your own unreadable date can be released" 0
+	err_lacks "release does not call it unowned" 'not reserved by you'
+	is "and clears it" "$(claim_keys box-1)" 0
+	reset
 	hold box-1 60 other-agent
 	run IBX_ALLOW_ANY=1 exec box-1 -- true
 	rc_is "user override permits work on another holder's box" 0
@@ -528,6 +548,50 @@ PYCODE
 	is "bulk recheck reports held_by_other" "$(jq -r '.failed[0].error.code' "$S/out")" held_by_other
 	is "a refused recheck stops immediately without further requests" "$(ncalls)" 2
 	is "a raced foreign reservation survives" "$(box box-1 '.metadata["ibx.claim.by"]')" other-agent
+	reset '"seed":{"count":1},"faults":[{"kind":"delay","method":"GET","match":"^/v1/machines/m_","seconds":2}]'
+	hold box-1 60 tester
+	"$IBX" release --json box-1 >"$S/out" 2>"$S/err" &
+	releasing=$!
+	for _ in $(seq 100); do
+		[ "$(count GET '^/v1/machines/m_')" -ge 1 ] && break
+		sleep 0.05
+	done
+	hold box-1 60 other-agent
+	wait "$releasing"; RC=$?; TIMEDOUT=
+	rc_is "release refuses a holder seen only on the fresh read" 125
+	is "that refusal is held_by_other" "$(jq -r .error.code "$S/out")" held_by_other
+	is "and does not clear the new reservation" "$(box box-1 '.metadata["ibx.claim.by"]')" other-agent
+	is "nor delete or patch after the fresh refusal" "$(count DELETE .):$(count PATCH .)" 0:0
+	reset '"seed":{"count":1},"faults":[{"kind":"delay","method":"GET","match":"^/v1/machines/m_","seconds":2}]'
+	hold box-1 60 tester
+	"$IBX" renew --json box-1 >"$S/out" 2>"$S/err" &
+	releasing=$!
+	for _ in $(seq 100); do
+		[ "$(count GET '^/v1/machines/m_')" -ge 1 ] && break
+		sleep 0.05
+	done
+	hold box-1 60 other-agent
+	after=$(box box-1 '.metadata["ibx.claim.at"]')
+	wait "$releasing"; RC=$?; TIMEDOUT=
+	rc_is "renew refuses a holder seen only on the fresh read" 125
+	is "renew refusal is held_by_other" "$(jq -r .error.code "$S/out")" held_by_other
+	is "and leaves the new holder's timestamp" "$(box box-1 '.metadata["ibx.claim.at"]')" "$after"
+	reset '"seed":{"count":2},"faults":[{"kind":"delay","method":"GET","match":"/ports$","seconds":2}]'
+	hold box-1 60 tester
+	hold box-2 60 tester
+	"$IBX" release --mine --json >"$S/out" 2>"$S/err" &
+	releasing=$!
+	for _ in $(seq 100); do
+		[ "$(count GET '/ports$')" -ge 1 ] && break
+		sleep 0.05
+	done
+	kill -TERM "$releasing"
+	wait "$releasing"; RC=$?; TIMEDOUT=
+	rc_is "a signal during release --mine exits 143" 143
+	is "and names the box already released" "$(jq -r .error.message "$S/out")" \
+		'interrupted by SIGTERM: released box-1; no further boxes were released'
+	is "the in-flight release still cleared its reservation" "$(claim_keys box-1)" 0
+	is "and the next box was not released" "$(claim_keys box-2)" 4
 	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"GET","match":"^/v1/machines/m_[a-z2-7]+$","status":200,"body":"{\"metadata\":[]}"}]'
 	hold box-1 60 tester
 	run release --mine --json

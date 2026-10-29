@@ -11,10 +11,13 @@ The Claude Code plugin manifests carry no version. Plugin users get every commit
 
 - Ownership-aware commands refuse another agent's live reservation with `held_by_other`;
   unreserved work warns to claim first, renew requires a live owned reservation (`not_held`),
-  and release stays idempotent. The user-only IBX_ALLOW_ANY bypasses pool and holder checks.
+  and release stays idempotent. An unreadable date is a live hold for that same agent.
+  `release` and `renew` re-check the holder on a fresh read before writing; there is still no
+  compare-and-swap. The user-only IBX_ALLOW_ANY bypasses pool and holder checks.
 - `ls --mine [--json]` finds your live pool reservations and reports agent identity/source.
   `release --mine [--json]` releases all yours, reports individual failures and exits 125 on
-  partial failure. It refuses a shared per-host fallback with `ambiguous_identity`.
+  partial failure. A signal stops further boxes and names any box already released. It refuses
+  a shared per-host fallback with `ambiguous_identity`.
 - Human claim output hints on stderr to use the literal name, release it and find it with
   `ls --mine`; stdout remains only the box name.
 

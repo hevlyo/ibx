@@ -169,16 +169,18 @@ session ID (`CLAUDE_CODE_SESSION_ID` or `CODEX_THREAD_ID`), with a per-host fall
 `ibx ls --mine` shows your live pool reservations and prints your identity and its source on
 stderr. Use the literal box name printed by claim in later calls; the claim hint goes to stderr.
 `ibx release --mine` releases each of your live pool reservations, continues after individual
-failures, and exits 125 if any failed. It requires a session ID or an explicit `IBX_AGENT_NAME`;
+failures, and exits 125 if any failed. A signal stops further boxes and names any box already
+released. It requires a session ID or an explicit `IBX_AGENT_NAME`;
 the per-host fallback may identify several agents and is refused with `ambiguous_identity`.
 With none held, both commands succeed and say so on stderr.
 
 Work commands (`exec`, `put`, `get`, `ssh`, `forward`, `port`, `unport`) and `renew`/`release`
 refuse another agent's live reservation with `held_by_other` (125), including its holder,
-reservation time, purpose and the boxes you hold. An unreadable reservation date stays guarded.
-Unreserved or abandoned boxes allow work with a warning to claim first; another agent may
-otherwise take the box. Renew requires your live reservation (`not_held`, 125); release remains
-idempotent. The user-only `IBX_ALLOW_ANY=1` bypasses pool and holder checks. It does not override
+reservation time, purpose and the boxes you hold. An unreadable reservation date is still a
+live hold: yours proceeds, and someone else's is refused. Unreserved or abandoned boxes allow
+work with a warning to claim first; another agent may otherwise take the box. Renew requires
+your live reservation (`not_held`, 125); release remains idempotent. `release` and `renew`
+check the holder again on a fresh read before they write. The user-only `IBX_ALLOW_ANY=1` bypasses pool and holder checks. It does not override
 bulk release's identity requirement. `keepalive`, `ls` and `doctor` are unaffected.
 
 An atomic mkdir lock serializes writes and cap checks for one user sharing a state directory.

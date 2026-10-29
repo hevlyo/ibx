@@ -55,7 +55,8 @@ Agents
   ibx unport <box> <port>                unpublish it
   ibx renew [--json] <box>               refresh your reservation (jobs that run past 24 h)
   ibx release [--json] <box> | --mine   give it back: unpublish ibx and reservation-created ports,
-                                         drop its lease and reservation (--mine: all yours; needs a session/name)
+                                         drop its lease and reservation (--mine: all yours; needs a session/name;
+                                         a signal stops the rest and names boxes already released)
   ibx ls [--all | --mine] [--json]       pool sandboxes, state and holders (--all: every sandbox);
                                          --mine finds your live reservations; --json adds Vault/Secrets risk and runtime
 
@@ -71,7 +72,8 @@ Humans
 
 Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox, cap reached
 or local claim lock busy; 125 ibx itself failed (API, network, usage); 255 ssh could not connect;
-130/143 when ibx receives SIGINT/SIGTERM, and it says whether the remote command had started.
+130/143 when ibx receives SIGINT/SIGTERM. Exec says whether the remote command had started;
+release --mine names any box already released and does not start the rest.
 Exec disconnect kills its process group, partly-run work included; setsid children can survive.
 SSH commands may still run. keepalive exits 1 for real lease failures; a max-run cooldown,
 max_run_disabled or a billing block (402) is a skip and exits 0. Leases prevent idle pause, not
@@ -168,6 +170,10 @@ ssh_pid=
 ssh_filter_pid=
 sleep_pid=
 exec_phase=not_started
+bulk_signal=
+bulk_status=
+interrupt_detail=
+release_status_file=
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX") || {
 	stderr printf 'ibx: could not create temporary directory\n'
@@ -181,6 +187,8 @@ cleanup() {
 	local rc=$?
 	set +e
 	[ "$BASHPID" = "$main_pid" ] || return 0
+	# release --mine reads this from the parent temp dir after wait returns.
+	[ -z "$release_status_file" ] || printf '%s\n' "$rc" >"$release_status_file"
 	trap '' INT TERM
 	local f output
 	if [ -n "$sleep_pid" ]; then
@@ -210,23 +218,32 @@ cleanup() {
 	rm -rf "$tmp"
 	return "$rc"
 }
+note_bulk_signal() { # release --mine: remember the signal and let the in-flight box finish
+	bulk_signal=$1
+	bulk_status=$2
+}
 interrupted() {
-	local message="interrupted by SIG$1: a remote command it started may still be running"
-	case $COMMAND in exec | put | get | ssh | forward)
-		# exec_phase: not_started (resolving, waiting for a slot, a cooldown or the box), partial
-		# (a request or session that runs a command is open), yes (the result arrived).
-		if [ "$exec_phase" = not_started ]; then
-			message="interrupted by SIG$1 before anything started in the sandbox"
-		elif [ "$exec_phase" = yes ]; then
-			message="interrupted by SIG$1 after the remote command finished"
-		elif [ "$COMMAND" != ssh ] && [ "$COMMAND" != forward ]; then
-			message="interrupted by SIG$1: the remote command was killed when the connection closed; it may have run partly; processes it started in a new session (setsid) keep running"
-		fi ;;
-	esac
-	case $file_transfer in
-	PUT) message="interrupted by SIG$1: the file upload stopped; the remote file may have been replaced; check before retrying" ;;
-	GET) message="interrupted by SIG$1: the file download stopped; check the local destination" ;;
-	esac
+	local message
+	if [ -n "$interrupt_detail" ]; then
+		message=$interrupt_detail
+	else
+		message="interrupted by SIG$1: a remote command it started may still be running"
+		case $COMMAND in exec | put | get | ssh | forward)
+			# exec_phase: not_started (resolving, waiting for a slot, a cooldown or the box), partial
+			# (a request or session that runs a command is open), yes (the result arrived).
+			if [ "$exec_phase" = not_started ]; then
+				message="interrupted by SIG$1 before anything started in the sandbox"
+			elif [ "$exec_phase" = yes ]; then
+				message="interrupted by SIG$1 after the remote command finished"
+			elif [ "$COMMAND" != ssh ] && [ "$COMMAND" != forward ]; then
+				message="interrupted by SIG$1: the remote command was killed when the connection closed; it may have run partly; processes it started in a new session (setsid) keep running"
+			fi ;;
+		esac
+		case $file_transfer in
+		PUT) message="interrupted by SIG$1: the file upload stopped; the remote file may have been replaced; check before retrying" ;;
+		GET) message="interrupted by SIG$1: the file download stopped; check the local destination" ;;
+		esac
+	fi
 	if [ "$kept_claim" != null ]; then
 		message+="; sandbox still reserved: $(jq -r 'map(.name) | join(", ")' <<<"$kept_claim")"
 	fi
@@ -483,7 +500,7 @@ resolve() { # [--pool] name-or-id -> id. With --pool, only pool sandboxes (agent
 			m=$(jq -c --arg id "$id" '.[] | select(.id == $id)' <<<"$ms")
 			owned=$(jq -r --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
 				age($now) as $age | .metadata["ibx.claim.by"] == $by and
-				$age != null and $age != "invalid" and $age <= $stale' <<<"$m")
+				$age != null and ($age == "invalid" or $age <= $stale)' <<<"$m")
 			if [ "$owned" != true ]; then
 				if jq -e --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
 					.metadata["ibx.claim.by"] != $by and (free($now; $stale) | not)' <<<"$m" >/dev/null; then
@@ -1008,9 +1025,57 @@ looks_secret() { # path -> 0 when the file looks like a credential
 
 table() { if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi; }
 
+hold_class() { # machine-json -> owned, foreign, open, or bad
+	# An unreadable date is still a live hold: owned for this agent, foreign for anyone else.
+	jq -r --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
+		if .metadata != null and (.metadata | type) != "object" then "bad"
+		else age($now) as $age |
+			if .metadata["ibx.claim.by"] == $by and $age != null and ($age == "invalid" or $age <= $stale) then "owned"
+			elif .metadata["ibx.claim.by"] != $by and (free($now; $stale) | not) then "foreign"
+			else "open" end
+		end' <<<"$1"
+}
+
+refuse_foreign() { # machine-json box
+	local message held ms
+	ms=$(all_machines) || die "could not list sandboxes"
+	held=$(held_claims "$ms" "$AGENT")
+	message=$(jq -r "$JQ_DEFS"' "\(.name | clean) is held by \(.metadata["ibx.claim.by"] // "?" | clean) since \(.metadata["ibx.claim.at"] | clean): \(.metadata["ibx.claim.purpose"] // "" | clean)"' <<<"$1")
+	message+="; you hold: $(jq -r 'if length == 0 then "none" else map(.name) | join(", ") end' <<<"$held")"
+	json_error held_by_other "$message" "$held"
+	die "$message"
+}
+
+# The list check in resolve can be stale by the time release or renew writes. Re-apply it to the
+# machine just fetched, before any port delete or metadata write. A change after this read can
+# still win: the API has no compare-and-swap.
+fresh_holder() { # machine-json box
+	local kind message
+	[ "${IBX_ALLOW_ANY:-}" = 1 ] && return 0
+	kind=$(hold_class "$1") || die "could not read the reservation of $2"
+	case $COMMAND in
+	renew)
+		case $kind in
+		owned) return 0 ;;
+		foreign) refuse_foreign "$1" "$2" ;;
+		bad) die "could not read the reservation of $2" ;;
+		*)
+			message="$2 is not reserved by you; ibx claim first (no live reservation to renew)"
+			json_error not_held "$message"
+			die "$message" ;;
+		esac ;;
+	release)
+		case $kind in
+		foreign) refuse_foreign "$1" "$2" ;;
+		bad) die "could not read the reservation of $2" ;;
+		esac ;;
+	esac
+}
+
 release_box() { # box: shared by literal and bulk release
 	id=$(resolve --pool "$1")
 	m=$(api GET "/v1/machines/$id") || die "could not read $1"
+	fresh_holder "$m" "$1"
 	ports=$(public_ports "$id") || die "could not list the public ports of $1; nothing released, try again"
 	left='' unpublished='[]' left_alone='[]' reasons='[]'
 	start=$(jq -r '.metadata["ibx.claim.start"] // empty' <<<"$m")
@@ -1044,14 +1109,16 @@ release_box() { # box: shared by literal and bulk release
 }
 
 # shellcheck disable=SC2030 # private subshell state must survive function unwinding at EXIT
-release_isolated() ( # box: private result/error files; AUTH stays a shell variable
+release_isolated() ( # status-file box: private result/error files; AUTH stays a shell variable
 	set -e
+	trap - INT TERM # a signal aimed at the parent must not kill this release halfway
+	release_status_file=$1
 	tmp=$(mktemp -d "${TMPDIR:-/tmp}/ibx.XXXXXX") || die "could not stage release"
 	JSON=1 main_pid=$BASHPID
 	trap cleanup EXIT
 	exec {JSON_FD}>&1
 	: >"$tmp/warnings"
-	release_box "$1"
+	release_box "$2"
 )
 
 cmd=$1
@@ -1293,6 +1360,7 @@ renew)
 	[ $# -ge 1 ] || die "usage: ibx renew <box>"
 	id=$(resolve --pool "$1")
 	m=$(api GET "/v1/machines/$id") || die "could not read $1"
+	fresh_holder "$m" "$1"
 	[ -n "$(jq -r '.metadata["ibx.claim.token"] // ""' <<<"$m")" ] || die "$1 has no reservation to renew (ibx claim)"
 	since=$(now_iso)
 	set_meta "$id" '. + {"ibx.claim.at": $at}' --arg at "$since" || die "could not renew $1"
@@ -1315,25 +1383,51 @@ release)
 		ms=$(all_machines) || die "could not list sandboxes"
 		held=$(held_claims "$ms" "$AGENT")
 		released='[]' failed='[]'
+		# Wait in the background. A foreground subshell would hold this trap until the release
+		# finished, and the interrupt would then hide a reservation that release had already cleared.
+		trap 'note_bulk_signal INT 130' INT
+		trap 'note_bulk_signal TERM 143' TERM
 		while IFS= read -r id; do
+			[ -z "$bulk_signal" ] || break
 			name=$(jq -r --arg id "$id" "$JQ_DEFS"' .[] | select(.id == $id) | .name | clean' <<<"$ms")
+			rm -f "$tmp/release-rc"
 			# Do not put the helper in an if condition: that disables its errexit too.
+			release_isolated "$tmp/release-rc" "$id" >"$tmp/release-result" &
+			release_pid=$!
 			set +e
-			release_isolated "$id" >"$tmp/release-result"
-			release_rc=$?
+			wait "$release_pid"
 			set -e
+			if [ -n "$bulk_signal" ] && [ ! -s "$tmp/release-rc" ]; then
+				set +e
+				wait "$release_pid"
+				set -e
+			fi
+			if [ -s "$tmp/release-rc" ]; then release_rc=$(cat "$tmp/release-rc"); else release_rc=125; fi
+			rm -f "$tmp/release-rc"
 			if [ "$release_rc" = 0 ]; then
 				released=$(jq -c --arg n "$name" "$JQ_DEFS"' . + [($n | clean)]' <<<"$released")
 				[ -n "$JSON" ] || printf 'released %s\n' "$name"
 			else
+				[ -s "$tmp/release-result" ] || printf '%s\n' '{"error":{"code":"failed","message":"release failed"}}' >"$tmp/release-result"
 				failed=$(jq -c --arg n "$name" --slurpfile r "$tmp/release-result" "$JQ_DEFS"'
 					. + [{name:($n | clean),error:($r[0].error // {code:"failed",message:"release failed"})}]' <<<"$failed")
 			fi
-			jq -c '.warnings[]?' "$tmp/release-result" >>"$tmp/warnings"
+			jq -c '.warnings[]?' "$tmp/release-result" >>"$tmp/warnings" || true
+			[ -z "$bulk_signal" ] || break
 		done < <(jq -r --arg by "$AGENT" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"'
 			.[] | select(inpool and .metadata["ibx.claim.by"] == $by) | age($now) as $age |
 			select($age != null and $age != "invalid" and $age <= $stale) | .id' <<<"$ms")
 		[ "$(jq length <<<"$held")" != 0 ] || warn "you hold no sandboxes"
+		if [ -n "$bulk_signal" ]; then
+			interrupt_detail=$(jq -rn --argjson released "$released" --argjson failed "$failed" --arg sig "$bulk_signal" '
+				"interrupted by SIG\($sig): " +
+				(if ($released | length) == 0 then "no box had been released"
+				 else "released \($released | join(", "))" end) +
+				(if ($failed | length) == 0 then ""
+				 else "; not released: \($failed | map(.name) | join(", "))" end) +
+				"; no further boxes were released"')
+			interrupted "$bulk_signal" "$bulk_status"
+		fi
 		jq -cn --argjson released "$released" --argjson failed "$failed" '{released:$released,failed:$failed}' >"$tmp/result"
 		[ "$(jq length <<<"$failed")" = 0 ] || exit 125
 		exit 0
