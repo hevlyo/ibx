@@ -18,8 +18,9 @@ Use the literal box name returned by claim in later calls. The example name abov
 example. Other holders may be using it.
 
 ibx is independent of InsForge. The official CLI and SDK administer your org and its
-sandboxes. ibx adds shared reservations, a per-agent cap, activity leases, credential guards
-and exec retry rules for coding agents. It does not create or delete boxes, keys or snapshots.
+sandboxes. ibx adds shared reservations, a per-agent cap, activity leases on paid plans,
+credential guards and exec retry rules for coding agents. It does not create or delete boxes,
+keys or snapshots.
 
 ## Install
 
@@ -77,7 +78,7 @@ is in the way, it stops before changing anything and names it.
 | `--agents LIST` | Skills roots, comma-separated. `claude` is `$CLAUDE_CONFIG_DIR/skills` (default `~/.claude/skills`), `agents` is `~/.agents/skills` (read by Codex and other agents), `codex` is `$CODEX_HOME/skills` (default `~/.codex/skills`), `opencode` is `${XDG_CONFIG_HOME:-~/.config}/opencode/skills`. `all` is every root above, and `none` installs no skill (useful with the bin link alone). Default `claude,agents`. |
 | `--copy` | Copy the skill instead of linking it. Run it again after a `git pull`. |
 | `--bin DIR`, `--no-bin` | Where the `ibx` command is linked (default `~/.local/bin`), or not at all. |
-| `--keepalive`, `--keepalive=all` | Install the keepalive timer (step 3 of [Setup](#setup)). |
+| `--keepalive`, `--keepalive=all` | Install the keepalive timer (step 3 of [Setup](#setup)). Paid plans only: it prints a warning, because the free plan's terms forbid it. |
 | `--uninstall` | Remove what install.sh installed. |
 | `--dry-run` | Print every change, including the timer files, and change nothing. |
 
@@ -109,8 +110,12 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
    reach every child your shell starts. ibx removes it before launching its own children.
 
 2. Keep the pool in an org with no Org Secrets and create boxes with both credential stores
-   disabled. New free orgs normally get one box; some older orgs have a higher limit. Read
-   `ibx doctor` before creating more.
+   disabled. New free orgs normally get one box. Accounts registered before 2026-10-20 and
+   activated before 2026-10-25 07:45 UTC got five free sandboxes until 2026-12-01 00:00 UTC;
+   after that only one free box runs at a time, and the service pauses the others
+   ([pricing](https://instabox.sh/docs/account/pricing)). A released free box keeps the slot
+   until it pauses after 30 idle minutes, so agents share one box in turn. Read `ibx doctor`
+   before creating more.
 
    ```sh
    instabox create --name box-1 --no-vault --secrets none
@@ -123,13 +128,21 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
    not turn off Org Secrets. Clear both proxy and env selections when repairing an old box.
    Claim fails closed when it cannot inspect selections, application state or residue.
 
-3. If you want automatic idle protection, install the optional timer yourself.
+3. On a paid plan, if you want automatic idle protection, install the optional timer
+   yourself.
 
    ```sh
    ./install.sh --keepalive
    ```
 
-   ibx never changes your installed timer on its own. See [keepalive](skills/ibx/references/keepalive.md).
+   Do not install it on the free plan. The [terms](https://instabox.sh/terms), updated on
+   2026-11-06, say in §2(e): "On the free plan, Customer may not: ... (ii) generate
+   artificial activity, such as scheduled pings, activity leases renewed from outside the
+   Sandbox, or busy loops, to keep a Sandbox from pausing after inactivity, or pause and
+   resume a Sandbox to reset its maximum runtime." The timer renews leases from your computer,
+   which is that pattern, so `ibx keepalive` skips free boxes and `ibx doctor` fails when a
+   timer is installed and a pool box is free. ibx never changes your installed timer on its
+   own. See [keepalive](skills/ibx/references/keepalive.md).
 
 ## Commands
 
@@ -146,7 +159,7 @@ and port names (`ibx:...`), and it does not need the instabox CLI. Install both 
 | `ibx unport BOX PORT` | Unpublish a port |
 | `ibx renew [--json] BOX` | Renew reservation age without changing its start time |
 | `ibx release [--json] BOX \| --mine` | Remove ibx ports and ports created during the reservation, drop lease and claim; --mine releases yours |
-| `ibx keepalive [--all]` | Renew reserved boxes, or every pool box with --all; cooldown, disabled max-run and billing refusals are skips |
+| `ibx keepalive [--all]` | Paid plans: renew reserved boxes, or every pool box with --all. Free boxes, cooldowns, abuse locks, disabled max-run, the start rate limit, the free running-box limit and billing refusals are skips |
 | `ibx pool add|rm BOX...` | User chooses pool membership |
 | `ibx doctor` | Dependencies, key, org plan and usage, run budgets, Secrets, ports and token audit; each FAIL names a next step |
 
@@ -160,7 +173,8 @@ tracked files for secrets; never transfer `.git`, local config or credentials.
 
 For a private preview, run `ibx forward BOX 18080:8080` and visit `http://127.0.0.1:18080`.
 Forwarding binds only to loopback. Its token lasts one hour, and its open-tunnel behavior after
-expiry is unverified. The tunnel relies on the reservation's activity lease.
+expiry is unverified. On a paid plan the claim's activity lease keeps the box awake. On the
+free plan claim sets no lease, so a box left idle for 30 minutes pauses and the tunnel closes.
 
 ## Reservations and parallel work
 
@@ -200,15 +214,28 @@ matter; ibx uses its own clock only when that PATCH left `updatedAt` unchanged.
 
 ## Lifecycle and long jobs
 
-The free plan fixes idle pause at 1800 seconds. Other values return 403 `permission_denied`.
-Paid plans allow 300-1800 in steps of 300, or 0 with always-on; the 120-86400 range is for
+The free plan fixes idle pause at 1800 seconds. Other values return 403 `spec_not_allowed` (`permission_denied` on older servers).
+Paid plans allow 300-1800 in whole minutes, or 0 with always-on; the 120-86400 range is for
 admin-granted manual lifecycle accounts. ibx changes none of these settings.
 
-Claim sets a one-hour activity lease. A timer renews it every 15 minutes. Leases prevent idle
-pauses, but free boxes still pause after 480 continuous minutes. All wake paths refuse until
-`cooldownUntil`; the spec default is 10 minutes, and observed cooldowns were 5-17 minutes.
-Plan checkpoints near eight hours; a refused poll is not a dead job. After a wake, check the
-job PID and `runtime.processesPreserved` in `ibx ls --json`. A fresh boot loses processes.
+On a paid plan, claim sets a one-hour activity lease and the optional timer renews it every
+15 minutes. On the free plan, claim sets no lease and keepalive skips free boxes, because the
+terms forbid renewing leases from outside the box (see [Setup](#setup)). A free box pauses
+after 30 idle minutes and wakes on the next exec, file read or SSH connection; the request
+waits up to 45 seconds for the resume. Idle means no coding agent working, no terminal or SSH
+traffic and no CPU load, so a detached job that waits silently can pause. ibx never pauses and
+resumes a box to reset its run limit.
+
+Free boxes also pause at their max-run limit. Each free run starts with 120 minutes, and use
+(commands, file access, port requests, terminal or SSH traffic, CPU load) extends it, up to
+480 minutes; activity leases and wakes do not count. `maxRunMinutes` and ibx's `pausesAt` show
+the current limit, which can still grow ([auto-pause](https://instabox.sh/docs/machines/auto-pause#runtime-on-the-free-plan)). After a max-run pause every wake path
+refuses until `cooldownUntil`: 5-20 minutes, then 60-75 and 120-135 minutes for back-to-back
+max-run pauses on the free plan ([auto-pause](https://instabox.sh/docs/machines/auto-pause)).
+An automatic abuse check can lock a box for up to 24 hours; ibx fails at once with
+`abuse_lock` instead of waiting. Plan checkpoints well before the run limit; a refused poll is
+not a dead job. After a wake, check the job PID and `runtime.processesPreserved` in
+`ibx ls --json`. A fresh boot loses processes.
 
 Use detached jobs for work longer than a tool call. Redirect every stream and record status.
 
@@ -222,6 +249,10 @@ pipes. Closing an exec connection kills its process group, even when the command
 Children started in a new session with `setsid` can survive. A dropped SSH command may still
 be running. Never retry user exec after `host_unavailable`, even if the API says retryable.
 
+The API docs say a buffered exec that prints nothing can be cut by a proxy or NAT on the way
+(seen at about 270 seconds). Give a quiet command that may run longer than about 4 minutes
+`--stream`, or start it with `ibx run`.
+
 Opt into `ibx exec BOX --stream -- CMD` for SSE output as it arrives, without the buffered
 1 MiB cap. It keeps partial output after an error, but a dropped stream kills the command.
 A stream error never retries partly-run work. The same 600-second limit applies; use detached
@@ -231,11 +262,11 @@ The shared limit is 32 concurrent requests per user, including files, desktop, f
 Secret refresh. Buffered exec caps stdout and stderr at 1 MiB each. Invalid UTF-8 is replaced
 and reported, not preserved as binary. Use get for binary output.
 
-With `keepalive --all`, free boxes cycle through eight hours running, cooldown, then up to 15
-minutes before the timer wakes them. Free hours may have an org cap; 0 means no cap. An
-included-usage suspension occurred on 2026-10-18. A paid 4 vCPU/8 GiB box costs about $0.034
-per running hour, plus storage (about $0.0022 an hour for 20 GiB, also while paused); the Pro
-plan adds a $20 monthly fee that includes $20 of usage. The user decides the timer mode.
+`keepalive --all` keeps every paid pool box running, so it bills the whole pool's running
+time. A paid 4 vCPU/8 GiB box costs about $0.034 per running hour, plus storage (about $0.0022
+an hour for 20 GiB, also while paused); the Pro plan adds a $20 monthly fee that includes $20
+of usage. On the free plan, free hours may have an org cap (0 means no cap); an included-usage
+suspension occurred on 2026-10-18. The user decides whether to install a timer and its mode.
 
 ## Safety and cleanup
 
@@ -272,12 +303,13 @@ pool recreation because it cannot pass `--no-vault --secrets none`. Keep deletio
 ## JSON and exit codes
 
 Claim, renew and release accept `--json` anywhere after the command and emit exactly one
-object with warnings. Error codes are `no_free_sandbox`, `claim_limit` and `lock_busy` (75),
-`auth` and `account_blocked` (125), `failed` (normally 125, or an unexpected command status),
+object with warnings. Error codes are `no_free_sandbox`, `claim_limit`, `free_limit`, `running_limit` (the plan
+allows no more sandboxes running at once) and `lock_busy` (75), `auth`, `account_blocked` (billing refusals and `403 account_disabled`) and
+`abuse_lock` (125), `failed` (normally 125, or an unexpected command status),
 `held_by_other`, `not_held`, `ambiguous_identity` (125), and `interrupted` (130/143). Check `error.held` and release any box it names. `ls --json`
-rows carry `secrets` (true when Org Secrets are selected or could not be inspected), `vault`,
-`pausesAt`, `cooldownUntil` and the API's `runtime` (`ready`, `processesPreserved`). API
-strings in diagnostics are cleaned before printing. `ls --mine --json` returns
+rows carry `free` (a free-plan box: no lease from outside, see keepalive), `secrets` (true when
+Org Secrets are selected or could not be inspected), `vault`, `pausesAt`, `cooldownUntil`, `cooldownReason` (an `abuse_` value is an abuse lock) and the
+API's `runtime` (`ready`, `processesPreserved`). API strings in diagnostics are cleaned before printing. `ls --mine --json` returns
 `{agent,agentSource,boxes}`, with the same box rows as `ls --json`. `release --mine --json`
 returns `{released:[names],failed:[{name,error}],warnings}`. A partial failure retains this
 result and exits 125, so callers can distinguish released boxes from those needing another try.
@@ -285,11 +317,11 @@ result and exits 125, so callers can distinguish released boxes from those needi
 | Exit | Meaning |
 |---|---|
 | The remote command's own | `exec` and `ssh` pass it through. |
-| 0 | Success. `keepalive` also exits 0 when it skips a box in cooldown, with max-run disabled, or blocked by billing (402). |
+| 0 | Success. `keepalive` also exits 0 when it skips a free box, a box in cooldown or under an abuse lock, one with max-run disabled, or one refused by the start rate limit (429 `rate_limited`), the free running-box limit, the plan's running limit (`running_limit`) or billing (402). |
 | 1 | `keepalive` could not renew at least one lease for another reason (the lease request was refused or cut off). Failure of the initial sandbox list (for example, a bad key or unreachable API) exits 125. A key that can list boxes but lacks `machines:write` fails each lease with `missing_scope` and exits 1. |
-| 75 | No free sandbox, the agent already holds `IBX_MAX_CLAIMS` sandboxes, or another claim on this computer held the lock for 5 minutes. |
+| 75 | No free sandbox, the free plan's running-box limit (`free_limit`), the plan's running limit (`running_limit`), the agent already holds `IBX_MAX_CLAIMS` sandboxes, or another claim on this computer held the lock for 5 minutes. |
 | 124 | `exec` timed out. |
-| 125 | ibx failed: API, network, usage, a guard (credential file, Vault, Org Secrets), or a sandbox outside the pool. A claim that could not inspect a box's Secrets exits 125, not 75. |
+| 125 | ibx failed: API, network, usage, a guard (credential file, Vault, Org Secrets), or a sandbox outside the pool. A claim that could not inspect a box's Secrets exits 125, not 75. An exec, file transfer, `run` or `job` whose own request hit `500 restore_failed` exits 125 and says it did not run: the box lost its processes, and the next command starts it from its disks. When API calls keep failing, check [status.instabox.sh](https://status.instabox.sh). |
 | 130 / 143 | ibx got SIGINT / SIGTERM. The message says whether the remote command had started. |
 | 255 | `ssh` could not connect (or the remote command exited 255). |
 
@@ -317,19 +349,22 @@ agents never to set them.
 
 Checked against the 2026-10-27 docs, CLI 0.7.1 and SDK 0.5.3.
 
-| Feature | ibx | Official CLI / SDK / skills |
+| Feature | ibx | Official [CLI](https://instabox.sh/docs/reference/cli) / [SDK](https://instabox.sh/docs/reference/sdk) / skills |
 |---|---|---|
 | Reservations, cap and pool guard | Yes | No |
 | Exec retry rules | Never repeats a user command once it may have started | Caller must apply the API's partly-run rules |
 | Command tools | exec, SSH | CLI exec --stream, --background, jobs, --json, argv and run; SDK command API |
 | Files | Guarded put up to 5 GiB, bounded get | CLI push, pull, cp; SDK files |
 | Credentials | Reads Vault and Org Secret state, fails closed | Manages Org Secrets and legacy Vault; basic setup enrolls credentials |
-| Lifecycle | Wake/resume/start existing pool boxes, leases | Create, delete, snapshots, restart, fork and auto-suspend settings; max-run through the API (`maxRunMinutes`) |
+| Lifecycle | Wake/resume/start existing pool boxes, leases on paid plans | Create, delete, snapshots, restart, fork and auto-suspend settings; max-run through the API (`maxRunMinutes`) |
 | Access | Private forward and public port cleanup | port-forward, ports, desktop |
 | Diagnostics | Org usage, run budgets, ports and SSH tokens | usage, logs, ps, metrics |
 
-Activity leases are documented only in the OpenAPI spec, so ibx tracks that contract.
-Official CLI jobs hold no activity lease and bypass ibx's reservations and guards.
+Activity leases are documented in the OpenAPI spec and the
+[auto-pause](https://instabox.sh/docs/machines/auto-pause) page, which still suggests one for a
+silent task with no free-plan caveat. The terms of 2026-11-06 forbid renewing them from outside
+the box on the free plan, and ibx follows the terms. Official CLI jobs hold no activity lease
+and bypass ibx's reservations and guards.
 
 ## References and development
 
@@ -339,6 +374,8 @@ Official CLI jobs hold no activity lease and bypass ibx's reservations and guard
 - [Field notes](skills/ibx/references/field-notes.md)
 - [Keepalive](skills/ibx/references/keepalive.md)
 - [2026-10-27 research and decisions](docs/research/2026-10-27-instabox-changes.md)
+- [2026-11-06 research and decisions](docs/research/2026-11-06-instabox-changes.md)
+- [2026-11-21 research and decisions](docs/research/2026-11-21-instabox-changes.md)
 - [Changelog](CHANGELOG.md) and [security reporting](SECURITY.md)
 
 Offline tests use a local mock and scratch HOME, without a real account. Run `tests/offline.sh`

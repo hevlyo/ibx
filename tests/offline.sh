@@ -1508,6 +1508,15 @@ t_claim_states() {
 	rc_is "claim of a sandbox that boots fresh" 0
 	err_has "a fresh boot is warned about" 'came back with a fresh boot'
 
+	# ibx's own wake past the server's hold gets 409 operation_conflict naming the resume.
+	reset '"opDelay":3,"wakeHold":1,"set":{"box-1":{"state":"idle","freshBoot":true}}'
+	hold box-2 0
+	hold box-3 0
+	run claim "fresh-held"
+	rc_is "claim of a sandbox whose wake outlived its hold" 0
+	is "after one wake" "$(count POST '/wake$')" 1
+	err_has "warns about the fresh boot of the resume it waited for" 'came back with a fresh boot'
+
 	reset '"set":{"box-1":{"state":"suspended"}},"failOps":1'
 	hold box-2 0
 	hold box-3 0
@@ -1745,9 +1754,9 @@ t_exec() {
 	reset '"set":{"box-1":{"state":"idle"}}'
 	LIMIT=20 run exec box-1 -- 'exit 6'
 	rc_is "exec on an idle-paused sandbox wakes it, then runs" 6
-	is "409 machine_not_running, one wake, run" \
+	is "the exec itself wakes it: one request, no separate wake" \
 		"$(calls | jq -c '[.calls[] | select(.method == "POST") | [(.path | split("/") | last), .status]]')" \
-		'[["exec",409],["wake",200],["exec",200]]'
+		'[["exec",200]]'
 	is "the woken box is running" "$(box box-1 .state)" running
 
 	reset '"dropExecs":1'
@@ -3155,11 +3164,16 @@ t_guards030() {
 		"$(box box-1 '.metadata["ibx.claim.start"] != .updatedAt')" true
 
 	# A stream answered with a 4xx error envelope never started the command.
-	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict"}]'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"conflict"}]'
 	run exec box-1 --stream -- true
 	rc_is "a plain JSON stream refusal fails with 125 (409)" 125
 	err_has "and says the command did not run" 'exec did not run: the API'
 	is "without a retry" "$(count POST '/exec$')" 1
+	# operation_conflict (the wake hold ran out) is the one 409 that waits and sends it again.
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict","count":1}]'
+	run exec box-1 --stream -- 'exit 3'
+	rc_is "a streamed exec refused with operation_conflict runs after the wait" 3
+	is "sent twice" "$(count POST '/exec$')" 2
 
 	# Any other reply without a stream may come after the command started, including every
 	# 503: retryable host_unavailable can also mean an API restart killed a running command.
@@ -3476,8 +3490,559 @@ PY
 	out_has "and names the newer version" '9.9.9 is available'
 }
 
+t_nov1106() {
+	group "2026-11-06 terms: free-plan leases, free_limit, rate limit, abuse locks, exec history, OOM"
+	local timer=$S/nov-timer fake=$S/nov-ssh ended later repo id
+	repo=$(cd -- "$here/.." && pwd -P)
+	ended='"org":{"limits":{"freeSandboxHours":0,"startsPerMinute":3,"freeSandboxes":1,"earlyAllowanceEnded":true}}'
+	later=$(ago -7200)
+	# doctor sees a fake systemctl, crontab and launchctl, never the real ones: FAKE_TIMER_RC=0 is an
+	# active ibx-keepalive.timer, 3 an inactive one.
+	mkdir -p "$timer" "$fake"
+	printf '#!/bin/sh\ncase "$*" in *is-active*) exit "${FAKE_TIMER_RC:-3}" ;; esac\nexit 1\n' >"$timer/systemctl"
+	printf '#!/bin/sh\nexit 1\n' >"$timer/crontab"
+	printf '#!/bin/sh\nexit 0\n' >"$timer/launchctl"
+	printf '#!/bin/sh\nexit 0\n' >"$fake/ssh"
+	chmod +x "$timer/systemctl" "$timer/crontab" "$timer/launchctl" "$fake/ssh"
+
+	# B1: no lease from outside on a free-plan sandbox (Terms 2(e)).
+	reset '"seed":{"count":3,"free":true},"set":{"box-2":{"free":false}}'
+	hold box-1 60
+	hold box-2 60
+	run keepalive
+	rc_is "keepalive with a free sandbox succeeds" 0
+	out_has "it names the Terms and skips the free sandbox" '^box-1: free plan: renewing a lease from outside the sandbox is not allowed \(instabox Terms 2\(e\), 2026-11-06\), skipped$'
+	is "and sends no lease request for it" "$(count PUT "/$(box box-1 .id)/activity-leases/")" 0
+	out_has "a paid sandbox still gets its lease" '^box-2: lease until 20'
+	run keepalive --all
+	rc_is "keepalive --all with free sandboxes succeeds" 0
+	out_has "--all skips an unreserved free sandbox too" '^box-3: free plan: .*skipped$'
+	is "--all leases only the paid sandbox" "$(state | jq -c '[.machines[] | select(.leases | length > 0) | .name]')" '["box-2"]'
+	run ls --json
+	is "ls --json says which sandboxes are free-plan ones" "$(jq -c '[.[] | [.name, .free]]' "$S/out")" '[["box-1",true],["box-2",false],["box-3",true]]'
+	reset '"seed":{"count":1,"free":true}'
+	run claim --json x
+	rc_is "claim of a free sandbox succeeds" 0
+	is "it sets no lease (leaseUntil null)" "$(jq -c .leaseUntil "$S/out")" null
+	is "and sends no lease request" "$(count PUT '/activity-leases/')" 0
+	err_lacks "and does not warn about the lease" 'could not set the activity lease'
+	run release box-1
+	rc_is "release of the free sandbox" 0
+	is "release still drops the lease (idempotent)" "$(count DELETE '/activity-leases/')" 1
+	reset '"seed":{"count":1}'
+	run claim --json x
+	is "a paid sandbox's claim keeps its lease" "$(box box-1 '[.leases[].id]')" '["ibx-keepalive"]'
+	reset '"seed":{"count":1,"free":true}'
+	run PATH="$fake:$PATH" forward box-1 18080:8080
+	err_has "forward does not promise a lease on a free sandbox" 'free plan: nothing keeps the sandbox awake'
+	err_lacks "nor says the claim's lease keeps it awake" "claim's lease"
+	reset '"seed":{"count":2,"free":true}'
+	run PATH="$timer:$PATH" FAKE_TIMER_RC=0 doctor
+	rc_is "doctor fails with a keepalive timer and free sandboxes" 125
+	out_has "it names the timer, the count and the Terms" '^FAIL +keepalive timer active \(systemd\), and 2 pool sandbox\(es\) are on the free plan: .*Terms 2\(e\) \(2026-11-06\)'
+	out_has "and how to disable it" '^      next: the user disables it: systemctl --user disable --now ibx-keepalive\.timer, or \./install\.sh --uninstall --agents none --no-bin'
+	yes_ "every FAIL line has a next step" fail_next
+	run PATH="$timer:$PATH" FAKE_TIMER_RC=3 doctor
+	rc_is "doctor without a timer and free sandboxes passes" 0
+	out_lacks "it does not recommend a timer to a free plan" 'no keepalive timer'
+	reset '"seed":{"count":1}'
+	run PATH="$timer:$PATH" FAKE_TIMER_RC=0 doctor
+	out_has "a paid pool keeps the timer" '^ok +keepalive timer active \(systemd\)$'
+	run PATH="$timer:$PATH" FAKE_TIMER_RC=3 doctor
+	out_has "and a neutral note without one" '^warn +no keepalive timer: a reserved paid-plan sandbox'
+	(cd "$S" && env -u XDG_CONFIG_HOME HOME="$S/nov-home" IBX_INSTALL_OS=Linux bash "$repo/install.sh" --dry-run --keepalive --no-bin --agents none) >"$S/out" 2>"$S/err" </dev/null
+	RC=$? TIMEDOUT=
+	rc_is "install.sh --keepalive still installs (dry run)" 0
+	err_has "but warns that the timer is for paid plans only" 'keepalive timer is for paid plans only'
+	err_has "and why" 'break the instabox Terms 2\(e\) \(2026-11-06\)'
+	(cd "$S" && env -u XDG_CONFIG_HOME HOME="$S/nov-home" IBX_INSTALL_OS=Linux bash "$repo/install.sh" --dry-run --no-bin --agents none) >"$S/out" 2>"$S/err" </dev/null
+	RC=$? TIMEDOUT=
+	err_lacks "without --keepalive there is no warning" 'paid plans only'
+
+	# B2: 402 early_allowance_ended is free_limit, not a billing block.
+	reset "\"seed\":{\"count\":3,\"free\":true,\"idle\":[\"box-2\",\"box-3\"]},$ended"
+	hold box-1 0
+	run claim --json x
+	rc_is "claim with the free allowance used up exits 75" 75
+	is "with error.code free_limit" "$(jq -r .error.code "$S/out")" free_limit
+	yes_ "naming limits.freeSandboxes and what to do" eval 'jq -r .error.message "$S/out" | grep -q "the free plan now runs only 1 sandbox at a time (402 early_allowance_ended.*another free one is running\. A released free box keeps its slot until it pauses after 30 idle minutes.*otherwise ask the user"'
+	err_lacks "it never tells an agent to pause a box" 'pause or release'
+	is "it skips the other free sandbox after the first refusal" "$(count POST '/(wake|resume|start)$')" 1
+	is "and leaves no reservation behind" "$(claim_keys box-2):$(claim_keys box-3)" 0:0
+	run exec box-2 -- true
+	rc_is "exec on a free sandbox past the allowance fails" 125
+	err_has "with the free_limit message" 'free plan now runs only 1 sandbox at a time'
+	is "the exec's own wake is refused and not retried" "$(count POST '/exec$'):$(count POST '/wake$')" 1:1
+	run exec --json box-2 -- true
+	is "exec --json says it did not run, with free_limit" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","free_limit"]'
+	run put box-3 "$here/../LICENSE" x.txt
+	rc_is "put on a free sandbox past the allowance fails" 125
+	err_has "with the same message" 'free plan now runs only 1 sandbox'
+	run PATH="$timer:$PATH" doctor
+	out_has "doctor shows freeSandboxes and earlyAllowanceEnded" '^ok +org: .*"freeSandboxes":1,"earlyAllowanceEnded":true'
+	out_has "and says only that many can run" '^warn +the early free allowance has ended: only 1 free sandbox\(es\) can run at a time'
+	# A 402 early_allowance_ended refuses only free sandboxes: claim walks on to a paid one. The
+	# order of paused candidates is random, so three rounds with four free ones before it.
+	for round in 1 2 3; do
+		reset "\"seed\":{\"count\":6,\"free\":true,\"idle\":[\"box-2\",\"box-3\",\"box-4\",\"box-5\",\"box-6\"]},\"set\":{\"box-6\":{\"free\":false}},$ended"
+		hold box-1 0
+		run claim --json x
+		rc_is "mixed pool, round $round: claim takes the paid sandbox past the free limit" 0
+		is "mixed pool, round $round: it is box-6" "$(jq -r .name "$S/out")" box-6
+		is "mixed pool, round $round: at most one free sandbox is tried" \
+			"$(calls | jq '[.calls[] | select(.method == "POST" and .status == 402)] | length | . <= 1')" true
+		is "mixed pool, round $round: no reservation stays on a free one" \
+			"$(state | jq '[.machines[] | select(.name != "box-1" and .name != "box-6") | .metadata | keys[] | select(startswith("ibx.claim."))] | length')" 0
+	done
+	reset "\"seed\":{\"count\":2,\"free\":true,\"idle\":[\"box-2\"]},\"set\":{\"box-2\":{\"earlyAllowanceEnded\":true}},$ended"
+	hold box-1 0
+	run claim --json x
+	rc_is "a sandbox the server marks earlyAllowanceEnded is free_limit" 75
+	is "with error.code free_limit" "$(jq -r .error.code "$S/out")" free_limit
+	is "without a wake or a reservation" "$(count POST '/(wake|resume|start)$'):$(count PATCH '/machines/')" 0:0
+	reset "\"seed\":{\"count\":1,\"idle\":[\"box-1\"]},$ended,\"set\":{\"box-1\":{\"earlyAllowanceEnded\":false}}"
+	run claim --json x
+	rc_is "a paid sandbox is claimed while the free allowance has ended" 0
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":402,"code":"early_allowance_ended","message":"mock: allowance ended"}]'
+	run exec --json box-1 -- true
+	rc_is "an exec that wakes into the limit fails" 125
+	is "as free_limit, not account_blocked" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","free_limit"]'
+	is "and is never resent" "$(count POST '/exec$')" 1
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":402,"code":"early_allowance_ended"}]'
+	run run box-1 j1 -- true
+	rc_is "run into the limit fails" 125
+	err_has "with the free_limit message" 'free plan now runs only 5 sandboxes at a time'
+	reset '"seed":{"count":1},"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":402,"code":"early_allowance_ended"}]'
+	hold box-1 0
+	run keepalive
+	rc_is "free_limit is a keepalive skip" 0
+	out_has "and says why" '^box-1: the free plan now runs only 5 sandboxes at a time .*; skipped$'
+	out_lacks "not as a billing block" 'billing'
+
+	# B3: 429 rate_limited on a wake is waited out (curl retries it three times first).
+	reset '"seed":{"count":1,"idle":["box-1"]},"faults":[{"kind":"error","method":"POST","match":"/wake$","status":429,"code":"rate_limited","retryable":true,"retryAfterSeconds":1,"count":5}]'
+	run claim --json x
+	rc_is "claim waits out the start rate limit" 0
+	is "and wakes the sandbox after it" "$(box box-1 .state)" running
+	is "one more wake after curl's retries" "$(count POST '/wake$')" 6
+	# An exec wakes a sandbox that paused itself; its 429 comes from that wake.
+	reset '"seed":{"count":1,"idle":["box-1"]},"faults":[{"kind":"error","method":"POST","match":"/exec$","status":429,"code":"rate_limited","retryable":true,"retryAfterSeconds":7}]'
+	run exec --json box-1 -- true
+	rc_is "an exec whose wake hits the start rate limit fails" 125
+	is "exec itself is never resent, and nothing else wakes the box" "$(count POST '/exec$'):$(count POST '/(wake|resume|start)$')" 1:0
+	is "and says it did not run" "$(jq -r .ran "$S/out")" no
+	err_has "naming the rate limit and the wait" 'exec did not run: waking box-1 hit the account.s start rate limit .*try again in 7 s'
+
+	# B4: an abuse lock is not waited out.
+	reset "$(jq -cn --arg c "$(ago -30)" '{seed:{count:1},set:{"box-1":{state:"suspended",cooldownUntil:$c,cooldownReason:"abuse_cpu",
+		abuseLock:{at:"2026-11-06T10:00:00Z",explanation:"was mining\u001b[2J",what:"xmrig at 98% CPU",appeal:"instabox feedback"}}}}' | sed 's/^{//; s/}$//')"
+	run exec --json box-1 -- true
+	rc_is "exec on an abuse-locked sandbox fails at once" 125
+	is "with abuse_lock and ran no" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","abuse_lock"]'
+	err_has "it names the check and the lock" 'an instabox abuse check \(abuse_cpu\) locked box-1 until .*stop and tell the user'
+	err_has "with the explanation, the finding and the appeal" 'was mining.*xmrig at 98% CPU. Appeal: instabox feedback'
+	yes_ "server text is cleaned" eval '! has_ctl "$S/out" "$S/err"'
+	is "no exec was attempted after the refusal" "$(count POST '/exec$')" 1
+	run get box-1 x.txt "$S/nov-got"
+	rc_is "get on it fails at once too" 125
+	err_has "with the abuse message" 'abuse check \(abuse_cpu\)'
+	reset "$(jq -cn --arg c "$later" '{seed:{count:3},set:{"box-1":{state:"suspended",cooldownUntil:$c,cooldownReason:"abuse_network_flows"},"box-3":{cooldownUntil:$c}}}' | sed 's/^{//; s/}$//')"
+	hold box-2 0
+	run claim --json x
+	rc_is "claim skips an abuse-locked sandbox" 75
+	yes_ "and names the lock in its warnings" eval 'jq -r ".warnings[]" "$S/out" | grep -q "^box-1: abuse lock (abuse_network_flows) until .*tell the user"'
+	is "it writes no reservation to it" "$(claim_keys box-1)" 0
+	run ls --json
+	is "ls --json exposes cooldownReason" "$(jq -c '[.[] | .cooldownReason]' "$S/out")" '["abuse_network_flows",null,null]'
+	is "and free, false for a paid sandbox" "$(jq -c '[.[] | .free]' "$S/out")" '[false,false,false]'
+	run ls
+	out_has "ls shows the abuse lock" '^box-1 .*abuse lock until '
+	out_has "and a max-run cooldown as a plain date" "^box-3 .*${later%%T*}T"
+	out_lacks "without calling it an abuse lock" '^box-3 .*abuse lock'
+	hold box-1 0
+	hold box-3 0
+	ctl '{"set":{"box-1":{"state":"running"}}}'
+	ctl "$(jq -cn --arg c "$later" '{set:{"box-1":{cooldownUntil:$c,cooldownReason:"abuse_network_flows"}}}')"
+	run keepalive
+	rc_is "keepalive skips an abuse lock" 0
+	out_has "and calls it one" '^box-1: abuse lock until .*, skipped$'
+	out_has "a long max-run cooldown is still a cooldown skip" '^box-3: max-run cooldown until .*, skipped$'
+	is "neither gets a lease request (only box-2 does)" "$(count PUT '/activity-leases/')" 1
+	reset '"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":409,"code":"machine_cooldown","reason":"abuse_egress_blocklist","retryAfterSeconds":2,"count":4}]'
+	hold box-1 0
+	run keepalive
+	rc_is "a raced abuse lock is a keepalive skip" 0
+	out_has "named as an abuse lock" '^box-1: abuse lock, retry after 2 s, skipped$'
+	reset "$(jq -cn --arg c "$later" '{seed:{count:1},set:{"box-1":{state:"suspended",cooldownUntil:$c,cooldownReason:"abuse_cpu",
+		abuseLock:{at:"2026-11-06T10:00:00Z",explanation:"was mining",what:"xmrig at 98% CPU",appeal:"instabox feedback"}}}}' | sed 's/^{//; s/}$//')"
+	run PATH="$timer:$PATH" doctor
+	rc_is "doctor fails on an abuse-locked pool sandbox" 125
+	out_has "it prints the explanation and the finding" '^FAIL +box-1 has an abuse lock \(abuse_cpu\) until .*: was mining; xmrig at 98% CPU$'
+	out_has "and the appeal as the next step" '^      next: tell the user; .*to contest it: instabox feedback$'
+	# Server text inside the message never reclassifies a refusal that came before anything ran.
+	reset "$(jq -cn --arg c "$later" '{seed:{count:1},set:{"box-1":{state:"suspended",cooldownUntil:$c,cooldownReason:"abuse_cpu",
+		abuseLock:{at:"2026-11-06T10:00:00Z",explanation:"traffic was cut off",what:"the miner process was killed; it may have run",appeal:"x"}}}}' | sed 's/^{//; s/}$//')"
+	run exec --json box-1 -- true
+	is "an abuse lock whose text says was killed stays abuse_lock, ran no" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","abuse_lock"]'
+	run job box-1 nojob
+	rc_is "ibx job on an abuse-locked sandbox fails" 125
+	err_has "with the abuse lock, not a generic failure" 'abuse check \(abuse_cpu\) locked box-1 .*Appeal: x'
+	run run box-1 j2 -- true
+	rc_is "ibx run on it fails too" 125
+	err_has "with the abuse lock" 'abuse check \(abuse_cpu\) locked box-1'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":402,"code":"early_allowance_ended","message":"the command was cut off and may have run"}]'
+	run exec --json box-1 -- true
+	is "a free_limit message with such words stays free_limit, ran no" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","free_limit"]'
+
+	# A 409 operation_conflict (a wake still running after the 45-second hold) comes before the
+	# command starts: ibx waits for the sandbox and sends it again.
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict","retryable":true,"count":1}]'
+	run exec box-1 -- 'exit 4'
+	rc_is "exec retries after a 409 operation_conflict" 4
+	is "once" "$(count POST '/exec$')" 2
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict","retryable":true,"count":9}]'
+	run exec --json box-1 -- true
+	rc_is "exec gives up on a conflict that does not clear" 125
+	is "saying nothing ran" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","not_started"]'
+	is "after a bounded number of tries" "$(count POST '/exec$')" 4
+	# On a running sandbox busy with another operation (a snapshot, a resize), ensure_running
+	# returns at once: ibx must wait on the operation the 409 names before it sends again.
+	# A 10-second operation leaves room for slow hosts: the request must reach it while it runs.
+	reset '"seed":{"count":1},"opDelay":10,"set":{"box-1":{"busyOp":"snapshot"}}'
+	id=$(box box-1 .operationId)
+	run exec box-1 -- 'exit 4'
+	rc_is "exec refused by another operation on a running box runs after it" 4
+	is "the exec is sent twice" "$(count POST '/exec$')" 2
+	is "with a wait on the named operation between the two" "$(calls | jq -c --arg op "/v1/operations/$id" '
+		[.calls[] | if .method == "POST" and (.path | test("/exec$")) then "exec"
+			elif .method == "GET" and .path == $op then "op" else empty end] | [.[0], (.[1:-1] | unique), .[-1]]')" '["exec",["op"],"exec"]'
+	# The server's own wake (trigger: request) past its hold: the 409 names the resume ibx then
+	# waits for, so ibx sees how it ended and warns about a fresh boot.
+	reset '"seed":{"count":1},"opDelay":3,"wakeHold":1,"set":{"box-1":{"state":"idle","freshBoot":true}}'
+	run exec box-1 -- 'exit 4'
+	rc_is "exec after the server's wake outlived its hold" 4
+	is "is sent twice" "$(count POST '/exec$')" 2
+	is "without a wake of its own" "$(count POST '/(wake|resume)$')" 0
+	err_has "and warns that the wake it waited for booted fresh" 'WARNING: box-1 came back with a fresh boot'
+	reset '"seed":{"count":1},"opDelay":3,"wakeHold":1,"set":{"box-1":{"state":"idle"}}'
+	run exec box-1 -- 'exit 4'
+	rc_is "exec after a wake that kept the processes" 4
+	err_lacks "does not warn" 'fresh boot'
+	reset '"seed":{"count":1},"opDelay":3,"wakeHold":1,"set":{"box-1":{"state":"idle","freshBoot":true}}'
+	run put box-1 "$here/../LICENSE" lic.txt
+	rc_is "put after the server's wake outlived its hold" 0
+	err_has "warns about the fresh boot too" 'WARNING: box-1 came back with a fresh boot'
+	reset '"seed":{"count":1},"opDelay":10,"set":{"box-1":{"busyOp":"resize"}}'
+	id=$(box box-1 .operationId)
+	run put box-1 "$here/../LICENSE" lic.txt
+	rc_is "put refused by another operation on a running box runs after it" 0
+	is "with a wait on the named operation between the two uploads" "$(calls | jq -c --arg op "/v1/operations/$id" '
+		[.calls[] | if .method == "PUT" and (.path | test("/files$")) then "put"
+			elif .method == "GET" and .path == $op then "op" else empty end] | [.[0], (.[1:-1] | unique), .[-1]]')" '["put",["op"],"put"]'
+	reset '"seed":{"count":1},"opDelay":10,"set":{"box-1":{"busyOp":"snapshot"}}'
+	id=$(box box-1 .operationId)
+	run get box-1 nothing-here "$S/conflict-get"
+	is "get waits on the named operation before it reads again" "$(count GET "^/v1/operations/$id\$")" 1
+	is "and reads twice" "$(count GET '/files/content$')" 2
+	reset '"seed":{"count":1},"opDelay":3,"failOps":1'
+	ctl '{"set":{"box-1":{"busyOp":"snapshot"}}}' # after the failop fault, so this operation fails
+	run exec --json box-1 -- true
+	# The failed snapshot leaves the box running: the sandbox's state decides, not the operation's.
+	rc_is "exec runs after the operation it waited for failed on a box still running" 0
+	is "saying it ran" "$(jq -c '[.ran,.exitCode]' "$S/out")" '["yes",0]'
+	is "it is sent again once" "$(count POST '/exec$')" 2
+	reset '"seed":{"count":1},"opDelay":3,"set":{"box-1":{"busyOp":"snapshot"}}'
+	is "a busy operation that ends keeps the run's start time" "$(box box-1 .runStartedAt)" "$(sleep 4; box box-1 .runStartedAt)"
+	reset '"faults":[{"kind":"error","method":"PUT","match":"/files$","status":409,"code":"operation_conflict","retryable":true,"count":1}]'
+	run put box-1 "$here/../LICENSE" lic.txt
+	rc_is "put retries after a 409 operation_conflict" 0
+	is "the upload is sent twice" "$(count PUT '/files$')" 2
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict","retryable":true,"count":1}]'
+	run run box-1 j3 -- true
+	rc_is "run refused by a conflict fails" 125
+	err_has "and says it did not start" 'run did not start'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"operation_conflict","retryable":true,"count":1}]'
+	run job box-1
+	rc_is "job refused by a conflict fails" 125
+	err_has "and says nothing started" 'nothing started, run ibx job again'
+
+	# B5: exec history. noHistory for ibx's own commands, historyCommand for a wrapper.
+	reset '"seed":{"count":1}'
+	run exec box-1 -- echo plain
+	is "plain exec sends neither history field" "$(last_exec '[has("noHistory"), has("historyCommand")]' | jq -c .)" '[false,false]'
+	run exec box-1 --tail 5 -- 'echo tailed'
+	rc_is "exec --tail" 0
+	is "exec --tail shows the user's command in the history" "$(last_exec '[has("noHistory"), .historyCommand]' | jq -c .)" '[false,"echo tailed"]'
+	run claim --json x
+	ctl '{"resetCalls":true}'
+	run run box-1 hist -- 'sleep 30'
+	rc_is "run starts a job" 0
+	run job box-1 hist
+	run release box-1
+	rc_is "release after the job" 0
+	is "run shows the user's command; job and release are housekeeping" \
+		"$(calls | jq -c '[.calls[] | select(.path | test("/exec$")) | .body | [(.noHistory // false), (.historyCommand // null)]]')" \
+		'[[false,"sleep 30"],[true,null],[true,null],[true,null]]'
+	# With a job directory, claim sweeps it with an exec of its own.
+	mkdir -p "$(box box-1 .home)/.ibx/jobs"
+	ctl '{"resetCalls":true}'
+	run claim --json x
+	rc_is "claim again" 0
+	is "claim's sweep is housekeeping" \
+		"$(calls | jq -c '[.calls[] | select(.path | test("/exec$")) | .body.noHistory] | if length == 0 then "no exec" else unique end')" '[true]'
+	run job box-1 hist --kill
+	ctl '{"resetCalls":true,"filesEnabled":false}'
+	run put box-1 "$here/../LICENSE" lic.txt
+	run get box-1 lic.txt "$S/nov-lic"
+	is "single-file put and get (exec fallback) are housekeeping" \
+		"$(calls | jq -c '[.calls[] | select(.path | test("/exec$")) | .body.noHistory] | if length < 2 then "under 2 execs" else unique end')" '[true]'
+	ctl '{"filesEnabled":true}'
+	run release box-1
+	reset '"seed":{"count":1}'
+	# 4095 ASCII bytes, then a 2-byte character that would end past 4096: it is dropped whole.
+	run run box-1 long -- "$(printf 'echo %04090d' 0)é$(printf '%0200d' 0)"
+	rc_is "run with a long command starts" 0
+	is "its historyCommand is cut at 4096 bytes on a character boundary" "$(calls | jq '[.calls[] | select(.path | test("/exec$")) | .body.historyCommand | utf8bytelength] | first')" 4095
+	if [ -n "$REAL" ]; then
+		mkdir -p "$S/nov-tree"
+		printf 'x\n' >"$S/nov-tree/a.txt"
+		ctl '{"resetCalls":true}'
+		run put box-1 "$S/nov-tree" novtree
+		rc_is "directory put" 0
+		run get box-1 novtree/ "$S/nov-tree-back"
+		rc_is "directory get" 0
+		is "the archive helpers stay out of the history" \
+			"$(calls | jq -c '[.calls[] | select(.path | test("/exec$")) | .body.noHistory] | unique')" '[true]'
+	else
+		skip "directory archive helpers need MOCK_EXEC=real"
+	fi
+	id=$(box box-1 .id)
+	printf 'Authorization: Bearer %s\n' "$KEY" | curl -q -sS -o "$S/out" -w '%{http_code}' -H @- -H 'Content-Type: application/json' \
+		--data-binary '{"cmd":"true","noHistory":true,"historyCommand":"x"}' "$BASE/v1/machines/$id/exec" >"$S/nov-status"
+	is "the mock refuses noHistory with historyCommand, as the API does" "$(cat "$S/nov-status"):$(jq -r .error.code "$S/out")" 400:bad_request
+
+	# B6: OOM kills. false or absent proves nothing and prints nothing.
+	reset '"execResults":[{"exitCode":137,"signal":"KILL","oomKilled":true,"oomKill":{"process":"py\u001bthon3","pid":4242}}]'
+	run exec box-1 -- python3 big.py
+	rc_is "an OOM-killed command keeps its status" 137
+	err_has "exec names the killed process" 'ran out of memory: its OOM killer killed py thon3 \(pid 4242\) of this command'
+	is "in one line" "$(grep -c 'out of memory' "$S/err")" 1
+	yes_ "and cleans the name" eval '! has_ctl "$S/err"'
+	ctl '{"execResults":[{"exitCode":137,"oomKilled":true}]}'
+	run exec box-1 -- python3 big.py
+	err_has "without oomKill it says a process" 'OOM killer killed a process of this command'
+	ctl '{"execResults":[{"exitCode":1,"oomKilled":false},{"exitCode":1}]}'
+	run exec box-1 -- false
+	err_lacks "oomKilled false prints nothing" 'out of memory'
+	run exec box-1 -- false
+	err_lacks "an absent oomKilled prints nothing" 'out of memory'
+	ctl '{"execResults":[{"exitCode":137,"oomKilled":true,"oomKill":{"process":"java","pid":7}},{"exitCode":0}]}'
+	run exec --json box-1 -- java
+	is "exec --json passes oomKilled and oomKill through" "$(jq -c '[.oomKilled,.oomKill.pid]' "$S/out")" '[true,7]'
+	run exec --json box-1 -- true
+	yes_ "and adds nothing when the server sends nothing" eval 'jq -e "has(\"oomKilled\") | not" "$S/out" >/dev/null'
+	ctl '{"execResults":[{"exitCode":137,"oomKilled":true,"oomKill":{"pid":9}}]}'
+	run exec --stream box-1 -- big
+	err_has "a streamed exec reports it from the exit event" 'OOM killer killed pid 9 of this command'
+
+	# B7: nothing pauses or resumes a sandbox to reset its max-run.
+	yes_ "ibx never pauses or stops a sandbox" eval '! grep -Eq "/(suspend|stop|pause)\"" "$IBX"'
+}
+
+t_nov1121() {
+	group "2026-11-21: free runtime that grows with use, account_disabled, restore_failed, concurrency_limit"
+	local timer=$S/nov21-timer soon restore
+	mkdir -p "$timer"
+	printf '#!/bin/sh\ncase "$*" in *is-active*) exit 3 ;; esac\nexit 1\n' >"$timer/systemctl"
+	printf '#!/bin/sh\nexit 1\n' >"$timer/crontab"
+	printf '#!/bin/sh\nexit 1\n' >"$timer/launchctl"
+	restore='could not restore its memory after the pause \(500 restore_failed\): its processes are gone'
+
+	# A free run starts at 120 minutes and use extends it, up to 480: the limit ibx reads is the
+	# current one. This run started 115 minutes ago.
+	soon=$(ago 6900)
+	reset "\"seed\":{\"count\":1,\"free\":true},\"set\":{\"box-1\":{\"maxRunMinutes\":120,\"runStartedAt\":\"$soon\"}}"
+	run claim x
+	rc_is "claim takes a free box near its current limit" 0
+	err_has "and says use extends a free run" 'box-1 has under 60 minutes left at its current max-run limit; use extends a free run, up to 480 minutes from its start'
+	run ls
+	out_has "ls marks a free box's pause time as one that can move" '^box-1 .*T[0-9:.]+Z or later'
+	run PATH="$timer:$PATH" doctor
+	out_has "doctor's run budget says the free limit is the current one" 'box-1 run budget: .*\(free plan: the current limit; a run starts at 120 minutes and use extends it, up to 480\)'
+	reset "\"seed\":{\"count\":1},\"set\":{\"box-1\":{\"maxRunMinutes\":120,\"runStartedAt\":\"$soon\"}}"
+	run claim x
+	err_has "a paid box keeps the fixed wording" 'box-1 has under 60 minutes left before its max-run pause'
+	err_lacks "without the free-plan note" 'use extends'
+	run ls
+	out_lacks "and ls shows its pause time as is" 'or later'
+
+	# 403 account_disabled: an administrator disabled the account. It is account-wide, not a
+	# per-box failure: claim stops at once and exec says nothing ran.
+	reset '"seed":{"count":3,"idle":["box-1","box-2","box-3"]},"faults":[{"kind":"error","method":"POST","match":"/(wake|resume|start)$","status":403,"code":"account_disabled","message":"the account is disabled","count":10}]'
+	run claim --json x
+	rc_is "claim on a disabled account fails" 125
+	is "with error.code account_blocked" "$(jq -r .error.code "$S/out")" account_blocked
+	is "after one wake, not one per box" "$(count POST '/(wake|resume|start)$')" 1
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":403,"code":"account_disabled","message":"the account is disabled"}]'
+	run exec --json box-1 -- true
+	rc_is "exec on a disabled account fails" 125
+	is "saying it did not run, as account_blocked" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","account_blocked"]'
+	is "without sending it again" "$(count POST '/exec$')" 1
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":403,"code":"account_disabled","message":"the account is disabled"}]'
+	run exec box-1 -- true
+	err_has "plain exec says it did not run too" 'exec did not run: account_disabled; the account is disabled'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":402,"code":"credit_exhausted","message":"no credit"}]'
+	run exec box-1 -- true
+	err_has "and for a billing block" 'exec did not run: credit_exhausted; no credit'
+	reset '"faults":[{"kind":"error","method":"GET","match":"^/v1/machines$","status":403,"code":"account_disabled","message":"the account is disabled","count":10}]'
+	run keepalive
+	rc_is "keepalive on a disabled account cannot list the boxes and fails" 125
+
+	# 500 restore_failed: a resume could not restore the suspended memory; the box is stopped with
+	# its files kept and its processes lost. An explicit start path starts it from its disks; an
+	# exec, file transfer, run or job that woke it says it did not run.
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run claim --json x
+	rc_is "claim recovers a box whose wake could not restore its memory" 0
+	err_has "warning that its processes are gone" 'WARNING: box-1 could not restore its memory after the pause \(restore_failed\): its processes are gone; starting it from its disks'
+	is "by starting it once" "$(count POST '/start$')" 1
+	reset '"seed":{"count":1},"set":{"box-1":{"state":"suspended","restoreFail":true}}'
+	run exec box-1 -- 'exit 3'
+	rc_is "a failed resume of a box paused by hand is followed by a start, then the exec" 3
+	err_has "with the same warning" 'could not restore its memory after the pause \(restore_failed\)'
+	is "one resume, one start" "$(count POST '/resume$'):$(count POST '/start$')" 1:1
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run exec --json box-1 -- true
+	rc_is "an exec whose own wake could not restore the memory fails" 125
+	is "saying it did not run" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","not_started"]'
+	err_has "and why" "exec did not run: box-1 $restore"
+	err_lacks "never that it may have run" 'may or may not'
+	is "the box is stopped, not retried" "$(box box-1 .state):$(count POST '/exec$')" stopped:1
+	run exec box-1 -- 'exit 3'
+	rc_is "the next command starts it and runs" 3
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run put box-1 "$here/../LICENSE" x.txt
+	rc_is "a put whose own wake could not restore the memory fails" 125
+	err_has "saying it did not run" "file transfer did not run: box-1 $restore"
+	is "and is not sent again" "$(count PUT '/files$')" 1
+	run put box-1 "$here/../LICENSE" x.txt
+	rc_is "the next put starts the box and copies" 0
+	# get checks the box first, so a failed restore there is followed by a start; a file read
+	# that itself gets 500 restore_failed read nothing.
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run get box-1 nothing-here "$S/nov21-get"
+	err_has "get wakes it first and warns about the failed restore" 'WARNING: box-1 could not restore its memory after the pause \(restore_failed\)'
+	is "then starts it once" "$(count POST '/start$')" 1
+	reset '"faults":[{"kind":"error","method":"GET","match":"/files/content$","status":500,"code":"restore_failed"}]'
+	run get box-1 x.txt "$S/nov21-get"
+	rc_is "get refused by restore_failed fails" 125
+	err_has "the same way" "file transfer did not run: box-1 $restore"
+	reset '"seed":{"count":1,"idle":["box-1"]},"opDelay":3,"wakeHold":1,"set":{"box-1":{"restoreFail":true}}'
+	run exec box-1 -- true
+	rc_is "an exec whose wake outlived its hold and then failed to restore fails" 125
+	err_has "naming the restore failure" "exec did not run: box-1 $restore"
+	is "and is not sent again" "$(count POST '/exec$')" 1
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run run box-1 j21 -- true
+	rc_is "run brings a box whose wake could not restore its memory up, then starts the job" 0
+	err_has "with the warning" 'WARNING: box-1 could not restore its memory after the pause \(restore_failed\)'
+	is "starting the box once and the job once" "$(count POST '/start$'):$(count POST '/exec$' | awk '{print ($1 >= 1)}')" 1:1
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run job box-1
+	rc_is "job brings it up the same way" 0
+	err_has "with the warning" 'could not restore its memory after the pause \(restore_failed\)'
+	# After restore_failed the box is stopped: the advice "the next ibx command starts it" holds
+	# for run and job too, which bring a stopped or paused box up before their single exec.
+	reset '"seed":{"count":1},"set":{"box-1":{"state":"stopped"}}'
+	run run box-1 j23 -- true
+	rc_is "run on a stopped box starts it, then the job" 0
+	is "one start, one job start" "$(count POST '/start$'):$(calls | jq '[.calls[] | select(.method == "POST" and (.path | test("/exec$")) and (.body.historyCommand // "" | length) > 0)] | length')" 1:1
+	reset '"seed":{"count":1},"set":{"box-1":{"state":"suspended"}}'
+	run job box-1
+	rc_is "job on a box paused by hand resumes it" 0
+	is "once" "$(count POST '/resume$')" 1
+	# The exec itself refused: nothing ran.
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":500,"code":"restore_failed"}]'
+	run run box-1 j24 -- true
+	rc_is "run whose start exec got restore_failed fails" 125
+	err_has "saying it did not start and why" "run did not start: box-1 $restore"
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":500,"code":"restore_failed"}]'
+	run job box-1
+	rc_is "job whose exec got restore_failed fails" 125
+	err_has "saying its jobs did not survive" "could not read jobs on box-1: box-1 $restore.*its jobs did not survive"
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"machine_not_running"}]'
+	run run box-1 j25 -- true
+	rc_is "run refused by machine_not_running fails" 125
+	err_has "saying nothing started" 'run did not start: box-1 stopped or paused again before the start \(409 machine_not_running\); nothing started'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":409,"code":"machine_not_running"}]'
+	run job box-1
+	rc_is "job refused by machine_not_running fails" 125
+	err_has "saying nothing started" 'could not read jobs on box-1: it stopped or paused again \(409 machine_not_running\); nothing started'
+	# exec --stream: a 500 restore_failed before the stream started means nothing ran.
+	reset '"seed":{"count":1,"idle":["box-1"]},"set":{"box-1":{"restoreFail":true}}'
+	run exec --stream box-1 -- true
+	rc_is "a streamed exec whose wake could not restore the memory fails" 125
+	err_has "saying it did not run" "exec did not run: box-1 $restore"
+	err_lacks "never that it may have run" 'may or may not|may have run'
+
+	# 429 concurrency_limit on exec and files: retryable is handled like quota_exceeded (nothing
+	# ran, wait and send again); not retryable says it did not run.
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":429,"code":"concurrency_limit","retryable":true}]'
+	run exec box-1 -- 'exit 4'
+	rc_is "exec retries after a retryable 429 concurrency_limit" 4
+	is "sent twice" "$(count POST '/exec$')" 2
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":429,"code":"concurrency_limit","retryable":false}]'
+	run exec --json box-1 -- true
+	rc_is "a non-retryable concurrency_limit fails" 125
+	is "saying it did not run, as running_limit" "$(jq -c '[.ran,.error.code]' "$S/out")" '["no","running_limit"]'
+	is "without sending it again" "$(count POST '/exec$')" 1
+	reset '"faults":[{"kind":"error","method":"PUT","match":"/files$","status":429,"code":"concurrency_limit","retryable":true}]'
+	run put box-1 "$here/../LICENSE" x.txt
+	rc_is "put retries after a retryable concurrency_limit" 0
+	is "the upload is sent twice" "$(count PUT '/files$')" 2
+	reset '"faults":[{"kind":"error","method":"PUT","match":"/files$","status":429,"code":"concurrency_limit","retryable":false}]'
+	run put box-1 "$here/../LICENSE" x.txt
+	rc_is "put with a non-retryable concurrency_limit fails" 125
+	err_has "naming the plan's running limit" 'the plan allows no more sandboxes running at once \(concurrency_limit.*nothing started'
+	# Starting a box past the plan's running limit is account-wide: claim stops at the first
+	# refusal, and curl does not repeat the refused start on its own.
+	reset '"seed":{"count":3,"idle":["box-1","box-2","box-3"]},"faults":[{"kind":"error","method":"POST","match":"/(wake|resume|start)$","status":429,"code":"concurrency_limit","retryable":false,"count":20}]'
+	run claim --json x
+	rc_is "claim past the running limit exits 75" 75
+	is "with error.code running_limit" "$(jq -r .error.code "$S/out")" running_limit
+	is "after one start request in all" "$(count POST '/(wake|resume|start)$')" 1
+	is "and leaves no reservation behind" "$(claim_keys box-1):$(claim_keys box-2):$(claim_keys box-3)" 0:0:0
+	reset '"seed":{"count":1,"idle":["box-1"]},"faults":[{"kind":"error","method":"POST","match":"/wake$","status":429,"code":"rate_limited","retryable":true,"retryAfterSeconds":1}]'
+	run claim x
+	rc_is "a wake refused by the start rate limit is waited out by ibx" 0
+	is "with two wakes: one refused, one after the wait" "$(count POST '/wake$')" 2
+	reset '"seed":{"count":2,"idle":["box-1","box-2"]},"faults":[{"kind":"error","method":"PUT","match":"/activity-leases/","status":429,"code":"concurrency_limit","retryable":false,"count":20}]'
+	hold box-1 0
+	hold box-2 0
+	run keepalive
+	rc_is "keepalive treats the running limit as a skip" 0
+	out_has "and says why" '^box-1: the plan allows no more sandboxes running at once .*; skipped$'
+	reset '"faults":[{"kind":"error","method":"POST","match":"/exec$","status":429,"code":"concurrency_limit","retryable":true}]'
+	run run box-1 j22 -- true
+	rc_is "run refused by concurrency_limit fails" 125
+	err_has "and says it did not start" 'run did not start'
+	# A transient gateway answer on a wake or start is repeated, as curl's --retry did before.
+	reset '"seed":{"count":1,"idle":["box-1"]},"faults":[{"kind":"error","method":"POST","match":"/wake$","status":503,"code":"host_unavailable","retryable":true,"count":1}]'
+	run claim x
+	rc_is "claim after one transient 503 on the wake succeeds" 0
+	is "with the wake sent twice" "$(count POST '/wake$')" 2
+	reset '"seed":{"count":1},"set":{"box-1":{"state":"stopped"}},"faults":[{"kind":"error","method":"POST","match":"/start$","status":502,"code":"bad_gateway","count":1}]'
+	run exec box-1 -- 'exit 4'
+	rc_is "exec after one 502 on the start runs" 4
+	is "with the start sent twice" "$(count POST '/start$')" 2
+	reset '"seed":{"count":1},"set":{"box-1":{"state":"stopped"}},"faults":[{"kind":"error","method":"POST","match":"/start$","status":502,"code":"bad_gateway","count":1}]'
+	run claim x
+	rc_is "claim after one 502 on the start succeeds" 0
+	is "with the start sent twice" "$(count POST '/start$')" 2
+}
+
 for t in review_a_r2 ownership guards030 platform030 files030 stream030 stream_backpressure030 cli doctor pool ls claim claim_parallel claim_cap claim_lock_busy claim_mkdir_signals closed_stderr claim_names claim_lock claim_reaper claim_signals claim_signal_commit claim_fresh claim_json claim_errors claim_states renew release port keepalive exec exec_wait_signals exec_stdin sigterm retry files \
-	put_guard poolonly vault hostile secrets ssh install cleanup b030; do
+	put_guard poolonly vault hostile secrets ssh install cleanup b030 nov1106 nov1121; do
 	want "$t" && "t_$t"
 done
 printf '\n%d passed, %d failed in %ds\n' "$passed" "$failed" $(($(date +%s) - start))

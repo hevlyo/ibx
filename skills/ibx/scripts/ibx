@@ -24,7 +24,7 @@ ENV_KEY=${INSTABOX_API_KEY:-}
 export -n ENV_KEY
 unset INSTABOX_API_KEY
 
-IBX_VERSION=0.3.1
+IBX_VERSION=0.4.0
 
 stderr() { "$@" >&2 || true; } # a closed stderr must not replace the intended exit status
 
@@ -77,20 +77,27 @@ Humans
   ibx pool add [--allow-vault] <box>...  let agents claim these sandboxes (refuses Vault secrets
                                          unless --allow-vault)
   ibx pool rm <box>...                   take them out of the pool
-  ibx keepalive [--all]                  renew a 1-hour activity lease on reserved pool sandboxes
-                                         (--all: every pool sandbox); run it from a timer
+  ibx keepalive [--all]                  paid plans only: renew a 1-hour activity lease on reserved
+                                         pool sandboxes (--all: every pool sandbox); run it from a
+                                         timer. Free-plan sandboxes are skipped: the instabox Terms
+                                         (2(e), 2026-11-06) forbid leases renewed from outside
   ibx doctor                             check dependencies, key, API access and the pool;
                                          every FAIL line is followed by its next step
   ibx --version | --help
 
-Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox, cap reached
-or local claim lock busy; 125 ibx itself failed (API, network, usage); 255 ssh could not connect;
+Exit codes: the remote command's for exec/ssh; 124 exec timed out; 75 no free sandbox, cap reached,
+free-plan or plan running limit reached or local claim lock busy; 125 ibx itself failed (API,
+network, usage, free_limit, running_limit or abuse_lock outside claim); 255 ssh could not connect;
 130/143 when ibx receives SIGINT/SIGTERM. Exec says whether the remote command had started;
 release --mine names any box already released and does not start the rest.
 Exec disconnect kills its process group, partly-run work included; setsid children can survive.
-SSH commands may still run. keepalive exits 1 for real lease failures; a max-run cooldown,
-max_run_disabled or a billing block (402) is a skip and exits 0. Leases prevent idle pause, not
-the free 480-minute max-run pause.
+SSH commands may still run. keepalive exits 1 for real lease failures; a free-plan sandbox, a
+max-run cooldown, an abuse lock, max_run_disabled, the start rate limit, free_limit, running_limit or a billing
+block (402) is a skip and exits 0. Leases prevent idle pause, not the max-run pause. A free run
+starts with a 120-minute max-run limit that real use extends, up to 480 minutes. When a box
+cannot restore its memory after a pause (500 restore_failed) its processes are gone: exec, put,
+get, run and job say they did not run; the next command starts it from its disks. Repeated API or
+network failures: check https://status.instabox.sh.
 
 Environment: INSTABOX_API_KEY (else the file IBX_KEY_FILE, default
 ${XDG_CONFIG_HOME:-~/.config}/instabox/api-key), INSTABOX_API_URL (https://api.instabox.sh;
@@ -103,8 +110,13 @@ delivery and every-host proxy Secrets stay refused), IBX_GET_MAX (download cap, 
 IBX_MAX_CLAIMS (live reservations per agent, default 3; 0 disables the cap), IBX_STATE_DIR (an atomic mkdir lock, default directory
 ${XDG_STATE_HOME:-~/.local/state}/ibx).
 claim, renew and release accept --json anywhere after the command. JSON includes warnings;
-errors have error.code (no_free_sandbox, claim_limit, lock_busy, auth, account_blocked, failed,
-interrupted, held_by_other, not_held, ambiguous_identity) and error.message. lock_busy exits 75
+errors have error.code (no_free_sandbox, claim_limit, lock_busy, auth, account_blocked, free_limit,
+running_limit, abuse_lock, failed, interrupted, held_by_other, not_held, ambiguous_identity) and error.message.
+free_limit: the free plan runs only limits.freeSandboxes sandboxes at once (402
+early_allowance_ended; claim still tries paid sandboxes, then exits 75). abuse_lock: an instabox abuse check locked the sandbox;
+ibx does not wait it out: tell the user. account_blocked also covers 403 account_disabled
+(an administrator disabled the account). running_limit: the plan allows no more sandboxes running
+at once (429 concurrency_limit, not retryable); claim exits 75, other commands 125. lock_busy exits 75
 after waiting up to 5 minutes for a usable local lock. Work commands refuse another agent's live reservation (held_by_other, 125).
 Unreserved or abandoned boxes warn: ibx claim first. Renew requires your live reservation
 (not_held, 125); release stays idempotent. ls, doctor and keepalive do not check ownership.
@@ -177,6 +189,9 @@ COMMAND=$1
 [ "$COMMAND" != exec ] || [ -z "$JSON" ] || EXEC_JSON=1
 STREAM=
 EXEC_SAFE=
+EXEC_NO_HISTORY='' # set per call by exec_body's callers, never from the environment
+EXEC_HISTORY=''
+RESTORE_FAILED='' OP_FAILED_CODE='' WAITED_OP=''
 SIGNAL_FD=
 if exec {SIGNAL_FD}>&2; then :; else SIGNAL_FD=; fi
 kept_claim=null
@@ -290,15 +305,18 @@ json_error() { # commit one complete object; only the main EXIT cleanup prints i
 fatal_check() { [ ! -s "$tmp/fatal" ] || die "API refused the request"; }
 exec_json_fail() { # api-code message: one exec --json object, then exit 125
 	local err=$1 message=$2 ran=partial
-	case $message in
-	*"did not run"* | *"did not start"* | *"rejected"*) ran=no; err=not_started ;;
-	esac
 	case $1 in
-	auth) ran=no; err=auth ;;
-	account_blocked) ran=no; err=account_blocked ;;
-	esac
-	case $message in
-	*"may have run"* | *"may or may not"* | *"cut off"* | *"was killed"*) ran=partial; err=cut_off ;;
+	auth | account_blocked | free_limit | running_limit | abuse_lock)
+		# The API refused before anything ran. These messages embed server text (an abuse lock's
+		# explanation, a 402's message), so no wording in them may reclassify the refusal.
+		ran=no ;;
+	*)
+		case $message in
+		*"did not run"* | *"did not start"* | *"rejected"*) ran=no; err=not_started ;;
+		esac
+		case $message in
+		*"may have run"* | *"may or may not"* | *"cut off"* | *"was killed"*) ran=partial; err=cut_off ;;
+		esac ;;
 	esac
 	jq -n --arg box "${LABEL:-}" --arg ran "$ran" --arg err "$err" --arg m "$message" \
 		'{box:$box,ran:$ran,exitCode:null,timedOut:false,signal:null,truncated:false,invalidUtf8:false,stdout:"",stderr:"",warnings:[],error:{code:$err,message:$m}}' >"$tmp/result"
@@ -429,16 +447,24 @@ printable() { LC_ALL=C tr -d '\000-\010\013-\037\177'; } # drop control chars fr
 # curl -q skips ~/.curlrc, which could otherwise turn on verbose output and print the key; -g (on
 # every curl here) keeps {} and [] in URLs and file names literal.
 api() {
-	local m=$1 p=$2 code rc
+	local m=$1 p=$2 code rc lifecycle='' tries=0
 	case "$p" in *..* | *'#'* | *[[:space:]]*) stderr printf '{"error":{"code":"bad_path","message":"refusing path %s"}}\n' "$p"; return 1 ;; esac
-	local args=(-q -g -sS -o "$tmp/resp" -w '%{http_code}' -X "$m" -H @- -H 'Content-Type: application/json')
+	# Starts, resumes, wakes and lease PUTs (which wake an idle-paused box) answer 429 and 500
+	# that curl's --retry would send again: each repeat counts against limits.startsPerMinute, and
+	# a repeated wake hides a 500 restore_failed behind a 409. Only a lost connection and the
+	# transient gateway answers (408, 502, 503, 504, 522, 524) are repeated, as curl would.
+	case "$m $p" in "POST "*/start | "POST "*/resume | "POST "*/wake | "PUT "*/activity-leases/*) lifecycle=1 ;; esac
+	local args=(-q -g -sS -o "$tmp/resp" -D "$tmp/resp-headers" -w '%{http_code}' -X "$m" -H @- -H 'Content-Type: application/json')
 	[ $# -ge 3 ] && args+=(--data-binary @"$3")
 	case "$m $p" in
 	"POST "*/exec) args+=(-m "${IBX_EXEC_MAXTIME:-700}") ;;
 	"POST "*/ssh-tokens) args+=(-m 60) ;;
 	*)
-		args+=(-m "${IBX_MAXTIME:-120}" --retry 3 --retry-delay 2 --retry-all-errors)
-		[ -n "${IBX_MAXTIME:-}" ] && args+=(--retry-max-time "$IBX_MAXTIME")
+		args+=(-m "${IBX_MAXTIME:-120}")
+		if [ -z "$lifecycle" ]; then
+			args+=(--retry 3 --retry-delay 2 --retry-all-errors)
+			[ -n "${IBX_MAXTIME:-}" ] && args+=(--retry-max-time "$IBX_MAXTIME")
+		fi
 		;;
 	esac
 	# Routes that take an Idempotency-Key get a fresh one; curl's retries reuse it.
@@ -453,8 +479,14 @@ api() {
 		curl_pid=
 		code=$(cat "$tmp/http-status")
 	else
-		rc=0
-		code=$(printf '%s\n' "$AUTH" | curl "${args[@]}" "$API$p") || rc=$?
+		while :; do
+			rc=0
+			code=$(printf '%s\n' "$AUTH" | curl "${args[@]}" "$API$p") || rc=$?
+			[ -n "$lifecycle" ] && [ "$tries" -lt 3 ] || break
+			if [ "$rc" = 0 ]; then case "$code" in 408 | 502 | 503 | 504 | 522 | 524) ;; *) break ;; esac; fi
+			tries=$((tries + 1))
+			sleep_for 2
+		done
 	fi
 	if [ "$rc" != 0 ]; then
 		stderr printf '{"error":{"code":"transport","message":"curl exit %s on %s %s","retryable":false}}\n' "$rc" "$m" "$p"
@@ -475,13 +507,66 @@ api_refusal() { # status body-file: remember account-wide failures, including fr
 	local code message kind=
 	code=$(err_code "$2")
 	if [ "$1" = 401 ] || auth_code "$code"; then kind=auth; fi
-	case $code in credit_exhausted | spend_limit_reached | subscription_required | payment_method_required | payment_failed) kind=account_blocked ;; esac
+	# account_disabled: an administrator disabled the account; every route but data export refuses.
+	case $code in credit_exhausted | spend_limit_reached | subscription_required | payment_method_required | payment_failed | account_disabled) kind=account_blocked ;; esac
 	[ "$1" != 402 ] || kind=account_blocked
+	# Not billing: one more free sandbox may not run (the early allowance ended on 2026-12-01).
+	[ "$code" != early_allowance_ended ] || kind=free_limit
+	# 429 concurrency_limit without retryable: the plan allows no more sandboxes running at once.
+	# It applies to every sandbox of the account, like a billing block. (A retryable one is too
+	# many execs at once, which exec and file transfers wait out.)
+	if [ "$code" = concurrency_limit ] && [ "$(jq -r '.error.retryable // false' "$2" 2>/dev/null)" != true ]; then
+		kind=running_limit
+	fi
 	[ -n "$kind" ] || return 0
-	message=$(jq -r "$JQ_DEFS"' .error | [.code,.message,.hint,((.requiredScopes // []) | join(", "))] | map(select(. != null and . != "") | tostring | clean) | join("; ")' "$2" | printable)
-	if [ "$kind" = auth ] && [ "$COMMAND" = exec ]; then message="exec rejected (the command did not run); $message"; fi
+	if [ "$kind" = free_limit ]; then
+		message=$(free_limit_message "$2")
+	else
+		message=$(jq -r "$JQ_DEFS"' .error | [.code,.message,.hint,((.requiredScopes // []) | join(", "))] | map(select(. != null and . != "") | tostring | clean) | join("; ")' "$2" | printable)
+	fi
+	if [ "$kind" = running_limit ]; then
+		message="the plan allows no more sandboxes running at once ($message); nothing started; ask the user to stop or pause a running sandbox or to change the plan"
+	fi
+	if [ "$kind" = auth ] && [ "$COMMAND" = exec ]; then message="exec rejected (the command did not run); $message"
+	elif [ "$COMMAND" = exec ]; then message="exec did not run: $message"; fi
 	if [ "$kind" = auth ]; then message+="; ask the user to fix this key; never look for another one"; fi
 	jq -cn --arg c "$kind" --arg m "$message" '{code:$c,message:$m}' >"$tmp/fatal"
+}
+
+free_sandboxes() { # -> limits.freeSandboxes of this key's org, empty when unknown (cached)
+	local me orgid org
+	if [ ! -e "$tmp/free-sandboxes" ]; then
+		: >"$tmp/free-sandboxes"
+		me=$(api GET /v1/me 2>/dev/null) || return 0
+		orgid=$(jq -r '.orgId // empty' <<<"$me")
+		[[ $orgid =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+		org=$(api GET "/v1/orgs/$orgid" 2>/dev/null) || return 0
+		jq -r '.limits.freeSandboxes | select(type == "number" and . >= 0 and . == floor)' <<<"$org" >"$tmp/free-sandboxes" || true
+	fi
+	cat "$tmp/free-sandboxes"
+}
+free_limit_message() { # error-file: why a start of one more free sandbox was refused
+	local n server
+	# The lookup reuses api's reply file, which may be the error file itself.
+	cp "$1" "$tmp/free-limit-error"
+	n=$(free_sandboxes)
+	cp "$tmp/free-limit-error" "$1"
+	server=$(jq -r "$JQ_DEFS"' .error.message // empty | clean' "$tmp/free-limit-error" 2>/dev/null | printable) || server=
+	case $n in
+	'') printf 'the free plan now runs fewer sandboxes at a time than this account has' ;;
+	1) printf 'the free plan now runs only 1 sandbox at a time' ;;
+	*) printf 'the free plan now runs only %s sandboxes at a time' "$n" ;;
+	esac
+	printf ' (402 early_allowance_ended%s) and another free one is running. A released free box keeps its slot until it pauses after 30 idle minutes, so releasing one you hold and no longer need (ibx ls --mine, ibx release BOX) frees the slot only later; otherwise ask the user\n' "${server:+: $server}"
+}
+abuse_lock() { # error-file machine-json: 0, with a fatal abuse_lock, when an abuse check locked it
+	local reason message
+	reason=$(jq -r --argjson m "$2" "$JQ_DEFS"' [(.error.reason? // empty), ($m.cooldownReason // empty)] |
+		map(select(type == "string" and startswith("abuse_"))) | first // empty | clean' "$1" 2>/dev/null | printable) || reason=
+	[ -n "$reason" ] || reason=$(jq -r "$JQ_DEFS"' .cooldownReason // empty | select(type == "string" and startswith("abuse_")) | clean' <<<"$2" 2>/dev/null | printable) || reason=
+	[ -n "$reason" ] || return 1
+	message=$(jq -r --arg name "${LABEL:-}" --arg reason "$reason" "$JQ_DEFS"' abuse_text($name; $reason)' <<<"$2" | printable)
+	jq -cn --arg m "$message" '{code:"abuse_lock",message:$m}' >"$tmp/fatal"
 }
 
 all_machines() { # every sandbox of the account (GET /v1/machines is paged)
@@ -518,7 +603,12 @@ JQ_DEFS='def timestamp: if type == "string" then ((try (ascii_upcase |
 	def available($now): (.maxRunMinutes // -1) != 0 and ((.cooldownUntil // "") as $c |
 		$c == "" or (($c | timestamp) as $t | $t != null and $t <= $now));
 	def scoped_proxy: .delivery == "proxy" and ((.hosts // []) | type == "array" and length > 0 and index("*") == null);
-	def clean: if type == "string" then gsub("[\u0000-\u001f\u007f-\u009f]"; " ") else . end;'
+	def clean: if type == "string" then gsub("[\u0000-\u001f\u007f-\u009f]"; " ") else . end;
+	def abused: (.cooldownReason // "") | type == "string" and startswith("abuse_");
+	def abuse_text($name; $reason): (if (.abuseLock | type) == "object" then .abuseLock else {} end) as $l |
+		"nothing ran: an instabox abuse check (\($reason | clean)) locked \(if $name == "" then (.name // "the sandbox" | clean) else $name end) until \(.cooldownUntil // "the server allows a wake" | clean); ibx does not wait out a lock (it can last 24 hours): stop and tell the user" +
+		([($l.explanation // empty | tostring | clean), ($l.what // empty | tostring | clean)] | map(select(. != "")) | if length == 0 then "" else ". " + join("; ") end) +
+		(if ($l.appeal // "") == "" then "" else ". Appeal: \($l.appeal | tostring | clean)" end);'
 
 resolve() { # [--pool] name-or-id -> id. With --pool, only pool sandboxes (agent commands).
 	local pool='' ms id
@@ -605,6 +695,8 @@ secrets_state() {
 }
 cooldown_wait() { # error-file machine-json deadline: safe only when no command started
 	local seconds until
+	# An abuse lock can last 24 hours: never wait it out (the caller's die reports it).
+	! abuse_lock "$1" "$2" || return 1
 	until=$(jq -r "$JQ_DEFS"' .cooldownUntil // empty | clean' <<<"$2")
 	seconds=$(jq -r --argjson m "$2" "$JQ_DEFS"'
 		.error.retryAfterSeconds // (((($m.cooldownUntil | timestamp) // 0) - now) | ceil)' "$1")
@@ -615,9 +707,25 @@ cooldown_wait() { # error-file machine-json deadline: safe only when no command 
 	warn "${LABEL:-sandbox} is in its max-run cooldown until ${until:-the server permits a wake}"
 	return 1
 }
+rate_wait() { # error-file deadline: waits out a 429 rate_limited on a start, resume or wake
+	local seconds
+	seconds=$(jq -r '.error.retryAfterSeconds | select(type == "number" and . >= 0) | ceil' "$1" 2>/dev/null) || seconds=
+	if ! [[ $seconds =~ ^[0-9]+$ ]]; then
+		seconds=$(tr -d '\r' <"$tmp/resp-headers" 2>/dev/null | awk 'tolower($1) == "retry-after:" { v = $2 } END { print v }') || seconds=
+	fi
+	[[ $seconds =~ ^[0-9]+$ ]] || seconds=20
+	if [ "$seconds" -lt "$(( $2 - SECONDS - 2 ))" ]; then
+		sleep_for "$((10#$seconds + RANDOM % 2))"
+		return 0
+	fi
+	warn "${LABEL:-sandbox} could not start: the account's start rate limit (limits.startsPerMinute; wakes count) asks to wait ${seconds} s"
+	return 1
+}
 
-wait_op() { # operation-id: waits up to 8 minutes
+wait_op() { # operation-id: waits up to 8 minutes; leaves the finished Operation in WAITED_OP and
+	# a failed one's error code in OP_FAILED_CODE
 	local op=$1 r end=$((SECONDS + 480))
+	WAITED_OP='' OP_FAILED_CODE=''
 	[ -n "$op" ] || return 0
 	[[ $op =~ ^[A-Za-z0-9_-]+$ ]] || { warn "unexpected operation id"; return 1; }
 	while [ $SECONDS -lt $end ]; do
@@ -628,18 +736,47 @@ wait_op() { # operation-id: waits up to 8 minutes
 			continue
 		fi
 		case "$(jq -r .state <<<"$r")" in
-		succeeded) return 0 ;;
-		failed) warn "operation $op failed: $(jq -c .error <<<"$r")"; return 1 ;;
+		succeeded) WAITED_OP=$r; return 0 ;;
+		failed)
+			OP_FAILED_CODE=$(jq -r '.error.code // empty | strings' <<<"$r" 2>/dev/null | printable) || OP_FAILED_CODE=
+			warn "operation $op failed: $(jq -c .error <<<"$r")"
+			return 1 ;;
 		esac
 	done
 	warn "operation $op still running after 8 minutes"
 	return 1
 }
 
+# fresh_boot_check ID [any]: after a start or resume ibx made or waited for (WAITED_OP, or any
+# wake with "any"), warns when the sandbox came back with a fresh boot. Only an Operation of type
+# start or resume counts: a snapshot or resize says nothing about the processes.
+fresh_boot_check() {
+	local m nm
+	[ -n "${2:-}" ] || jq -e '.type == "start" or .type == "resume"' <<<"${WAITED_OP:-null}" >/dev/null 2>&1 || return 0
+	m=$(api GET "/v1/machines/$1" 2>/dev/null) || return 0
+	if [ "$(jq -r '.runtime.processesPreserved' <<<"$m" 2>/dev/null)" = false ]; then
+		nm=$(jq -r "$JQ_DEFS"' .name // "" | clean' <<<"$m")
+		warn "WARNING: ${nm:-$1} came back with a fresh boot: processes started before the pause are gone"
+	fi
+}
+
 # ensure_running ID: returns 0 once the sandbox runs (waking an idle-paused one, resuming a paused
 # one, starting a stopped one, waiting out an operation in progress), 1 if it cannot.
+# restore_lost NAME: after a resume failed with 500 restore_failed (its memory could not be restored;
+# the sandbox is stopped with its files kept), warns that its processes are gone. 0 while
+# ensure_running may start it from its disks, 1 for any other failure or a second restore failure.
+restore_lost() {
+	[ "$OP_FAILED_CODE" = restore_failed ] || return 1
+	restores=$((restores + 1))
+	[ "$restores" -le 1 ] || return 1
+	warn "WARNING: $1 could not restore its memory after the pause (restore_failed): its processes are gone; starting it from its disks"
+}
+restore_text() { # name: why an exec or file transfer did not run after restore_failed
+	printf '%s could not restore its memory after the pause (500 restore_failed): its processes are gone and it is stopped with its files kept; the next ibx command starts it from its disks, then run this again' "$1"
+}
+
 ensure_running() {
-	local m op opid state action nm=$1 end=$((SECONDS + 600)) notready=
+	local m op opid state action nm=$1 end=$((SECONDS + 600)) notready='' restores=0
 	while [ $SECONDS -lt $end ]; do
 		m=$(api GET "/v1/machines/$1") || { [ ! -s "$tmp/fatal" ] || return 3; sleep_for 3; continue; }
 		nm=$(jq -r "$JQ_DEFS"' .name // "" | clean' <<<"$m")
@@ -654,7 +791,11 @@ ensure_running() {
 			sleep_for 3
 			continue
 		fi
-		if [ -n "$opid" ]; then wait_op "$opid" || return 1; continue; fi
+		if [ -n "$opid" ]; then
+			wait_op "$opid" || { restore_lost "$nm" && continue; return 1; }
+			fresh_boot_check "$1"
+			continue
+		fi
 		case "$state" in
 		suspended | stopped)
 			action=start
@@ -662,15 +803,24 @@ ensure_running() {
 			[ "$state" = suspended ] && [ -n "$(jq -r '.autoSuspendedAt // empty' <<<"$m")" ] && action=wake # concurrent callers share it
 			if op=$(api POST "/v1/machines/$1/$action" 2>"$tmp/err"); then
 				# resume and start answer with an Operation (202); wake answers with the Machine (200).
-				if [ "$action" != wake ]; then wait_op "$(jq -r '.id // empty' <<<"$op")" || return 1; fi
-				m=$(api GET "/v1/machines/$1") || true
-				if [ "$(jq -r '.runtime.processesPreserved' <<<"$m" 2>/dev/null)" = false ]; then
-					warn "WARNING: $nm came back with a fresh boot: processes started before the pause are gone"
-				fi
+				if [ "$action" != wake ]; then wait_op "$(jq -r '.id // empty' <<<"$op")" || { restore_lost "$nm" && continue; return 1; }; fi
+				fresh_boot_check "$1" any
 			elif [ "$(err_code "$tmp/err")" = operation_conflict ]; then
-				wait_op "$(jq -r '.error.operationId // empty' <"$tmp/err")" || return 1
+				# a wake past its 45-second hold: wait for the resume it names
+				wait_op "$(jq -r '.error.operationId // empty' <"$tmp/err")" || { restore_lost "$nm" && continue; return 1; }
+				fresh_boot_check "$1"
+			elif [ "$(err_code "$tmp/err")" = restore_failed ] || { [ "$(err_code "$tmp/err")" = machine_not_running ] &&
+				m=$(api GET "/v1/machines/$1" 2>/dev/null) &&
+				jq -e '.state == "stopped" and .lastError.code? == "restore_failed"' <<<"$m" >/dev/null; }; then
+				# The wake itself could not restore the memory, and the sandbox is now stopped. curl
+				# repeats a 500 for idempotent routes, so the 500 can arrive as the repeated wake's
+				# 409 machine_not_running; the sandbox's lastError then names the failure.
+				OP_FAILED_CODE=restore_failed
+				restore_lost "$nm" || { stderr cat "$tmp/err"; return 1; }
 			elif [ "$(err_code "$tmp/err")" = machine_cooldown ]; then
 				cooldown_wait "$tmp/err" "$m" "$end" || return 1
+			elif [ "$(err_code "$tmp/err")" = rate_limited ]; then
+				rate_wait "$tmp/err" "$end" || return 1
 			elif [ -s "$tmp/fatal" ]; then
 				return 3
 			else
@@ -684,6 +834,28 @@ ensure_running() {
 	done
 	warn "$nm did not start within 10 minutes"
 	return 1
+}
+
+# conflict_wait ID ERROR-FILE: after a 409 operation_conflict refused a request before it started,
+# waits for the operation the error names (a wake past its 45-second hold, or a snapshot, resize
+# or other operation on a running sandbox), warns when that wake came back with a fresh boot,
+# then waits until the sandbox runs. ensure_running alone returns at once for a running sandbox,
+# whatever operation it is busy with.
+conflict_wait() {
+	local op
+	op=$(jq -r '.error.operationId // empty' <"$2" 2>/dev/null) || op=
+	if [ -n "$op" ]; then
+		# A failed, vanished or overlong operation can leave the sandbox running: ensure_running
+		# below decides from the sandbox's own state, not from the operation's outcome.
+		if wait_op "$op"; then fresh_boot_check "$1"
+		elif [ "$OP_FAILED_CODE" = restore_failed ]; then
+			RESTORE_FAILED=1
+			return 1
+		fi
+	else
+		sleep_for 2 # a transition the server does not allow yet: do not resend at once
+	fi
+	ensure_running "$1"
 }
 
 set_meta() { # id jq-filter [jq args...]: read-modify-write of the sandbox metadata. Leaves the
@@ -894,6 +1066,10 @@ stream_exec() { # id timeout: stdout/stderr pass through; only pre-start JSON re
 	if [[ $status == 4[0-9][0-9] ]] && jq -e '.error.code | type == "string"' "$tmp/sse-body" >/dev/null 2>&1; then
 		exec_phase=not_started
 	fi
+	# 500 restore_failed: the exec's own wake could not restore the memory; nothing started.
+	if [ "$status" = 500 ] && jq -e '.error.code == "restore_failed"' "$tmp/sse-body" >/dev/null 2>&1; then
+		exec_phase=not_started
+	fi
 	cp "$tmp/sse-body" "$tmp/err"
 	[ "$exec_phase" != not_started ] || api_refusal "$status" "$tmp/err"
 	case $status in
@@ -902,15 +1078,31 @@ stream_exec() { # id timeout: stdout/stderr pass through; only pre-start JSON re
 	return 1
 }
 
+# exec_body timeout cmd [stdin-file] -> $tmp/exec. The server keeps the newest 200 commands of a
+# sandbox in its history: EXEC_NO_HISTORY=1 leaves out ibx's own housekeeping, EXEC_HISTORY=TEXT
+# shows what a wrapper runs for the user (cut at 4096 bytes). The API refuses both together.
+exec_body() {
+	local extra='{}'
+	if [ -n "${EXEC_NO_HISTORY:-}" ]; then
+		extra='{"noHistory":true}'
+	elif [ -n "${EXEC_HISTORY:-}" ]; then
+		extra=$(jq -cn --arg h "$EXEC_HISTORY" '{historyCommand: ($h | if utf8bytelength <= 4096 then . else
+			reduce explode[] as $c ({s: [], n: 0, full: false};
+				($c | if . < 128 then 1 elif . < 2048 then 2 elif . < 65536 then 3 else 4 end) as $l |
+				if .full or .n + $l > 4096 then .full = true else .s += [$c] | .n += $l end) | .s | implode end)}')
+	fi
+	if [ $# -ge 3 ]; then
+		jq -n --arg c "$2" --argjson t "$1" --rawfile s "$3" --argjson x "$extra" '{cmd:$c, timeoutSeconds:$t, stdin:$s} + $x' >"$tmp/exec"
+	else
+		jq -n --arg c "$2" --argjson t "$1" --argjson x "$extra" '{cmd:$c, timeoutSeconds:$t} + $x' >"$tmp/exec"
+	fi
+}
+
 exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call it directly, not
 	# in $(...): then a SIGTERM while it waits for a slot ends ibx before it tries again.
 	local id=$1 t=$2 code starts=0 end=$((SECONDS + 600)) m safe=${EXEC_SAFE:-}
 
-	if [ $# -ge 4 ]; then
-		jq -n --arg c "$3" --argjson t "$t" --rawfile s "$4" '{cmd:$c, timeoutSeconds:$t, stdin:$s}' >"$tmp/exec"
-	else
-		jq -n --arg c "$3" --argjson t "$t" '{cmd:$c, timeoutSeconds:$t}' >"$tmp/exec"
-	fi
+	exec_body "${@:2}"
 	while :; do
 		exec_phase=partial
 		if [ -n "${STREAM:-}" ]; then
@@ -926,22 +1118,36 @@ exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call i
 		fi
 		code=$(err_code "$tmp/err")
 		# These refusals come before the command starts: an interrupt from here on says so.
-		case $code in quota_exceeded | machine_not_running | machine_cooldown | max_run_disabled | bad_request | not_found | permission_denied | bad_path) exec_phase=not_started ;; esac
+		case $code in quota_exceeded | concurrency_limit | machine_not_running | operation_conflict | machine_cooldown | max_run_disabled | rate_limited | restore_failed | bad_request | not_found | permission_denied | bad_path) exec_phase=not_started ;; esac
 		if auth_code "$code" || [ -s "$tmp/fatal" ]; then exec_phase=not_started; fi
 		fatal_check
 		case "$code" in
-		quota_exceeded) # a refusal means the command did not run
+		quota_exceeded | concurrency_limit) # a refusal means the command did not run; a
+			# concurrency_limit that is not retryable already ended as running_limit above
 			[ $SECONDS -lt $end ] || { stderr cat "$tmp/err"; die "exec did not run: the account's concurrent-request limit stayed full for 10 minutes"; }
 			sleep_for "$((5 + RANDOM % 5))" ;;
 		machine_not_running) # it never started, so retrying is safe
 			starts=$((starts + 1))
 			[ $starts -le 3 ] || { stderr cat "$tmp/err"; die "exec did not run: ${LABEL:-the sandbox} keeps stopping"; }
 			ensure_running "$id" || die "exec did not run: could not start ${LABEL:-the sandbox}" ;;
+		operation_conflict) # the server's 45-second wake hold ran out, or another operation runs:
+			# nothing started, so wait for the operation it names and send the exec again
+			starts=$((starts + 1))
+			[ $starts -le 3 ] || { stderr cat "$tmp/err"; die "exec did not run: ${LABEL:-the sandbox} stayed busy with another operation (409 operation_conflict)"; }
+			RESTORE_FAILED=
+			conflict_wait "$id" "$tmp/err" || {
+				[ -z "$RESTORE_FAILED" ] || die "exec did not run: $(restore_text "${LABEL:-the sandbox}")"
+				die "exec did not run: ${LABEL:-the sandbox} stayed busy with another operation or could not start"
+			} ;;
+		restore_failed) # the exec's own wake could not restore the memory; nothing ran
+			stderr cat "$tmp/err"; die "exec did not run: $(restore_text "${LABEL:-the sandbox}")" ;;
 		machine_cooldown)
 			m=$(api GET "/v1/machines/$id") || die "could not read the cooldown"
 			cooldown_wait "$tmp/err" "$m" "$end" || die "exec did not run: ${LABEL:-sandbox} is in its max-run cooldown"
 			;;
 		max_run_disabled) die "exec did not run: max-run is disabled for ${LABEL:-sandbox}" ;;
+		rate_limited) # waking it hit the start rate limit; exec is not idempotent, so ibx never resends it
+			die "exec did not run: waking ${LABEL:-the sandbox} hit the account's start rate limit (limits.startsPerMinute); try again in $(jq -r '.error.retryAfterSeconds // 20' <"$tmp/err" | printable) s" ;;
 		bad_request | unauthenticated | api_key_expired | api_key_revoked | permission_denied | insufficient_scope | not_found | bad_path)
 			stderr cat "$tmp/err"; die "exec rejected (the command did not run)" ;;
 		host_unavailable)
@@ -954,6 +1160,15 @@ exec_in() { # id timeout cmd [stdin-file]: sets R to the ExecResult json. Call i
 			die "exec failed (the command may or may not have run; check before retrying)" ;;
 		esac
 	done
+}
+
+oom_note() { # ExecResult json -> a warning when the sandbox's OOM killer hit the command, else nothing
+	# oomKilled false or absent proves nothing (older servers and templates report no kills).
+	jq -r "$JQ_DEFS"' select(.oomKilled == true) | (if (.oomKill | type) == "object" then .oomKill else {} end) as $k |
+		($k.process // "" | tostring | clean) as $p | ($k.pid | if type == "number" then tostring else "" end) as $n |
+		"the sandbox ran out of memory: its OOM killer killed " +
+		(if $p != "" and $n != "" then "\($p) (pid \($n))" elif $p != "" then $p elif $n != "" then "pid \($n)" else "a process" end) +
+		" of this command"' <<<"$1" | printable
 }
 
 remote_cmd() { # args -> one bash command line: a single argument is a script, several are quoted
@@ -1001,21 +1216,32 @@ file_api() { # METHOD id remote-path local-file: raw bytes, bounded storage, rep
 		if [ "$code" = 404 ] && jq -e '.error.code == "not_found" and (.error.message | test("route.*not.*found|unknown route"; "i"))' "$tmp/file-body" >/dev/null; then file_transfer=; return 2; fi
 		# These refusals come before any byte is written: an interrupt while waiting them out
 		# says that nothing started.
-		case $(err_code "$tmp/file-body") in quota_exceeded | machine_not_running | machine_cooldown) file_transfer= ;; esac
+		case $(err_code "$tmp/file-body") in quota_exceeded | concurrency_limit | machine_not_running | operation_conflict | machine_cooldown | rate_limited | restore_failed) file_transfer= ;; esac
 		case $(err_code "$tmp/file-body") in
 		host_unavailable)
 			jq -e '.error.retryable == true' "$tmp/file-body" >/dev/null && [ "$SECONDS" -lt "$end" ] || die "file transfer interrupted"
 			sleep_for 5 ;;
-		quota_exceeded)
+		quota_exceeded | concurrency_limit) # retryable only: api_refusal ends the other kind
 			[ "$SECONDS" -lt "$end" ] || die "file transfer did not run: concurrent-request limit stayed full"
 			sleep_for 5 ;;
 		machine_not_running)
 			starts=$((starts + 1))
 			[ "$starts" -le 3 ] && [ "$SECONDS" -lt "$end" ] || die "file transfer did not run: $LABEL keeps stopping"
 			ensure_running "$id" || die "could not start $LABEL for file transfer" ;;
+		operation_conflict) # a wake hold ran out or another operation runs, before the transfer
+			# started: wait for the operation it names, then repeat it
+			starts=$((starts + 1))
+			[ "$starts" -le 3 ] && [ "$SECONDS" -lt "$end" ] || die "file transfer did not run: $LABEL stayed busy with another operation (409 operation_conflict)"
+			RESTORE_FAILED=
+			conflict_wait "$id" "$tmp/file-body" || {
+				[ -z "$RESTORE_FAILED" ] || die "file transfer did not run: $(restore_text "$LABEL")"
+				die "file transfer did not run: $LABEL stayed busy with another operation or could not start"
+			} ;;
+		restore_failed) die "file transfer did not run: $(restore_text "$LABEL")" ;;
 		machine_cooldown)
 			m=$(api GET "/v1/machines/$id") || die "could not read cooldown"
 			cooldown_wait "$tmp/file-body" "$m" "$end" || die "file transfer did not run: max-run cooldown" ;;
+		rate_limited) die "file transfer did not run: waking $LABEL hit the account's start rate limit (limits.startsPerMinute); try again in $(jq -r '.error.retryAfterSeconds // 20' "$tmp/file-body" | printable) s" ;;
 		not_a_file) return 3 ;;
 		no_space) die "file transfer failed: disk full" ;;
 		too_large) die "file transfer failed: server limit is 5 GiB" ;;
@@ -1152,11 +1378,7 @@ release_box() { # box: shared by literal and bulk release
 
 exec_shot() { # id timeout cmd [stdin-file]: one exec, no retry. Sets R. Does not die.
 	local id=$1 t=$2
-	if [ $# -ge 4 ]; then
-		jq -n --arg c "$3" --argjson t "$t" --rawfile s "$4" '{cmd:$c, timeoutSeconds:$t, stdin:$s}' >"$tmp/exec"
-	else
-		jq -n --arg c "$3" --argjson t "$t" '{cmd:$c, timeoutSeconds:$t}' >"$tmp/exec"
-	fi
+	exec_body "${@:2}"
 	exec_phase=partial
 	if IBX_EXEC_MAXTIME=$((t + 30)) api POST "/v1/machines/$id/exec" "$tmp/exec" >"$tmp/exec-result" 2>"$tmp/err"; then
 		R=$(cat "$tmp/exec-result")
@@ -1164,6 +1386,12 @@ exec_shot() { # id timeout cmd [stdin-file]: one exec, no retry. Sets R. Does no
 		return 0
 	fi
 	return 1
+}
+shot_abuse() { # id: after a failed exec_shot, 0 (with a fatal abuse_lock) when an abuse check refused the wake
+	local m
+	[ "$(err_code "$tmp/err")" = machine_cooldown ] || return 1
+	m=$(api GET "/v1/machines/$1" 2>/dev/null) || return 1
+	abuse_lock "$tmp/err" "$m"
 }
 
 home_has() { # id absolute-path -> 0 when the file API does not answer 404
@@ -1418,7 +1646,7 @@ sweep_jobs() { # id release|claim [token]
 	claim) script=$(job_remote claim "$3") ;;
 	*) return 0 ;;
 	esac
-	if exec_shot "$1" 30 "$script"; then
+	if EXEC_NO_HISTORY=1 exec_shot "$1" 30 "$script"; then
 		text=$(jq -r '.stdout // ""' <<<"$R")
 		warn_remote_lines "$text"
 	else
@@ -1432,7 +1660,7 @@ report_leftovers() { # id box claim-start   uses the machine object in m
 	[ -n "$3" ] || return 0
 	[ "$(jq -r '.state // ""' <<<"$m")" = running ] || return 0
 	script=$(job_remote left "$3")
-	if exec_shot "$1" 15 "$script"; then
+	if EXEC_NO_HISTORY=1 exec_shot "$1" 15 "$script"; then
 		text=$(jq -r '.stdout // ""' <<<"$R")
 		warn_remote_lines "$text"
 	else
@@ -1535,7 +1763,7 @@ put_tree() { # box src dst. untracked, excludes and force are in scope.
 	[ "$sha" = "$(jq -r .sha256 "$tmp/file-body")" ] || die "uploaded archive SHA-256 does not match"
 	shell_dest=$(printf '$HOME/%q' "${dst#\~/}")
 	shell_arch=$(printf '$HOME/.ibx/in/%s.tgz' "$rand")
-	EXEC_SAFE=1 exec_in "$id" 120 "# ibx-remote
+	EXEC_SAFE=1 EXEC_NO_HISTORY=1 exec_in "$id" 120 "# ibx-remote
 mkdir -p -- $shell_dest && tar xzf $shell_arch -C $shell_dest && rm -f -- $shell_arch"
 	[ "$(jq -r .exitCode <<<"$R")" = 0 ] || die "could not extract on $box: $(jq -r .stderr <<<"$R" | printable)"
 	if [ -n "$JSON" ]; then
@@ -1708,14 +1936,14 @@ get_tree() { # box remote-src local-dst
 	*) shell_src=$(printf '$HOME/%q' "$rel"); arch=/data/home/.ibx/out/$rand.tgz ;;
 	esac
 	shell_arch=$(printf '$HOME/.ibx/out/%s.tgz' "$rand")
-	EXEC_SAFE=1 exec_in "$id" 120 "# ibx-remote
+	EXEC_SAFE=1 EXEC_NO_HISTORY=1 exec_in "$id" 120 "# ibx-remote
 mkdir -p -- \$HOME/.ibx/out && tar czf $shell_arch -C $shell_src ."
 	[ "$(jq -r .exitCode <<<"$R")" = 0 ] || die "could not archive $box:$src: $(jq -r .stderr <<<"$R" | printable)"
 	stage=$(mktemp "${TMPDIR:-/tmp}/ibx-get.XXXXXX") || die "could not stage download"
 	remove_download() { rm -f "$stage"; }
 	cleanup_fns+=(remove_download)
 	file_api GET "$id" "$arch" "$stage" || die "could not download $box:$src"
-	EXEC_SAFE=1 exec_shot "$id" 30 "# ibx-remote
+	EXEC_SAFE=1 EXEC_NO_HISTORY=1 exec_shot "$id" 30 "# ibx-remote
 rm -f -- $shell_arch" || warn "could not remove the temporary archive on $box"
 	inspect_tar "$stage"
 	rm -rf -- "${dst}.ibx-part"
@@ -1766,8 +1994,8 @@ ls)
 	done < <(jq -r '.[].id' <<<"$ms")
 	rows=$(jq --argjson secrets "$secrets_rows" --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
 		[.[] | select($all == "1" or inpool) | age($now) as $age | {
-			name: (.name | clean), id, state, pool: inpool, vault: vaulton, secrets:$secrets[.id],
-			pausesAt:pauses, cooldownUntil:(.cooldownUntil // null | clean), maxRunMinutes, runStartedAt, runtime:(.runtime // null),
+			name: (.name | clean), id, state, pool: inpool, free: (.free == true), vault: vaulton, secrets:$secrets[.id],
+			pausesAt:pauses, cooldownUntil:(.cooldownUntil // null | clean), cooldownReason:(.cooldownReason // null | clean), maxRunMinutes, runStartedAt, runtime:(.runtime // null),
 			reservation: (if $age == null then "free"
 				elif $age == "invalid" then "invalid"
 				elif $age > $stale then "abandoned" else "held" end),
@@ -1789,7 +2017,10 @@ ls)
 			elif .reservation == "abandoned" then "free (abandoned reservation by \(.by // "?"))"
 			elif .reservation == "invalid" then "held? reservation date unreadable (\(.since)); only the user should release it"
 			else "held by \(.by // "?") since \(.since): \(.purpose // "")" end),
-			(if .pool then "" else "not in pool" end), (.pausesAt // ""), (.cooldownUntil // "")] | @tsv' <<<"$rows" | table
+			(if .pool then "" else "not in pool" end),
+			(if .pausesAt == null then "" elif .free then "\(.pausesAt) or later" else .pausesAt end),
+			(if .cooldownUntil != null and (.cooldownReason | type == "string" and startswith("abuse_")) then "abuse lock until \(.cooldownUntil)"
+			 else (.cooldownUntil // "") end)] | @tsv' <<<"$rows" | table
 	fi
 	;;
 pool)
@@ -1840,7 +2071,7 @@ claim)
 	[ $# -eq 1 ] && [ -n "$purpose" ] || die 'usage: ibx claim [--json] "<purpose>": the purpose must be ONE quoted argument'
 	purpose=$(printf '%s' "$purpose" | tr '\t\n\r' '   ' | printable)
 	token=$(idem)
-	apierr=''
+	apierr='' free_refused=''
 	claimed_ids=()
 	claim_lock_kind='' claim_lock_disabled=''
 	cleanup_fns+=(claim_unlock reap_unlock)
@@ -1873,6 +2104,17 @@ claim)
 			m=$(api GET "/v1/machines/$id") || { fatal_check; apierr=1; continue; }
 			[ "$(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" "$JQ_DEFS"' free($now; $stale)' <<<"$m")" = true ] || continue
 			name=$(jq -r "$JQ_DEFS"' .name | clean' <<<"$m")
+			# 402 early_allowance_ended refuses only free sandboxes: once one was refused, or the
+			# server marks this one (Machine.earlyAllowanceEnded), skip free ones that are not
+			# running and keep looking for a paid one.
+			if [ "$(jq -r '.free == true and .state != "running"' <<<"$m")" = true ]; then
+				[ -z "$free_refused" ] || continue
+				if [ "$(jq -r '.earlyAllowanceEnded == true' <<<"$m")" = true ]; then
+					echo '{}' >"$tmp/free-limit-none"
+					free_refused=$(free_limit_message "$tmp/free-limit-none")
+					continue
+				fi
+			fi
 			if [ "${IBX_ALLOW_VAULT:-}" != 1 ]; then
 				n=$(vault_items "$id" "${b:-${name:-$id}}") || { fatal_check; apierr=1; continue; }
 				[ "$n" = 0 ] || { warn "skipping $name: the Vault writes $n secret(s) into it"; continue; }
@@ -1927,23 +2169,63 @@ claim)
 			done
 			IBX_MAXTIME=''
 			[ -n "$ok" ] || continue
-			ensure_running "$id" || { fatal_check; warn "$name would not start; trying another"; set_claim "$id" '{}' || true; continue; }
+			if ! ensure_running "$id"; then
+				fatal=$(jq -r '.code // empty' "$tmp/fatal" 2>/dev/null) || fatal=
+				if [ "$fatal" = free_limit ]; then
+					# Every other free sandbox that is not running would get the same refusal; a
+					# paid one would not, so the walk goes on (the check above skips free ones).
+					free_refused=$(jq -r .message "$tmp/fatal")
+					rm -f "$tmp/fatal"
+					set_claim "$id" '{}' || true
+					continue
+				elif [ "$fatal" = running_limit ]; then
+					# The plan's running-sandbox limit refuses every other box the same way.
+					message=$(jq -r .message "$tmp/fatal")
+					rm -f "$tmp/fatal"
+					set_claim "$id" '{}' || true
+					stderr printf 'ibx: %s\n' "$message"
+					json_error running_limit "$message"
+					exit 75
+				elif [ "$fatal" = abuse_lock ]; then
+					message=$(jq -r .message "$tmp/fatal")
+					rm -f "$tmp/fatal"
+					warn "skipping $name: ${message#nothing ran: }"
+					set_claim "$id" '{}' || true
+					continue
+				fi
+				fatal_check
+				warn "$name would not start; trying another"
+				set_claim "$id" '{}' || true
+				continue
+			fi
 			LABEL=$name
 			sweep_jobs "$id" claim "$token"
 			m=$(api GET "/v1/machines/$id") || die "could not read the claimed sandbox"
 			pauses=$(jq -c "$JQ_DEFS"' pauses' <<<"$m")
 			cooldown=$(jq -c '.cooldownUntil // null' <<<"$m")
-			if jq -e "$JQ_DEFS"' (pauses | timestamp) as $p | $p != null and $p - now < 3600' <<<"$m" >/dev/null; then warn "$name has under 60 minutes left before its max-run pause"; fi
+			if jq -e "$JQ_DEFS"' (pauses | timestamp) as $p | $p != null and $p - now < 3600' <<<"$m" >/dev/null; then
+				if [ "$(jq -r '.free // false' <<<"$m")" = true ]; then
+					# A free run starts at 120 minutes and real use extends it, up to 480.
+					warn "$name has under 60 minutes left at its current max-run limit; use extends a free run, up to 480 minutes from its start"
+				else
+					warn "$name has under 60 minutes left before its max-run pause"
+				fi
+			fi
 			kept_claim=$(jq -cn --arg n "$name" --arg id "$id" '[{name:$n,id:$id}]')
 			claimed_ids=("${claimed_ids[@]/$id/}") # ours to keep: do not clear it on exit
-			# Keep it awake from now on; a keepalive timer renews this lease while it is reserved.
-			echo '{"ttlSeconds":3600}' >"$tmp/lease"
 			lease=null
-			if lease_reply=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>/dev/null); then
-				lease=$(jq -c "$JQ_DEFS"' .expiresAt | clean' <<<"$lease_reply")
-			else
-				fatal_check
-				warn "could not set the activity lease on $name: it may pause after 30 idle minutes"
+			# Paid plans: keep it awake from now on; a keepalive timer renews this lease while it is
+			# reserved. The free plan forbids leases renewed from outside the sandbox to keep it from
+			# pausing (instabox Terms 2(e), 2026-11-06): a free sandbox gets none, pauses after 30
+			# idle minutes and wakes on the next use.
+			if [ "$(jq -r '.free // false' <<<"$m")" != true ]; then
+				echo '{"ttlSeconds":3600}' >"$tmp/lease"
+				if lease_reply=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>/dev/null); then
+					lease=$(jq -c "$JQ_DEFS"' .expiresAt | clean' <<<"$lease_reply")
+				else
+					fatal_check
+					warn "could not set the activity lease on $name: it may pause after 30 idle minutes"
+				fi
 			fi
 			port_rows='[]'
 			if ! ports=$(public_ports "$id"); then
@@ -1975,11 +2257,20 @@ claim)
 	done
 	fatal_check
 	[ -z "$apierr" ] || die "could not claim a sandbox: API errors (see above)"
+	if [ -n "$free_refused" ]; then
+		stderr printf 'ibx: %s\n' "$free_refused"
+		json_error free_limit "$free_refused"
+		exit 75
+	fi
 	claim_limit "$ms" "$token"
 	held=$(held_claims "$ms")
 	message='no free sandbox in the pool (ibx ls). Ask the user before using one someone else holds.'
 	stderr printf 'ibx: %s\n' "$message"
 	stderr jq -r '.[] | "  \(.name): held by \(.by) since \(.since): \(.purpose)"' <<<"$held"
+	while IFS= read -r line; do
+		[ -z "$line" ] || warn "$line"
+	done < <(jq -r --argjson now "$(date +%s)" "$JQ_DEFS"' .[] | select(inpool and abused and (available($now) | not)) |
+		"\(.name | clean): abuse lock (\(.cooldownReason | clean)) until \(.cooldownUntil // "unknown" | clean): tell the user; ibx doctor shows why"' <<<"$ms" | printable)
 	json_error no_free_sandbox "$message" "$held"
 	exit 75
 	;;
@@ -2101,13 +2392,14 @@ exec)
 	id=$(resolve --pool "$box")
 	LABEL=$box
 	cmd=$(remote_cmd "$@")
-	[ -z "$tailn" ] || cmd=$(tail_wrapper "$tailn" "$cmd")
+	history= # --tail wraps the command: the sandbox's history shows the user's command instead
+	if [ -n "$tailn" ]; then history=$cmd; cmd=$(tail_wrapper "$tailn" "$cmd"); fi
 	if [ -n "$stdin" ]; then
 		head -c 1048577 >"$tmp/stdin"
 		[ "$(size_of "$tmp/stdin")" -le 1048576 ] || die "stdin is over 1 MiB: use ibx ssh"
-		exec_in "$id" "$t" "$cmd" "$tmp/stdin"
+		EXEC_HISTORY=$history exec_in "$id" "$t" "$cmd" "$tmp/stdin"
 	else
-		exec_in "$id" "$t" "$cmd"
+		EXEC_HISTORY=$history exec_in "$id" "$t" "$cmd"
 	fi
 	r=$R
 	if [ -n "$EXEC_JSON" ]; then
@@ -2119,6 +2411,8 @@ exec)
 		[ -z "$signal" ] || warn "the remote command was killed by SIG$signal"
 		disk=$(jq -r "$JQ_DEFS"' .diskWarning.message // empty | clean' <<<"$r" | printable)
 		[ -z "$disk" ] || warn "$disk"
+		oom=$(oom_note "$r")
+		[ -z "$oom" ] || warn "$oom"
 		[ "$timed" = true ] && warn "timed out after ${t}s; the command may have run partly"
 		jq -n --arg box "$box" --argjson r "$r" --arg full "$full" --arg timed "$timed" --arg t "$t" '
 			{box:$box, ran:(if $timed == "true" then "partial" else "yes" end),
@@ -2126,6 +2420,7 @@ exec)
 			 truncated:($r.truncated // false), invalidUtf8:($r.invalidUtf8 // false),
 			 stdout:($r.stdout // ""), stderr:($r.stderr // ""), warnings:[]}
 			+ (if $full == "" then {} else {fullLog:$full} end)
+			+ ($r | with_entries(select(.key == "oomKilled" or .key == "oomKill")))
 			+ (if $timed == "true" then {error:{code:"timed_out", message:("timed out after " + $t + "s; the command may have run partly")}} else {} end)' >"$tmp/result"
 		[ "$timed" = true ] && exit 124
 		exit "$(jq -r '.exitCode // 125' <<<"$r")"
@@ -2133,6 +2428,8 @@ exec)
 	jq -j '.stdout // ""' <<<"$r"
 	stderr jq -j '.stderr // ""' <<<"$r"
 	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && warn "output truncated (1 MiB per stream)"
+	oom=$(oom_note "$r")
+	[ -z "$oom" ] || warn "$oom"
 	if [ "$(jq -r '.timedOut // false' <<<"$r")" = true ]; then
 		warn "timed out after ${t}s; the command may never have started if the sandbox was slow; for long jobs run them detached: setsid -f CMD </dev/null >LOG 2>&1"
 		exit 124
@@ -2193,7 +2490,7 @@ put)
 	LABEL=$box
 	q=$(printf %q "$dst")
 	# Runs in the sandbox (Debian, GNU coreutils).
-	EXEC_SAFE=1 exec_in "$id" 120 "[ ! -d $q ] || { echo 'destination is a directory: give the file name too' >&2; exit 3; }
+	EXEC_SAFE=1 EXEC_NO_HISTORY=1 exec_in "$id" 120 "[ ! -d $q ] || { echo 'destination is a directory: give the file name too' >&2; exit 3; }
 mkdir -p -- \"\$(dirname -- $q)\" && { base64 -d >$q.ibx-part || { rm -f -- $q.ibx-part; exit 1; }; } && mv -fT -- $q.ibx-part $q" "$tmp/in"
 	r=$R
 	[ "$(jq -r .exitCode <<<"$r")" = 0 ] || die "put failed: $(jq -r .stderr <<<"$r" | printable)"
@@ -2225,7 +2522,7 @@ get)
 	LABEL=$box
 	q=$(printf %q "$src")
 	# Runs in the sandbox (Debian, GNU coreutils).
-	EXEC_SAFE=1 exec_in "$id" 120 "[ -f $q ] || { echo 'not a regular file' >&2; exit 3; }; s=\$(stat -L -c %s -- $q); [ \"\$s\" -le 750000 ] || { echo \"\$s bytes is over 750 KB: use ibx ssh BOX 'cat FILE' >LOCAL\" >&2; exit 4; }; head -c 750001 -- $q | base64 -w0"
+	EXEC_SAFE=1 EXEC_NO_HISTORY=1 exec_in "$id" 120 "[ -f $q ] || { echo 'not a regular file' >&2; exit 3; }; s=\$(stat -L -c %s -- $q); [ \"\$s\" -le 750000 ] || { echo \"\$s bytes is over 750 KB: use ibx ssh BOX 'cat FILE' >LOCAL\" >&2; exit 4; }; head -c 750001 -- $q | base64 -w0"
 	r=$R
 	[ "$(jq -r .exitCode <<<"$r")" = 0 ] || die "get failed: $(jq -r .stderr <<<"$r" | printable)"
 	[ "$(jq -r '.truncated // false' <<<"$r")" = true ] && die "get failed: output truncated"
@@ -2286,7 +2583,12 @@ ssh | forward)
 			sshargs+=(-L "127.0.0.1:$((10#$local_port)):127.0.0.1:$((10#$remote_port))")
 		done
 		sshargs+=(ibx)
-		warn "private tunnel in the foreground; SSH token expires in 1 hour; the claim's lease keeps the sandbox awake"
+		if [ "$(api GET "/v1/machines/$id" | jq -r '.free // false')" = true ]; then
+			# No lease on the free plan (instabox Terms 2(e), 2026-11-06).
+			warn "private tunnel in the foreground; SSH token expires in 1 hour; free plan: nothing keeps the sandbox awake, it can pause after 30 idle minutes and close the tunnel"
+		else
+			warn "private tunnel in the foreground; SSH token expires in 1 hour; the claim's lease keeps the sandbox awake"
+		fi
 	else
 		sshargs+=(ibx)
 		[ $# -gt 0 ] && sshargs+=(-- "$(remote_cmd "$@")")
@@ -2324,21 +2626,28 @@ unport)
 	echo "unpublished port $2 of $1"
 	;;
 keepalive)
-	# Free-plan idle pause is fixed at 30 minutes. Leases do not prevent max-run pauses.
-	# An activity lease (1 h) keeps it awake; renewing it every 15 minutes from a timer keeps
-	# reserved pool sandboxes (or, with --all, every pool sandbox) running while that timer runs.
-	# Idle-paused ones are woken; manually paused and stopped ones are left alone.
+	# Paid plans only. An activity lease (1 h) keeps a sandbox awake; renewing it every 15 minutes
+	# from a timer keeps reserved pool sandboxes (or, with --all, every pool sandbox) running while
+	# that timer runs. Idle-paused ones are woken; manually paused and stopped ones are left alone.
+	# Leases do not prevent max-run pauses. The free plan forbids leases renewed from outside the
+	# sandbox to keep it from pausing (instabox Terms 2(e), 2026-11-06): free sandboxes are skipped.
 	all=''
 	for a in "$@"; do case "$a" in --all) all=1 ;; *) die "usage: ibx keepalive [--all]" ;; esac; done
 	ms=$(all_machines) || die "could not list sandboxes"
 	echo '{"ttlSeconds":3600}' >"$tmp/lease"
 	fail=0
-	while IFS=$'\037' read -r id name state auto cool; do
+	while IFS=$'\037' read -r id name state auto cool free abused; do
 		[ -n "$id" ] || continue
 		[[ $id =~ ^m_[a-z2-7]{26}$ ]] || continue
+		kind='max-run cooldown'
+		[ "$abused" != true ] || kind='abuse lock'
 		# A cooldown ibx cannot read is left to the server, which refuses the lease if it applies.
 		if jq -en --arg c "$cool" "$JQ_DEFS"' ($c | timestamp) as $c | $c != null and $c > now' >/dev/null; then
-			echo "$name: max-run cooldown until $cool, skipped"
+			echo "$name: $kind until $cool, skipped"
+			continue
+		fi
+		if [ "$free" = true ]; then
+			echo "$name: free plan: renewing a lease from outside the sandbox is not allowed (instabox Terms 2(e), 2026-11-06), skipped"
 			continue
 		fi
 		if [ "$state" = running ] || { [ "$state" = suspended ] && [ -n "$auto" ]; }; then
@@ -2346,10 +2655,15 @@ keepalive)
 			if r=$(api PUT "/v1/machines/$id/activity-leases/$LEASE" "$tmp/lease" 2>"$tmp/err"); then
 				echo "$name: lease until $(jq -r .expiresAt <<<"$r")"
 			elif [ "$(err_code "$tmp/err")" = machine_cooldown ]; then
-				if [ -n "$cool" ]; then echo "$name: max-run cooldown until $cool, skipped"
-				else echo "$name: max-run cooldown, retry after $(jq -r '.error.retryAfterSeconds // "unknown"' "$tmp/err") s, skipped"; fi
+				jq -e '.error.reason | type == "string" and startswith("abuse_")' "$tmp/err" >/dev/null 2>&1 && kind='abuse lock'
+				if [ -n "$cool" ]; then echo "$name: $kind until $cool, skipped"
+				else echo "$name: $kind, retry after $(jq -r '.error.retryAfterSeconds // "unknown"' "$tmp/err" | printable) s, skipped"; fi
 			elif [ "$(err_code "$tmp/err")" = max_run_disabled ]; then
 				echo "$name: max-run is disabled (maxRunMinutes 0), skipped"
+			elif [ "$(err_code "$tmp/err")" = rate_limited ]; then
+				echo "$name: the start rate limit was reached, retry after $(jq -r '.error.retryAfterSeconds // "unknown"' "$tmp/err" | printable) s, skipped"
+			elif [ -s "$tmp/fatal" ] && { [ "$(jq -r .code "$tmp/fatal")" = free_limit ] || [ "$(jq -r .code "$tmp/fatal")" = running_limit ]; }; then
+				echo "$name: $(jq -r .message "$tmp/fatal" | printable); skipped"
 			elif [ -s "$tmp/fatal" ] && [ "$(jq -r .code "$tmp/fatal")" = account_blocked ]; then
 				# The lease route does not list 402, but it wakes an idle-paused box first, and wake
 				# does. A skip, not a failure: the installed systemd unit restarts failed runs
@@ -2365,7 +2679,8 @@ keepalive)
 		fi
 	done < <(jq -r --argjson now "$(date +%s)" --argjson stale "$STALE_SECS" --arg all "$all" "$JQ_DEFS"'
 		.[] | select(inpool) | select($all == "1" or (free($now; $stale) | not)) |
-		[.id, (.name | clean), .state, (.autoSuspendedAt // ""), (.cooldownUntil // "" | clean)] | join("\u001f")' <<<"$ms")
+		[.id, (.name | clean), .state, (.autoSuspendedAt // ""), (.cooldownUntil // "" | clean),
+		 (.free == true | tostring), (abused | tostring)] | join("\u001f")' <<<"$ms")
 	exit $fail
 	;;
 doctor)
@@ -2431,9 +2746,10 @@ doctor)
 			done < <(jq -r "$JQ_DEFS"' .[] | select(inpool) | [.id, (.name | clean), (vaulton | tostring)] | join("\u001f")' <<<"$ms")
 			orgid=$(jq -r '.orgId // empty' <<<"$me")
 			if [[ $orgid =~ ^[A-Za-z0-9_-]+$ ]] && org=$(api GET "/v1/orgs/$orgid" 2>"$tmp/orgplanerr"); then
-				ok "org: $(jq -c '{tier,freeSandboxHoursLimit:.limits.freeSandboxHours,freeSandboxHoursUsed:.usage.freeSandboxHours,startsPerMinute:.limits.startsPerMinute,cardMissingAt,disabledAt}' <<<"$org" | printable); 0 free hours means no cap"
-				if [ "$(jq -r .tier <<<"$org")" = free ] && command -v systemctl >/dev/null &&
-					systemctl --user cat ibx-keepalive.service 2>/dev/null | grep -q -- '--all'; then note "keepalive --all cycles every free box through 8-hour max-run pauses and uses free hours"; fi
+				ok "org: $(jq -c '{tier,freeSandboxHoursLimit:.limits.freeSandboxHours,freeSandboxHoursUsed:.usage.freeSandboxHours,startsPerMinute:.limits.startsPerMinute,freeSandboxes:.limits.freeSandboxes,earlyAllowanceEnded:.limits.earlyAllowanceEnded,cardMissingAt,disabledAt}' <<<"$org" | printable); 0 free hours means no cap"
+				if [ "$(jq -r '.limits.earlyAllowanceEnded // false' <<<"$org")" = true ]; then
+					note "the early free allowance has ended: only $(jq -r '.limits.freeSandboxes // "?"' <<<"$org" | printable) free sandbox(es) can run at a time; instabox pauses the others, and waking one more fails with free_limit"
+				fi
 				if orgsecrets=$(api GET "/v1/orgs/$orgid/secrets" 2>"$tmp/orgerr"); then
 					while IFS=$'\037' read -r secret risk; do
 						[ -n "$secret" ] || continue
@@ -2454,7 +2770,18 @@ doctor)
 				1) no "$name has Org Secrets selected, pending or left behind" "the user clears both selections (PATCH /v1/machines/ID/secrets {\"secrets\":[],\"envSecrets\":[]}) or recreates it with --no-vault --secrets none" ;;
 				2) no "could not inspect the Org Secrets of $name$(why "$tmp/serr")" "run ibx doctor again; claim skips the box until it can be inspected" ;;
 				esac
-				ok "$name run budget: $(jq -c --arg id "$id" "$JQ_DEFS"' .[] | select(.id == $id) | {maxRunMinutes,pausesAt:pauses,cooldownUntil}' <<<"$ms" | printable)"
+				ok "$name run budget: $(jq -c --arg id "$id" "$JQ_DEFS"' .[] | select(.id == $id) | {maxRunMinutes,pausesAt:pauses,cooldownUntil}' <<<"$ms" | printable)$(
+					[ "$(jq -r --arg id "$id" '.[] | select(.id == $id) | .free == true' <<<"$ms")" != true ] ||
+						printf ' (free plan: the current limit; a run starts at 120 minutes and use extends it, up to 480)')"
+				lock=$(jq -c --arg id "$id" --argjson now "$(date +%s)" "$JQ_DEFS"' .[] | select(.id == $id and abused and (available($now) | not))' <<<"$ms")
+				if [ -n "$lock" ]; then
+					appeal=$(jq -r "$JQ_DEFS"' .abuseLock | if type == "object" then .appeal // "" | tostring | clean else "" end' <<<"$lock" | printable)
+					no "$(jq -r "$JQ_DEFS"' (if (.abuseLock | type) == "object" then .abuseLock else {} end) as $l |
+						"\(.name | clean) has an abuse lock (\(.cooldownReason | clean)) until \(.cooldownUntil // "unknown" | clean)" +
+						([($l.explanation // empty | tostring | clean), ($l.what // empty | tostring | clean)] | map(select(. != "")) |
+							if length == 0 then "" else ": " + join("; ") end)' <<<"$lock" | printable)" \
+						"tell the user; ibx does not wait out the lock and claim skips the sandbox${appeal:+; to contest it: $appeal}"
+				fi
 				if tokens=$(api GET "/v1/machines/$id/ssh-tokens" 2>"$tmp/tokenerr"); then
 					while IFS= read -r token_name; do [ -z "$token_name" ] || note "$name has a long-lived SSH token: $token_name"; done < <(jq -r "$JQ_DEFS"' .tokens[]? | select(.revokedAt == null) | (.expiresAt | timestamp) as $e | select($e == null or $e > now + 3600) | .name | clean' <<<"$tokens")
 				else no "could not audit SSH tokens for $name$(why "$tmp/tokenerr")" "run ibx doctor again"; fi
@@ -2469,21 +2796,31 @@ doctor)
 
 			if r=$(api GET /v1/usage 2>/dev/null); then ok "limits: $(jq -c '.limits | {maxMachines, machineSpec}' <<<"$r")"; fi
 		else
-			next="check the network and run ibx doctor again"
+			next="check the network and https://status.instabox.sh, then run ibx doctor again"
 			[ ! -s "$tmp/fatal" ] || next="the user fixes or replaces this key (README: Setup); never look for another one"
 			no "API call failed: $(jq -c '.error | {code, message, hint, requiredScopes}' <"$tmp/err" 2>/dev/null || head -c 200 "$tmp/err" | printable)" "$next"
 		fi
 	else
 		no "no API key: set INSTABOX_API_KEY or write it to $KEYFILE (chmod 600)" "the user creates one (README: Setup, step 1)"
 	fi
+	timer='' stop=''
+	uninstall='or ./install.sh --uninstall --agents none --no-bin from the ibx clone'
 	if command -v systemctl >/dev/null && systemctl --user is-active -q ibx-keepalive.timer 2>/dev/null; then
-		ok "keepalive timer active (systemd)"
+		timer='timer active (systemd)' stop="systemctl --user disable --now ibx-keepalive.timer, $uninstall"
 	elif command -v launchctl >/dev/null && launchctl list 2>/dev/null | grep -q ibx-keepalive; then
-		ok "keepalive agent loaded (launchd)"
+		timer='agent loaded (launchd)' stop="launchctl bootout gui/\$(id -u)/local.ibx-keepalive and rm ~/Library/LaunchAgents/local.ibx-keepalive.plist, $uninstall"
 	elif crontab -l 2>/dev/null | grep -q 'ibx keepalive'; then
-		ok "keepalive in crontab"
-	else
-		note "no keepalive timer: a reserved sandbox can pause after its 1-hour lease runs out (see references/keepalive.md)"
+		timer='in crontab' stop='crontab -e and delete the ibx keepalive line'
+	fi
+	# Without a sandbox list (no key, API error) the plan of the pool is unknown: both counts are 0.
+	free_pool=$(jq "$JQ_DEFS"' [.[] | select(inpool and .free == true)] | length' <<<"${ms:-[]}")
+	paid_pool=$(jq "$JQ_DEFS"' [.[] | select(inpool and .free != true)] | length' <<<"${ms:-[]}")
+	if [ -n "$timer" ] && [ "$free_pool" != 0 ]; then
+		no "keepalive $timer, and $free_pool pool sandbox(es) are on the free plan: renewing leases from outside the sandbox to keep it awake breaks the instabox Terms 2(e) (2026-11-06)" "the user disables it: $stop"
+	elif [ -n "$timer" ]; then
+		ok "keepalive $timer"
+	elif [ "$paid_pool" != 0 ]; then
+		note "no keepalive timer: a reserved paid-plan sandbox can pause after its 1-hour lease runs out (see references/keepalive.md)"
 	fi
 	version_newer() { # $1 is newer than $2
 		local IFS=. i x y
@@ -2568,13 +2905,16 @@ run)
 	[ $# -gt 0 ] || die "usage: ibx run <box> <name> [--replace] -- <cmd>"
 	id=$(resolve --pool "$box")
 	LABEL=$box
+	# Bring a paused or stopped box up first, as exec does; the start itself is sent once.
+	ensure_running "$id" || die "run did not start: could not start $box"
 	m=$(api GET "/v1/machines/$id") || die "could not read $box"
 	token=$(jq -r '.metadata["ibx.claim.token"] // "-"' <<<"$m")
 	[[ $token =~ ^[-A-Za-z0-9_]+$ ]] || token=-
 	script=$(job_controller "$name" "$replace" "$token")
 	remote_cmd "$@" >"$tmp/job-cmd"
 	line=
-	if exec_shot "$id" 60 "$script" "$tmp/job-cmd"; then
+	# The history shows the user's command, not the job controller that starts it.
+	if EXEC_HISTORY=$(cat "$tmp/job-cmd") exec_shot "$id" 60 "$script" "$tmp/job-cmd"; then
 		ec=$(jq -r '.exitCode // 1' <<<"$R")
 		line=$(jq -r '.stdout // ""' <<<"$R" | head -n 1)
 		if [ "$ec" != 0 ]; then
@@ -2584,12 +2924,23 @@ run)
 	else
 		code=$(err_code "$tmp/err")
 		case $code in
-		quota_exceeded | machine_not_running | machine_cooldown | max_run_disabled | bad_request | not_found | permission_denied | bad_path | unauthenticated | api_key_expired | api_key_revoked | insufficient_scope | missing_scope)
+		machine_not_running)
+			stderr cat "$tmp/err"
+			die "run did not start: $box stopped or paused again before the start (409 machine_not_running); nothing started, run it again" ;;
+		quota_exceeded | concurrency_limit | operation_conflict | max_run_disabled | rate_limited | bad_request | not_found | permission_denied | bad_path | unauthenticated | api_key_expired | api_key_revoked | insufficient_scope | missing_scope)
 			stderr cat "$tmp/err"
 			die "run did not start" ;;
+		restore_failed)
+			stderr cat "$tmp/err"
+			die "run did not start: $(restore_text "$box")" ;;
+		machine_cooldown)
+			! shot_abuse "$id" || die "run did not start"
+			m=$(api GET "/v1/machines/$id") || die "run did not start: $box is in a cooldown"
+			stderr cat "$tmp/err"
+			die "run did not start: $box is in its max-run cooldown until $(jq -r "$JQ_DEFS"' .cooldownUntil // "the server permits a wake" | clean' <<<"$m" | printable)" ;;
 		esac
 		fatal_check
-		if exec_shot "$id" 30 "$(job_remote status "$name")"; then
+		if EXEC_NO_HISTORY=1 exec_shot "$id" 30 "$(job_remote status "$name")"; then
 			line=$(jq -r '.stdout // ""' <<<"$R" | head -n 1)
 			[ "$line" != absent ] || die "run did not start"
 		else
@@ -2650,7 +3001,17 @@ job)
 	fi
 	id=$(resolve --pool "$box")
 	LABEL=$box
-	exec_shot "$id" "$tout" "$script" || die "could not read jobs on $box"
+	ensure_running "$id" || die "could not read jobs on $box: could not start it; nothing started"
+	if ! EXEC_NO_HISTORY=1 exec_shot "$id" "$tout" "$script"; then
+		! shot_abuse "$id" || die "could not read jobs on $box"
+		[ "$(err_code "$tmp/err")" != operation_conflict ] ||
+			die "could not read jobs on $box: it is still waking or busy with another operation (409 operation_conflict); nothing started, run ibx job again"
+		[ "$(err_code "$tmp/err")" != restore_failed ] || die "could not read jobs on $box: $(restore_text "$box"); its jobs did not survive"
+		[ "$(err_code "$tmp/err")" != machine_not_running ] ||
+			die "could not read jobs on $box: it stopped or paused again (409 machine_not_running); nothing started, run ibx job again"
+		stderr cat "$tmp/err"
+		die "could not read jobs on $box"
+	fi
 	[ "$(jq -r '.exitCode // 1' <<<"$R")" = 0 ] || die "$(jq -r '.stderr // "could not read the job"' <<<"$R" | head -n 1 | printable)"
 	text=$(jq -r '.stdout // ""' <<<"$R")
 	if [ "$mode" = show ] || [ "$mode" = wait ] || [ "$mode" = kill ]; then

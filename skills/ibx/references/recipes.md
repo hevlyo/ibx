@@ -2,7 +2,7 @@
 
 Concrete ways to get common jobs done in a pool sandbox. `BOX` is the name `ibx claim` printed.
 Write it down, because shell variables do not survive between your tool calls. The facts behind
-these recipes were checked through 2026-10-27 ([field-notes.md](field-notes.md)). The API is in
+these recipes were checked through 2026-11-06 ([field-notes.md](field-notes.md)). The API is in
 beta and changes fast, so prefer what you observe.
 
 Two forms run code in the sandbox. Exec can also opt into SSE:
@@ -21,7 +21,8 @@ and `ibx claim` and `ibx ssh` 600000 ms. Where a tool call stops at 10 minutes, 
 Code, keep `-t` at 480 or less; work that takes more than ~8 minutes goes detached (recipe 5).
 That budget covers the command, not what comes before it: ibx can first wait up to 600 s for
 a free request slot (32 per user) or a max-run cooldown, and up to 10 more minutes for a paused
-box to start. An ibx interrupted during those waits says `interrupted by SIG... before anything
+box to start (including waits for the free plan's 3 starts a minute). An abuse lock or the free
+plan's one-running-box limit fails at once instead (`abuse_lock`, `free_limit`). An ibx interrupted during those waits says `interrupted by SIG... before anything
 started in the sandbox`; only then is running the same command again known to be safe. `ibx ls`
 shows a cooldown.
 
@@ -275,17 +276,26 @@ ibx exec BOX -- 'kill -TERM -- -"$(cat jobs/build/pid)"'
 - `setsid -f` puts the job in a new session, so the exec ending (or timing out) does not take
   it down. `$$` in the inner bash is the process group ID, so `kill -- -PGID` stops the job
   together with its children.
-- The idle pause (30 minutes) ignores light CPU. Over 30 minutes, the user's keepalive timer
-  ([keepalive.md](keepalive.md)) keeps a reserved sandbox up. Polling with an exec at least
-  every 25 minutes also counts as activity, according to the spec. An idle pause usually preserves
-  the job. Free boxes also pause at 480 continuous minutes, regardless of leases; all wake
-  paths refuse until cooldownUntil. A refused poll is not a dead job. Checkpoint near 8 hours
-  and check the PID and runtime.processesPreserved in ibx ls --json after waking.
+- A job that uses CPU or the network keeps the box busy. A job that waits silently (no CPU,
+  no traffic) can be paused after 30 idle minutes on the free plan. Your next `ibx job` or `ibx exec`
+  wakes the box, and a resume normally brings the job back, but it can come back as a fresh
+  boot (`runtime.processesPreserved: false`) or with dropped connections: check the job's
+  state and `processesPreserved` after a wake. Poll
+  when you need the result, not to hold the box awake: on the free plan, scheduled pings,
+  busy loops and leases renewed from outside the box to prevent a pause are against the
+  terms, and ibx sets no lease there. On a paid plan the claim's lease, renewed by the user's
+  timer, keeps a reserved box up ([keepalive.md](keepalive.md)).
+- Free boxes also pause at their max-run limit: a free run starts at 120 minutes and only use
+  extends it, up to 480, so a run with little work ends sooner; all wake paths refuse until `cooldownUntil`, 5-20 minutes
+  and longer for back-to-back max-run pauses. A refused poll is not a dead job. Checkpoint
+  long jobs and check the PID and `runtime.processesPreserved` in `ibx ls --json` after
+  waking.
 - "gone without an exit code" usually means the sandbox booted fresh or the OOM killer struck
-  (`sudo dmesg | grep -i 'killed process'`). ibx warns about a fresh boot only when it started,
-  resumed or woke the sandbox itself (`claim`, `ssh`, or an exec that found it not running).
-  When the server wakes an idle-paused sandbox for an exec, ibx cannot tell, so this poll is
-  how you find out. Make long jobs restartable.
+  (`sudo dmesg | grep -i 'killed process'`; newer servers also report `oomKilled` on an exec,
+  and ibx warns about it, but its absence proves nothing). ibx warns about a fresh boot only after a start, resume or
+  wake it made or waited for (`claim`, `ssh`, or an exec that found the sandbox not running or
+  got a `409 operation_conflict` naming the wake). When the server's wake for an exec finishes
+  within its 45-second hold, ibx cannot tell, so this poll is how you find out. Make long jobs restartable.
 - For jobs past 24 h, run `ibx renew BOX` so your reservation does not count as abandoned.
 - For an interactive session that survives disconnects, install tmux
   (`sudo apt-get install -y tmux`).
@@ -391,9 +401,10 @@ ibx exec BOX -- "sleep 3; if pgrep -f '[m]y-server' >/dev/null; then pkill -KILL
 ## 9. Private previews and public ports
 
 For a preview on the user's computer, keep `ibx forward BOX 18080:8000` running in the
-foreground and visit `http://127.0.0.1:18080`. It binds only to localhost, revokes its 1-hour
-SSH token on exit, and relies on the claim's lease. Whether an open tunnel outlives token
-expiry remains unverified. Max-run pauses still interrupt access.
+foreground and visit `http://127.0.0.1:18080`. It binds only to localhost and revokes its
+1-hour SSH token on exit. On a paid plan the claim's lease keeps the box awake; on the free
+plan there is no lease, and a box left idle for 30 minutes pauses and drops the tunnel. Whether
+an open tunnel outlives token expiry remains unverified. Max-run pauses still interrupt access.
 
 A public URL has **no authentication**, and anyone with it reaches the service. Publish only
 when the user asks, tell them that, and unpublish as soon as they are done.
@@ -412,8 +423,8 @@ ibx unport BOX 8000        # when the user is done
   same port again keeps its URL.
 - The prose docs say URL visits wake an idle-paused box and wait; the spec still says 503.
   This has not been verified here. Manual pauses and stops still answer 503.
-  For a demo that must stay up past 30 idle minutes, the user needs the keepalive timer
-  ([keepalive.md](keepalive.md)).
+  A demo that must stay up past 30 idle minutes needs a paid plan and the keepalive timer
+  ([keepalive.md](keepalive.md)); on the free plan, do not keep it awake by other means.
 - If `curl` inside works but the public URL does not, bind to `0.0.0.0` instead of
   `127.0.0.1`.
 - instabox has no access control for these URLs. If the user wants protection, it has to live

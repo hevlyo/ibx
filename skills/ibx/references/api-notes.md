@@ -1,8 +1,10 @@
 # API notes: the instabox routes ibx and agents use
 
 This is a compact reference, checked against `GET https://api.instabox.sh/v1/openapi.json` on
-2026-10-27. The API is in beta and changes fast. When in doubt, read the live spec (public, no
-key) and prefer what you observe; [field-notes.md](field-notes.md) lists where the two differ.
+2026-10-27, with the changes found on 2026-11-06 (section 12 and
+[the research note](../../../docs/research/2026-11-06-instabox-changes.md)). The API is in
+beta and changes fast. When in doubt, read the live spec (public, no key) and prefer what you
+observe; [field-notes.md](field-notes.md) lists where the two differ.
 Agents should prefer `ibx`. It handles the key, retries, idempotency and waiting. Call the
 API directly only for something ibx does not do.
 
@@ -22,6 +24,7 @@ Read a route from the spec with
 9. [curl patterns that survive TLS drops](#9-curl-patterns-that-survive-tls-drops)
 10. [Routes added to ibx in 0.3.0](#10-routes-added-to-ibx-in-030)
 11. [Opt-in exec streaming](#11-opt-in-exec-streaming)
+12. [Fields and codes added by 2026-11-06](#12-fields-and-codes-added-by-2026-11-06)
 
 ## 1. Basics
 
@@ -58,9 +61,10 @@ Key: **Idem** = the `Idempotency-Key` header per the route's own parameters (`re
 | `POST .../{id}/start`, `/stop`, `/suspend`, `/resume` | machines:write | req | same key | returns an Operation |
 | `POST .../{id}/wake` | machines:write | none | yes | wakes an idle-paused sandbox; waits up to 45 s |
 | `GET /v1/operations/{id}?wait=25s` | machines:read or images:read | - | yes | long-poll, 30 s at most |
-| `POST .../{id}/exec` | machines:write | none | **no** | runs again on every retry |
+| `POST .../{id}/exec` | machines:write | none | **no** | runs again on every retry; recorded in the history unless `noHistory` |
+| `GET .../{id}/history` | machines:write | - | yes | the newest 200 execs, with exit code and the first 64 KiB of each stream; ibx never reads it |
 | `GET .../{id}/files?path=/abs` | **machines:write** | - | yes | reads as root; counts toward the exec limit |
-| `PUT .../{id}/activity-leases/{leaseID}` | machines:write | none | yes | `{"ttlSeconds": 30-3600}` |
+| `PUT .../{id}/activity-leases/{leaseID}` | machines:write | none | yes | `{"ttlSeconds": 30-3600}`; ibx sets it on paid boxes only (section 12) |
 | `DELETE .../{id}/activity-leases/{leaseID}` | machines:write | none | yes | 204 |
 | `GET .../{id}/ports` | machines:read | - | yes | `{enabled, ports[]}` |
 | `POST .../{id}/ports` | machines:write | none | yes | 201 new, 200 already public (same URL) |
@@ -106,10 +110,16 @@ spec.
 | 401 missing_key, malformed_key, invalid_key, expired_key, revoked_key, session_expired | `auth`, exit 125; ask the user to fix this key |
 | 403 missing_scope | `auth`, with requiredScopes and hint; exec did not run |
 | Older unauthenticated, api_key_expired, api_key_revoked, insufficient_scope | supported as auth errors |
-| 402 credit_exhausted, spend_limit_reached, subscription_required, payment_method_required, payment_failed | `account_blocked`; stop claim, exec or SSH, ask the user; keepalive skips that box (status 0) and still leases the others |
+| 402 credit_exhausted, spend_limit_reached, subscription_required, payment_method_required, payment_failed; 403 account_disabled (an administrator disabled the account; every route but data export refuses) | `account_blocked`; stop claim, exec or SSH, ask the user; exec says it did not run. For the 402 codes keepalive skips that box (status 0) and still leases the others. `account_disabled` also refuses the sandbox list, so keepalive (and every other command) fails with 125 |
+| 402 early_allowance_ended (not retryable) | `free_limit`: the free plan runs only `limits.freeSandboxes` boxes at a time; it refuses only free boxes, so claim skips the other free boxes that are not running (and any the server marks `Machine.earlyAllowanceEnded`), keeps looking for a paid one, and exits 75 when none is left; exec, put, get, ssh and run fail without retry; keepalive skips the box |
 | 409 machine_cooldown | no command started; wait within the 10-minute budget, else name the cooldown; keepalive skips the box |
+| 409 machine_cooldown with `reason` `abuse_*` | `abuse_lock`: an abuse check locked the box for up to 24 hours; fail at once and print `abuseLock.explanation` and `appeal`; claim and keepalive skip the box |
+| 409 operation_conflict during a wake | the 45-second wake hold ran out while the resume was still running, or another operation (snapshot, resize, fork) is active on a running box; nothing started. `error.operationId` names the operation. On its own start, resume or wake ibx waits on the named operation, then checks the box again; on an exec or a file transfer it also waits on the named operation (`GET /v1/operations/{id}`), then until the box runs, and sends the request again, at most three times. When the named operation was a start or resume, ibx warns if the box came back with a fresh boot (`runtime.processesPreserved: false`). `ibx run` and `ibx job` fail and say nothing started |
 | 409 max_run_disabled | no command started; refuse; keepalive skips the box |
 | 429 quota_exceeded | nothing started; wait up to 10 minutes |
+| 429 concurrency_limit | Retryable (too many execs at once, on exec or a file transfer): nothing started; handled like `quota_exceeded`. Not retryable (the plan allows no more machines running at once, on a start, resume, wake, or a request that wakes the box): `running_limit`, account-wide like a billing block; claim stops at the first refusal and exits 75, exec, put, get, run and job say nothing started (125), keepalive skips the box (status 0) |
+| 500 restore_failed (not retryable) | a resume, or a request that woke the box, could not restore its suspended memory: the processes are lost and the box is stopped with its files kept; the operation's error and the box's `lastError` carry the code. On its own start, resume or wake (claim, get, ssh, run, job, and exec after `machine_not_running`) ibx warns and starts the box from its disks once. An exec, put, get, `ibx run` or `ibx job` whose own request got it says it did not run; the next command starts the box. A wake that comes back as `409 machine_not_running` with `lastError` restore_failed counts the same |
+| 429 rate_limited on create, start, resume or wake | retryable: ibx waits `retryAfterSeconds` (or `Retry-After`, default 20 s) within its start budget, then retries the start (ibx repeats a start, resume, wake or lease PUT itself only after a lost connection or a 408, 502, 503, 504, 522 or 524, at most three times, never after a 429 or 500, so a refusal is not multiplied); it never retries an exec |
 | 503 host_unavailable, even retryable | never repeat user exec; a restarting API may have killed it partly run |
 | delete_confirmation_required | deletion needs X-Confirm-Delete; ibx never deletes sandboxes |
 | 413 too_large, 507 no_space, 409 not_a_file | file limit, disk full, or destination directory |
@@ -127,6 +137,9 @@ its single JSON error object. `auth`, `account_blocked` and `failed` normally ex
   on it rather than sleeping between calls (spec: GET /v1/operations/{id}).
 - `trigger` tells you instabox started the operation itself, with values including `idle`, `request` (wake on use),
   `max_run`, `memory_pressure`, `wake`, `credit`, `archive`, `drain`, `user_delete`, `admin_delete`.
+  Added by 2026-11-06: `early_allowance_ended` (the service pausing free boxes over the
+  allowance), `payment_method` and `members` (free boxes paused in a workspace without a card
+  on file or with too many members).
 - One operation runs at a time per sandbox. Repeating the same change returns the running
   operation, and a change that is already in effect returns an operation that has already
   succeeded.
@@ -163,10 +176,13 @@ its single JSON error object. `auth`, `account_blocked` and `failed` normally ex
 | SSH certificate TTL | default 1 h, max 24 h | schemas.CreateConnectionRequest |
 | Desktop link TTL | default 1 h, 60 s to 24 h | schemas.DesktopStreamRequest |
 | Activity lease | 30-3600 s (0 or absent: 300); 128 active per sandbox | PUT .../activity-leases/{leaseID} |
-| Max-run | free 480 minutes, fixed; paid default -1 (unlimited); 0 sleeps at once, then refuses wakes with `409 max_run_disabled` once the cooldown ends | schemas.MaxRunMinutes |
-| Idle pause | free fixed 1800; paid 300-1800 in steps of 300, 0 with alwaysOn; manualLifecycle 120-86400 | schemas.AutoSuspendAfterSeconds |
+| Max-run | free: set by the service (admin-only); each run starts at 120 minutes and grows with use (commands, files, ports, terminal/SSH, CPU; not leases or wakes) up to 480; a free box that is not running reports 480; paid default -1 (unlimited); 0 sleeps at once, then refuses wakes with `409 max_run_disabled` once the cooldown ends | schemas.MaxRunMinutes |
+| Max-run cooldown | 5-20 minutes; free back-to-back pauses 60-75, then 120-135; abuse locks up to 24 h | schemas.MaxRunMinutes, [auto-pause](https://instabox.sh/docs/machines/auto-pause.md) |
+| Starts | free 3 a minute (Pro 30); create, start, resume and wake count; `limits.startsPerMinute` | schemas.OrgLimits, [limits](https://instabox.sh/docs/account/limits.md) |
+| Exec history | newest 200 commands per sandbox, first 64 KiB of each stream, kept until the sandbox is deleted; `historyCommand` up to 4096 bytes | GET .../history, schemas.ExecRequest |
+| Idle pause | free fixed 1800; paid 300-1800 in whole minutes (multiples of 60), 0 with alwaysOn; manualLifecycle 120-86400 | schemas.AutoSuspendAfterSeconds |
 | Public ports | 16 per sandbox; ports 1024-65535; 5901 and 6768 reserved | POST .../ports, PublishPortRequest |
-| Sandboxes | free default 1; this account grandfathered at 5; read maxMachines | GET /v1/usage |
+| Sandboxes | free default 1; accounts registered before 2026-10-20 and activated before 2026-10-25 07:45 UTC (this one included) keep 5 free sandboxes until 2026-12-01 00:00 UTC, then only `freeSandboxes` (one) run at a time; read maxMachines, `limits.freeSandboxes` and `earlyAllowanceEnded` | GET /v1/usage, schemas.OrgLimits, [pricing](https://instabox.sh/docs/account/pricing.md) |
 | Snapshots / stored data | free default 5 / 200 GB; read live limits | GET /v1/usage |
 | API keys | 20 active; expiry 1-365 days or never | info.description, CreateAPIKeyRequest |
 | Terminals | 8 open per user | GET .../terminal |
@@ -289,8 +305,10 @@ Reference only: ibx never calls these, but the docs point users and agents to th
 | PATCH /v1/machines/{id}/secrets | machines:write | `{"secrets":[],"envSecrets":[]}` clears both selections of an old box |
 | GET /v1/machines/{id}/logs | machines:read | console log and recent operations; never wakes the box |
 
-The lease route is documented in OpenAPI, not in the prose documentation. Watch the spec for
-changes. A whole-map metadata PATCH and SDK `setMetadata` replace the pool and claim keys.
+The lease route is documented in OpenAPI and on the auto-pause page (docs/machines/auto-pause.md),
+which still recommends holding a lease without a free-plan caveat. On the free plan the terms
+of 2026-11-06 forbid renewing one from outside the box, so ibx sets it only on paid boxes
+(section 12). Watch both for changes. A whole-map metadata PATCH and SDK `setMetadata` replace the pool and claim keys.
 Other tools must preserve them. ibx uses read-modify-write but has no server-side CAS.
 
 Claim JSON adds pausesAt and cooldownUntil, each a timestamp or null. Release preserves the
@@ -321,6 +339,48 @@ a reply cut off) are reported as "may have run". An error event, transport loss 
 terminal, with partial output retained and no retry.
 The server kills the process group when the stream closes. Timeouts stay at 1-600 seconds;
 streaming changes output delivery, not long-job lifecycle. Put/get never use SSE.
+
+## 12. Fields and codes added by 2026-11-06
+
+Read from the public spec and docs on 2026-11-06; what ibx does with each is in the error
+table (section 4).
+
+- `Machine.free` (boolean, read-only): the box belongs to a free-tier org. ibx sets and renews
+  its `ibx-keepalive` lease only when this is false or absent. The terms of 2026-11-06, §2(e),
+  forbid "activity leases renewed from outside the Sandbox ... to keep a Sandbox from pausing
+  after inactivity" on the free plan ([keepalive.md](keepalive.md)). Claim JSON then has
+  `leaseUntil: null`.
+- `Machine.cooldownReason`: absent for a max-run cooldown; `abuse_egress_blocklist`,
+  `abuse_network_flows` or `abuse_cpu` while an abuse check's lock lasts. errors.md also lists
+  `abuse_proxy`, which the two enums leave out, so ibx treats any `abuse_` prefix as a lock.
+  The same value is `Error.reason` on a wake's `409 machine_cooldown`. `ls --json` rows
+  expose it.
+- `Machine.abuseLock` (`MachineAbuseLock`): `at`, `explanation`, `what` and `appeal` are
+  required; `kind`, `dst`, `port`, `count`, `coreShare`, `process` and `pool` are optional
+  detail. Doctor prints `what`, `explanation` and `appeal` for locked pool boxes, cleaned like
+  other server text.
+- `OrgLimits.earlyAllowanceEnded`: true after 2026-12-01 00:00 UTC when the org has more free
+  sandboxes than `freeSandboxes`. Then a start, resume or wake of one more free box is refused
+  with `402 early_allowance_ended`, and the service pauses the excess itself, keeping the most
+  recently active one running. `OrgLimits.freeSandboxes` is the allowance. Doctor shows both.
+- `OrgLimits.startsPerMinute`: starts per minute, wakes included; above it `429
+  rate_limited` with `retryAfterSeconds` and `Retry-After`.
+- `ExecRequest.noHistory` (boolean): "Leave the command out of the sandbox's history ... for a
+  client's own housekeeping commands, such as the CLI's job polls. Does not go with
+  `historyCommand`." ibx sends it on every exec it composes for itself (job polls, status and
+  kill, sweeps, release and claim checks, `~/.ibx` maintenance, directory archive helpers and
+  the single-file put and get fallbacks), never on a user command.
+  It does not cover the process list captured at every pause.
+- `ExecRequest.historyCommand` (string, at most 4096 bytes, no NUL): how the command appears in
+  the history, "for a wrapper that runs something else". `ibx run` and `ibx exec --tail N` set it
+  to the user's command, so the history shows that instead of ibx's wrapper. A plain `ibx exec`
+  (without `--tail`) sends neither field. Sending both is a 400. The server cuts a longer value
+  at 4096 bytes; ibx cuts it first, on a character boundary.
+- `ExecResult.oomKilled` (boolean) and `oomKill` (`OOMKill`: `process`, `pid`, `at`,
+  `rssBytes` and more), also on a streamed exec's exit event: the kernel OOM killer killed the
+  command or one of its children. Absent from older servers, and false when the box's host or
+  template cannot report kills, so false is not proof that nothing was killed. Plain exec
+  prints one warning line on stderr when it is true; `exec --json` passes the fields through.
 
 ## Ownership-aware commands (0.3.0)
 

@@ -6,14 +6,27 @@ it: the error envelope, Bearer auth, Idempotency-Key on PATCH /v1/machines/{id} 
 resume/start, 202 Operations for resume/start and long polls on GET /v1/operations/{id}?wait=,
 POST /wake answering 200 with the Machine, PUT activity-leases waking an idle-paused sandbox,
 metadata replaced (not merged) by PATCH, exec answering 409 machine_not_running on a sandbox that
-does not run, DELETE of a port that is not public answering 404 not_found.
+was paused or stopped by hand (one paused for idleness is woken first), DELETE of a port that
+is not public answering 404 not_found.
 
 Vault: every Machine has "vault" (false by default: the Vault is off for it). With the Vault on,
 GET /v1/machines/{id or name}/vault answers {enabled, items: [{name, kind, ...}], applied}; on a
 sandbox whose Machine has no "vault" field (set "vault": null) that route answers 404, as a
 server without the Vault would. resume/start with {"vault": false} turn it off for good.
 
-Exec: with --exec real (or MOCK_EXEC=real) the command runs with `bash -c` in a per-sandbox
+Plan: Machine.free is false by default (a paid sandbox: activity leases are allowed); seed
+{"free": true} or set {"box-1": {"free": true}} makes it a free-plan one. With the org's
+limits.earlyAllowanceEnded true, a start, resume or wake (also through a lease PUT) of a free
+sandbox while limits.freeSandboxes free ones already run answers 402 early_allowance_ended.
+set {cooldownReason, abuseLock} model an abuse lock: wakes then answer 409 machine_cooldown with
+error.reason set to cooldownReason. set {earlyAllowanceEnded: true} marks a sandbox as the server
+does when a start of it would get 402 early_allowance_ended (the mock does not compute it).
+
+Exec: noHistory (boolean) and historyCommand (string; the server cuts it at 4096 bytes) are
+accepted and recorded in /_calls as sent; both together answer 400, as the real API does. exec
+and the file routes wake a sandbox paused for idleness (autoSuspendedAt) the way POST /wake does
+(45 s hold, then 409 operation_conflict; cooldown, abuse lock and 402 early_allowance_ended
+apply); on a sandbox paused or stopped by hand they answer 409 machine_not_running. With --exec real (or MOCK_EXEC=real) the command runs with `bash -c` in a per-sandbox
 temporary HOME (also its working directory), with the request's stdin and timeout. Otherwise a
 canned result: `exit N` exits N, `sleep N` longer than the timeout times out, anything else
 exits 0 and echoes the command on stdout. Queued results (control "execResults") win over both.
@@ -25,18 +38,26 @@ Test endpoints (no auth):
   GET    /_state    sandboxes with their ports, leases, SSH tokens and HOME directory
   POST   /_control  JSON object; keys are applied in this order:
     reset: true                       default sandboxes; no faults, calls or queued results
-    seed: {count, states, pool, metadata, idle, vault}   replace the sandboxes (box-1..N);
+    seed: {count, states, pool, metadata, idle, vault, free}   replace the sandboxes (box-1..N);
         vault: {"box-2": 3, "box-3": 0} or "box-2:3,box-3:0" = the Vault on with N items
     set: {"box-1": {state, metadata, mergeMetadata, deleteMetadata, ports, leases, freshBoot,
-                    ready, vault, name, id, rawPorts}}   change one sandbox; state "idle" = paused when
+                    restoreFail, ready, vault, name, id, rawPorts, busyOp}}   change one sandbox; state "idle" = paused when
         idle; ports: [{port, name, url}]; vault: N (on, N items), false (off) or null (no
         "vault" field and no Vault route); name/id rename it (id: any string, even an invalid one).
         rawPorts overrides GET /ports verbatim, for malformed provider responses.
+        restoreFail: true makes its next resume fail with 500 restore_failed (a resume operation
+        fails with that error; a wake, exec or file request answers it): the sandbox is then
+        stopped, with lastError set and its processes lost.
+        busyOp: TYPE starts an operation of that type (snapshot, resize...) on a running sandbox;
+        it stays running, with its runtime ready, and busy for opDelay seconds; exec and the file
+        routes answer 409 operation_conflict naming it meanwhile.
     clockSkew: SECONDS                seconds the mock's clock runs ahead of the client's (negative:
         behind); applies to every timestamp it makes, before the reset's seed; reset restores 0
     metadataKeepsUpdatedAt: true      PATCH leaves updatedAt as it was (reset: false)
     clearFaults: true
     opDelay: SECONDS                   delay for new operations (reset restores --op-delay)
+    wakeHold: SECONDS                  how long a wake (POST /wake, exec, files) holds the request
+        before its 409 operation_conflict (reset restores the real API's 45)
     faults: [{kind, method, match, count, status, code, message, retryable, operationId,
               before, seconds, skip}]
         kind "drop": the reply is cut off mid-body (before: true closes the connection
@@ -94,6 +115,7 @@ TRANSITIONS = {  # transitional state -> (operation type, final state)
 }
 META_KEY = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 MACHINE_ID = re.compile(r"^m_[a-z2-7]{26}$")
+DEFAULT_ORG = {"id": "org_mock", "tier": "free", "limits": {"freeSandboxHours": 0, "startsPerMinute": 3, "freeSandboxes": 5}, "usage": {"freeSandboxHours": 12}}
 
 
 def rid(prefix, n=26):
@@ -149,6 +171,7 @@ class State:
         self.cond = threading.Condition(self.lock)
         self.key = args.key
         self.default_op_delay = self.op_delay = args.op_delay
+        self.wake_hold = 45.0
         self.exec_real = args.exec == "real"
         self.max_execs = args.max_execs
         self.ssh_port = args.ssh_port or closed_port()
@@ -169,7 +192,7 @@ class State:
         self.files_enabled = True
         self.file_bad_hash = False
         self.metadata_keeps_updated_at = False
-        self.org = {"id": "org_mock", "tier": "free", "limits": {"freeSandboxHours": 0, "startsPerMinute": 3}, "usage": {"freeSandboxHours": 12}}
+        self.org = copy.deepcopy(DEFAULT_ORG)
         startup = {"dropGets": args.drop_gets, "quotaExecs": args.quota_execs,
                    "dropExecs": args.drop_execs, "conflictResumes": args.conflict_resumes,
                    "failOps": args.fail_ops}
@@ -178,7 +201,7 @@ class State:
             self.control({k: v for k, v in startup.items() if v})
 
     # ---- sandboxes -------------------------------------------------------------------------
-    def seed(self, count=3, states=None, pool=None, metadata=None, idle=None, vault=None):
+    def seed(self, count=3, states=None, pool=None, metadata=None, idle=None, vault=None, free=False):
         for m in self.machines.values():
             shutil.rmtree(m["_home"], ignore_errors=True)
         self.machines, self.ops = {}, {}
@@ -200,7 +223,7 @@ class State:
                  "spec": {"vcpus": 4, "memMiB": 8192, "persistentDiskGiB": 20},
                  "storage": {"sizeGiB": 20, "mountPath": "/data", "persistent": True,
                              "synced": True},
-                 "runtime": {"ready": True}, "free": True, "maxRunMinutes": 480,
+                 "runtime": {"ready": True}, "free": truthy(free), "maxRunMinutes": 480,
                  "runStartedAt": now, "cooldownUntil": None, "orgId": "org_mock",
                  "autoSuspendAfterSeconds": 1800, "metadata": md, "vault": False,
                  "guestUser": "user", "createdAt": now, "updatedAt": now,
@@ -285,6 +308,22 @@ class State:
             changed = True
             op["updatedAt"] = iso()
             m = self.machines.get(op["machineId"])
+            if m and op["type"] == "resume" and m.get("_restore_fail"):
+                # 500 restore_failed: the suspended memory could not be restored. The processes
+                # are lost and the sandbox is stopped with its files kept; the operation's error
+                # and the sandbox's lastError carry the code.
+                m["_restore_fail"] = False
+                op["state"], op["phase"] = "failed", "failed"
+                op["error"] = ApiError(500, "restore_failed",
+                                       "mock: the suspended memory could not be restored").body()["error"]
+                if m["operationId"] == op["id"]:
+                    m["operationId"] = None
+                    m["state"] = m["desiredState"] = "stopped"
+                    m.pop("autoSuspendedAt", None)
+                    m["lastError"] = op["error"]
+                    m["runtime"] = {"ready": False}
+                    self.touch(m)
+                continue
             if op["_fail"]:
                 op["state"], op["phase"] = "failed", "failed"
                 op["error"] = ApiError(500, "internal",
@@ -302,7 +341,7 @@ class State:
                 m["state"] = m["desiredState"] = op["_final"]
                 m.pop("autoSuspendedAt", None)
                 m["runtime"] = {"ready": op["_final"] == "running"}
-                if op["_final"] == "running":
+                if op["_final"] == "running" and op["_from"] != "running":  # not a busyOp
                     m["runStartedAt"] = iso()
                     m["cooldownUntil"] = None
                 if op["type"] in ("start", "resume") and op["_from"] in ("suspended", "suspending"):
@@ -356,11 +395,13 @@ class State:
             CLOCK_SKEW = float(c["clockSkew"])
         if c.get("reset"):
             self.op_delay = self.default_op_delay
+            self.wake_hold = 45.0
             self.org_secrets = []
             self.org_secrets_enabled = True
             self.files_enabled = True
             self.file_bad_hash = False
             self.metadata_keeps_updated_at = False
+            self.org = copy.deepcopy(DEFAULT_ORG)
             self.seed(**self.defaults)
             self.faults, self.exec_results, self.calls, self.idem = [], [], [], {}
         if "orgSecrets" in c:
@@ -377,15 +418,19 @@ class State:
             self.org.update(c["org"])
         if "opDelay" in c:
             self.op_delay = float(c["opDelay"])
+        if "wakeHold" in c:
+            self.wake_hold = float(c["wakeHold"])
         if "seed" in c:
             s = c["seed"]
             self.seed(count=s.get("count", 3), states=s.get("states"), pool=s.get("pool"),
-                      metadata=s.get("metadata"), idle=s.get("idle"), vault=s.get("vault"))
+                      metadata=s.get("metadata"), idle=s.get("idle"), vault=s.get("vault"),
+                      free=s.get("free", False))
         for ref, ch in (c.get("set") or {}).items():
             m = self.find(ref)
             if "state" in ch:
                 self.set_state(m, ch["state"])
-            for key in ("maxRunMinutes", "runStartedAt", "cooldownUntil", "free"):
+            for key in ("maxRunMinutes", "runStartedAt", "cooldownUntil", "free", "cooldownReason", "abuseLock",
+                        "earlyAllowanceEnded"):
                 if key in ch:
                     m[key] = ch[key]
             if "secrets" in ch:
@@ -409,8 +454,14 @@ class State:
                 self.put_lease(m, lease, 3600)
             if "freshBoot" in ch:
                 m["_fresh"] = truthy(ch["freshBoot"])
+            if "restoreFail" in ch:
+                m["_restore_fail"] = truthy(ch["restoreFail"])
             if "ready" in ch:
                 m["runtime"]["ready"] = truthy(ch["ready"])
+            if "busyOp" in ch:  # an operation (snapshot, resize...) on a running sandbox, whose
+                # runtime stays ready meanwhile
+                self.start_op(m, str(ch["busyOp"]), "running", transitional="running")
+                m["runtime"]["ready"] = True
             if "vault" in ch:
                 self.set_vault(m, ch["vault"])
             if "name" in ch:
@@ -1059,10 +1110,41 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:  # a deadline the client may not parse: the server still enforces it
                 seconds = 60
             if seconds > 0:
-                raise ApiError(409, "machine_cooldown", "max-run cooldown", retryAfterSeconds=max(1, int(seconds + 1)))
+                reason = {"reason": m["cooldownReason"]} if m.get("cooldownReason") else {}
+                raise ApiError(409, "machine_cooldown", "abuse lock" if reason else "max-run cooldown",
+                               retryAfterSeconds=max(1, int(seconds + 1)), **reason)
+
+    def check_free_limit(self, m):
+        """402 early_allowance_ended: one more free sandbox may not run."""
+        limits = self.S.org.get("limits") or {}
+        if not m.get("free") or not limits.get("earlyAllowanceEnded"):
+            return
+        running = [o for o in self.S.machines.values() if o is not m and o.get("free")
+                   and o["state"] in ("running", "starting", "resuming")]
+        if len(running) >= int(limits.get("freeSandboxes", 1)):
+            raise ApiError(402, "early_allowance_ended",
+                           "the early free-sandbox allowance has ended: only %d free sandbox(es) may run"
+                           % int(limits.get("freeSandboxes", 1)))
+
+    def wake_on_use(self, m):
+        """exec and the file routes wake a sandbox that paused itself, as POST /wake does: the
+        request waits up to 45 s, then gets 409 operation_conflict; the same cooldown, abuse-lock
+        and free-limit refusals apply. A sandbox paused or stopped by hand is not woken."""
+        if m.get("autoSuspendedAt") and m["state"] != "running":
+            self.wake(m)
+
+    def check_busy(self, m):
+        """A running sandbox busy with another operation refuses exec and file requests with 409
+        operation_conflict naming it (OpenAPI: "another operation is active; operationId names
+        it")."""
+        if m["state"] == "running" and m["operationId"]:
+            raise ApiError(409, "operation_conflict", "another operation is in progress",
+                           operation_id=m["operationId"])
 
     def files(self, m, method, query, raw):
         self.check_cooldown(m)
+        self.wake_on_use(m)
+        self.check_busy(m)
         if m["state"] != "running":
             raise ApiError(409, "machine_not_running", "not running")
         path = (query.get("path") or [""])[0]
@@ -1101,6 +1183,7 @@ class Handler(BaseHTTPRequestHandler):
         if m["operationId"]:
             raise ApiError(409, "operation_conflict", "another operation is in progress",
                            operation_id=m["operationId"])
+        self.check_free_limit(m)
         allowed = {"resume": ("suspended",), "start": ("stopped", "suspended")}[action]
         if m["state"] not in allowed:
             raise ApiError(409, "operation_conflict",
@@ -1133,18 +1216,22 @@ class Handler(BaseHTTPRequestHandler):
         if m["state"] == "running" and not m["operationId"]:
             return 200, S.public(m)
         if m["state"] == "suspended" and m.get("autoSuspendedAt") and not m["operationId"]:
+            self.check_free_limit(m)
             S.start_op(m, "resume", "running", trigger="request")
         op = S.ops.get(m["operationId"]) if m["operationId"] else None
         if op is None:
             raise ApiError(409, "machine_not_running",
                            "the sandbox is %s (paused or stopped by hand: resume or start it)"
                            % m["state"])
-        end = time.monotonic() + 45
+        end = time.monotonic() + S.wake_hold
         while op["state"] not in ("succeeded", "failed") and time.monotonic() < end:
             S.wait_op(op, end - time.monotonic())
         if op["state"] == "succeeded" and m["state"] == "running":
             return 200, S.public(m)
         if op["state"] == "failed":
+            if (op.get("error") or {}).get("code") == "restore_failed":
+                raise ApiError(500, "restore_failed", "the sandbox could not restore its suspended "
+                               "memory: its processes are lost; start it")
             raise ApiError(409, "machine_not_running", "the sandbox could not be resumed")
         raise ApiError(409, "operation_conflict", "still resuming", operation_id=op["id"])
 
@@ -1195,6 +1282,16 @@ class Handler(BaseHTTPRequestHandler):
         stdin = b.get("stdin", "")
         if not isinstance(stdin, str) or len(stdin.encode("utf-8", "surrogatepass")) > MIB:
             raise bad_request("stdin: at most 1 MiB")
+        if "noHistory" in b and not isinstance(b["noHistory"], bool):
+            raise bad_request("noHistory: a boolean")
+        if "historyCommand" in b:
+            h = b["historyCommand"]
+            if not isinstance(h, str) or "\0" in h:
+                raise bad_request("historyCommand: a string, no NUL")
+            # The server cuts it at 4096 bytes (OpenAPI ExecRequest.historyCommand); /_calls keeps
+            # what the client sent.
+            if "noHistory" in b:
+                raise bad_request("historyCommand does not go with noHistory")
         cwd = b.get("cwd") or ""
         envs = b.get("envs") or {}
         if not isinstance(envs, dict) or not all(
@@ -1204,6 +1301,8 @@ class Handler(BaseHTTPRequestHandler):
         with S.lock:
             m = S.find(mref)
             self.check_cooldown(m)
+            self.wake_on_use(m)
+            self.check_busy(m)
             if m["state"] != "running" or m["operationId"]:
                 raise ApiError(409, "machine_not_running", "the sandbox is %s" % m["state"])
             if S.running_execs >= S.max_execs:

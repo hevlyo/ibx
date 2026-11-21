@@ -5,9 +5,109 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/). The version is the one `ibx --version` prints.
 Plugin manifests carry the same version as `ibx --version`.
 
-## 0.3.1 - 2026-10-29
+## 0.4.0 - 2026-11-21
+
+Adapts ibx to instabox's terms of 2026-11-06 and the free-plan change of 2026-12-01, and to
+the API as read on 2026-11-21. Research and decisions are in
+docs/research/2026-11-06-instabox-changes.md and docs/research/2026-11-21-instabox-changes.md.
+
+### Added
+
+- `402 early_allowance_ended` is the new error code `free_limit`, no longer `account_blocked`:
+  the free plan runs only `limits.freeSandboxes` boxes at a time. The refusal applies only to
+  free boxes: after one, claim skips the other free boxes that are not running (and any the
+  server marks `Machine.earlyAllowanceEnded`), still tries paid ones, and exits 75 when none
+  is left. Commands that wake a box fail without retry; keepalive skips the box. Doctor shows
+  `earlyAllowanceEnded` and `freeSandboxes`.
+- Abuse locks (`cooldownReason` starting with `abuse_`, or `reason` on a wake's
+  `409 machine_cooldown`) fail at once with error code `abuse_lock`, printing the lock's
+  explanation and appeal, instead of waiting out a lock of up to 24 hours. This covers exec,
+  put, get, `ibx run` and `ibx job`, and `exec --json` keeps the code whatever the server's
+  text says. Claim skips such boxes, ls shows an abuse lock, keepalive prints `abuse lock until
+  TIME, skipped`, `ls --json` rows carry `cooldownReason`, and doctor prints the lock's `what`,
+  `explanation` and `appeal`.
+- Plain `ibx exec` prints one warning line on stderr when the server reports `oomKilled`,
+  naming the process and PID when given; nothing when it is false or absent.
+- `ls --json` rows carry `free` (`Machine.free`: a free-plan box).
+- `500 restore_failed` (a resume could not restore the box's memory; its processes are lost and
+  it is stopped with its files kept). When ibx itself starts, resumes or wakes the box (claim,
+  get, ssh, run, job, exec after `machine_not_running`), it warns and starts the box from its
+  disks once; a wake that comes back as `409 machine_not_running` with the box's `lastError`
+  restore_failed counts the same. An exec (buffered or `--stream`), put, get, `ibx run` or
+  `ibx job` whose own request got it says it did not run, never "may or may not have run"; the
+  next command starts the box.
+- `ibx run` and `ibx job` bring a stopped or paused box up before their single exec, as exec,
+  put and get do (run still sends its start once). A `409 machine_not_running` on that exec
+  says nothing started.
+- `403 account_disabled` is `account_blocked`: claim stops at the first refusal instead of
+  trying every box. Exec says it did not run for every account-wide refusal (`account_blocked`,
+  `free_limit`, `running_limit`), in plain output as in `--json`.
+- New error code `running_limit`: a `429 concurrency_limit` that is not retryable (the plan
+  allows no more sandboxes running at once). It is account-wide: claim stops at the first
+  refusal and exits 75; exec, put, get, run and job say nothing started (125); keepalive skips
+  the box. A retryable `concurrency_limit` (too many execs at once) on exec and file transfers
+  is handled like `quota_exceeded`.
+- curl no longer repeats a start, resume, wake or lease PUT after a 429 or 500 reply (each
+  repeat counted against `limits.startsPerMinute`, and a repeated wake hid a
+  `500 restore_failed`); ibx repeats those requests only after a lost connection or a
+  transient gateway answer (408, 502, 503, 504, 522, 524), at most three times.
+
+### Changed
+
+- Free boxes (`Machine.free`) get no activity lease. The terms of 2026-11-06, §2(e), forbid
+  "activity leases renewed from outside the Sandbox" that keep a free box from pausing.
+  `ibx keepalive`, with or without `--all`, prints a free-plan skip line for such a box and
+  exits 0; `ibx claim` sets no lease there (`leaseUntil: null`, no lease warning). Paid boxes
+  keep the lease. Release still deletes it. `tests/live.sh` expects the skip line and no
+  lease on free boxes, and skips its two-box run when the free plan can run only one free box
+  at a time.
+- `ibx doctor` fails when a keepalive timer, launchd agent or cron entry is installed and any
+  pool box is free, and names how to remove it. Without a timer it no longer recommends one
+  for free boxes.
+- `install.sh --keepalive` and `--keepalive=all` still install the timer, and warn that it is
+  for paid plans only and against the free plan's terms.
+- A start, resume or wake refused with `429 rate_limited` waits `retryAfterSeconds` (or
+  `Retry-After`, default 20 s) within the existing budget, then retries. Exec itself is never
+  retried.
+- Every exec ibx composes for itself (job polls, status and kill, sweeps, release and claim
+  checks, `~/.ibx` maintenance, directory archive helpers, the single-file put and get
+  fallbacks) sends `noHistory`. `ibx run` and `ibx exec --tail N` send `historyCommand` set to
+  the user's command, so the box's exec history shows what the user ran. A plain `ibx exec`
+  sends neither.
+- An exec, put or get refused with `409 operation_conflict` (nothing started: the 45-second
+  wake hold ran out, or another operation such as a snapshot or resize is active) waits for the
+  operation the error names, then until the box runs, and sends the request again, at most
+  three times, instead of failing with "may or may not have run". `ibx run` and `ibx job` fail
+  and say nothing started.
+- The fresh-boot warning (`runtime.processesPreserved: false`) also follows a start or resume
+  that ibx waited for but did not send: the server's wake named by an exec's or a file
+  transfer's `409 operation_conflict`, ibx's own wake that outlived the 45-second hold, and a
+  resume already running when ibx looked.
+- Free runs start with a 120-minute max-run limit that use extends, up to 480 minutes (the
+  instabox rule since mid-November; leases and wakes do not count). On a free box, claim's
+  "under 60 minutes left" warning says use extends the run, `ls` shows `pausesAt` as "TIME or
+  later", and doctor's run budget calls it the current limit. Docs no longer say "480 by
+  default, dynamic runtime when enabled".
+- The `free_limit` message says a released free box keeps its slot until it pauses after 30
+  idle minutes. Doctor's network hint and the skill point to https://status.instabox.sh.
+- Docs: trust-model.md adds Latitude.sh bare-metal hosting in the United States, that the SOC 2
+  Type II audit does not cover InstaBox yet, and the ban on health data without a BAA. The
+  skill lists the abuse workloads the terms ban, including brute force searches for crypto
+  keys, seeds or vanity addresses and resource farming (stopped without notice since
+  2026-11-16), says §2(e) is unchanged through that revision, and tells agents to stream or
+  detach a quiet command longer than about 4 minutes (a quiet buffered exec can be cut at about
+  270 s).
+- Docs: the README, the skill, keepalive.md, api-notes.md, field-notes.md, trust-model.md and
+  recipes.md describe the free plan's idle definition, wake on use, dynamic runtime, the
+  escalating max-run cooldowns, abuse locks, the 2026-12-01 one-box limit, server-side exec
+  history, declared monitoring and the preinstalled instabox toolkit. Agents are told never to
+  keep a free box awake, never to give a box an instabox key, and never to ask the user to
+  approve an `instabox login --agent` code from a box. Links to the CLI and SDK docs point at
+  `/docs/reference/*`.
 
 ### Fixed
+
+Also includes the fixes once listed as 0.3.1 (2026-10-29), which was never tagged:
 
 - `ibx run` still starts the job in a new session when `setsid` is not installed.
   Debian sandboxes keep `setsid -f`. Otherwise `python3` calls `setsid(2)`, which is

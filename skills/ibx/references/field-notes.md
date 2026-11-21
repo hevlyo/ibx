@@ -1,7 +1,8 @@
 # Field notes: instabox behaviour seen in practice
 
 These notes record observations from 2026-10-15 through 2026-10-27, including details that the
-docs omit or contradict. The initial image was `agent-browser` version 2026-10-15.4 in
+docs omit or contradict, plus documentation and terms changes read on 2026-11-06 (marked as
+such; none of those was tested live). The initial image was `agent-browser` version 2026-10-15.4 in
 us-west-2. instabox is in beta and changes fast. When a note here and
 the live spec disagree, read `GET https://api.instabox.sh/v1/openapi.json` (public, no key),
 and trust what you observe over both. Each note gives the symptom and what to do.
@@ -39,14 +40,29 @@ setting stayed 1800. SDK 0.5.0 sent the same PATCH. The server changed on 2026-1
 to the docs. On 2026-10-27, non-1800 values returned 403 `permission_denied` on the free plan;
 PATCH 1800 was a successful no-op. This is now a plan restriction, not an ignored-setting bug.
 
-Free boxes have a fixed 1800-second idle pause. Paid plans allow 300-1800 in 300-second steps,
+Free boxes have a fixed 1800-second idle pause. Paid plans allow 300-1800 in whole minutes,
 or 0 when always-on is allowed. The 120-86400 range belongs to admin-granted manual lifecycle
-accounts. ibx never changes these settings; it renews an activity lease instead.
+accounts. ibx never changes these settings. On paid boxes it holds an activity lease while a
+box is claimed. On free boxes it holds none: since 2026-11-06 the terms (§2(e)) forbid leases
+renewed from outside the sandbox, scheduled pings and busy loops that keep a free box from
+pausing ([keepalive.md](keepalive.md)).
 
-Free boxes also pause after 480 continuous minutes. Leases cannot prevent this. Live probes
-on 2026-10-27 found runs of exactly 8 hours and cooldowns of 5-17 minutes. The spec default is
-10 minutes. `runtime.processesPreserved` was true in the observed resumptions. Check job PIDs
+Free boxes also pause at their max-run limit. Leases cannot prevent this. Live probes on
+2026-10-27 found runs of exactly 8 hours and cooldowns of 5-17 minutes. The docs read on
+2026-11-06 give 5-20 minutes for the first max-run pause, 60-75 for a second back-to-back one
+and 120-135 from the third on, and describe a dynamic runtime "when enabled". The OpenAPI and
+auto-pause docs read on 2026-11-21 make it the rule for every free box: each run starts at 120
+minutes and grows with use up to 480; leases and wake calls do not count. The change landed
+between 2026-11-08 and 2026-11-13 without an announcement
+([research note](../../../docs/research/2026-11-21-instabox-changes.md)). `runtime.processesPreserved` was true in the observed resumptions. Check job PIDs
 and `runtime.processesPreserved` (in `ibx ls --json`) after waking, keep checkpoints, and do not interpret a refused poll as a dead job.
+
+The 2026-11-06 docs define idle as "no coding agent working, no terminal or SSH traffic, and no
+CPU load"; an exec, a file read, a public port request or a lease keeps a box busy, and a
+missing signal counts as busy. A job that waits silently can therefore be paused. A resume normally
+brings its memory and processes back, but it can fall back to a fresh boot
+(`runtime.processesPreserved: false`) and open network connections can drop, so check the PID
+and `processesPreserved` after any wake, not only after a max-run pause.
 
 The prose docs say public visits wake idle-paused boxes and wait; the spec still says 503.
 This behavior was not verified on the pool. Manual pauses and stops still return 503.
@@ -57,25 +73,28 @@ Leases prevent idle pauses, not max-run pauses. An idle sandbox stayed up for mo
 60 minutes with a lease renewed every 15 minutes. How they
 behave (a PUT wakes an idle-paused sandbox, a lifecycle operation drops every lease, a full
 idle period starts at expiry, a DELETE starts the idle clock without waking) is in
-[keepalive.md](keepalive.md#2-how-activity-leases-work); the route and its limits are in
+[keepalive.md](keepalive.md#4-how-activity-leases-work); the route and its limits are in
 [api-notes.md](api-notes.md#2-routes).
 
-ibx uses the lease ID `ibx-keepalive` with a TTL of 3600 s. `ibx claim` sets it once the
-sandbox is reserved, `ibx keepalive` renews it, and `ibx release` deletes it.
+ibx uses the lease ID `ibx-keepalive` with a TTL of 3600 s. On a paid box `ibx claim` sets it
+once the sandbox is reserved and `ibx keepalive` renews it. On a free box (`Machine.free`) neither
+does, because the free plan's terms forbid it. `ibx release` deletes it either way.
 
 ## 3. What wakes a paused sandbox
 
 | Request | Sandbox paused for idleness | Paused or stopped by hand, or archived |
 |---|---|---|
-| exec | wakes it, then runs (`trigger: request`), per the spec's lifecycle text and the prose docs; the exec route itself says `409 machine_not_running`. ibx handles both: on a 409 it wakes the sandbox and retries | `409 machine_not_running` |
+| exec | wakes it, then runs (`trigger: request`), per the spec's lifecycle text and the prose docs; the request waits up to 45 s, then gets a retryable `409 operation_conflict`. The exec route itself says `409 machine_not_running`. ibx handles both, since neither means the command started: on `machine_not_running` it wakes the sandbox and sends the exec again; on `operation_conflict` it waits for the operation `error.operationId` names (the wake, or a snapshot or resize on a running sandbox), then until the sandbox runs, and sends it again, at most three times. `ibx run` and `ibx job` send once and report that nothing started | `409 machine_not_running` |
 | `GET /files`, `PUT /files`, terminal | wakes it, then runs (`trigger: request`) | `409 machine_not_running` |
 | `GET /files/content` | the route says `409 machine_not_running`; ibx wakes it and retries | `409 machine_not_running` |
 | `POST /connections` (SSH certificate) | wakes it | `409 machine_not_running` |
 | `POST /wake` | wakes it, waits up to 45 s | not undone |
-| `PUT` activity lease | wakes it | do not rely on it |
+| `PUT` activity lease | wakes it; ibx sends none to free boxes | do not rely on it |
 | SSH login with a token | the client is told to start the sandbox; it is not woken | same |
 | Public URL | prose docs say wake and wait; spec says 503, unverified here | 503 |
 | Max-run cooldown | every wake path refuses until cooldownUntil | same |
+| Abuse lock (`cooldownReason` `abuse_*`) | every wake path refuses, for up to 24 h | same |
+| Second free box after 2026-12-01 | start, resume and wake refused with `402 early_allowance_ended` | same |
 | `GET /v1/machines/{id}`, lists | no effect | no effect |
 
 Sources: spec info.description ("Sandbox lifecycle"), the per-route descriptions, and
@@ -92,10 +111,13 @@ by hand gets resumed.
   so programs that compare wall-clock times see a gap.
 - After a resume, `runtime.processesPreserved: false` means the programs could not be brought
   back and the sandbox booted fresh; the files are still there (spec: schemas.Runtime). ibx
-  prints "WARNING: ... came back with a fresh boot" only after a start, resume or wake it made
-  itself (`claim`, `ssh`, or an exec that got `409 machine_not_running`). When the server wakes
-  an idle-paused sandbox for an exec (`trigger: request`), ibx never sees the resume and cannot
-  warn. Check that your processes are still there.
+  prints "WARNING: ... came back with a fresh boot" after a start, resume or wake it made
+  itself (`claim`, `ssh`, or an exec that got `409 machine_not_running`) and after a start or
+  resume it waited for: one already running when it looked, or the one a
+  `409 operation_conflict` names (a wake, the server's or its own, that outlived its 45-second
+  hold). When the server's wake for an exec or a file request (`trigger: request`) finishes
+  within the hold, the request just runs; ibx never sees the resume and cannot warn. Check that
+  your processes are still there.
 - After a pause, `storage.synced` stays `false` for about 16 s. A snapshot of a stopped or
   paused sandbox waits for it (spec: schemas.Storage).
 - After stop/start, files persist on `/data` and on the system disk (packages installed with
@@ -125,6 +147,14 @@ Limits (timeout, `cmd`, stdin and output sizes, concurrency) are in
   caps each stream at 1 MiB. Closing a stream kills its command; an error never retries it.
 - `invalidUtf8` reports replacement of bad bytes with U+FFFD. Use put/get for binary data.
   `signal` names the terminating signal; `diskWarning.message` reports filesystem pressure.
+- Newer servers set `oomKilled: true` (and `oomKill` with the process name and PID) when the
+  kernel OOM killer killed the command or a child. ibx prints one warning line for it. Boxes
+  whose host or template predates the feature report `oomKilled: false` and `oomKills: 0`, so
+  false proves nothing; exit 137 and `sudo dmesg` remain the check.
+- Every exec that reaches the box is recorded server-side: the command text and the first
+  64 KiB of each output stream, newest 200 per box, until the box is deleted (spec: GET
+  /v1/machines/{id}/history, read on 2026-11-06). ibx leaves its own housekeeping execs out with
+  `noHistory`; user commands stay in.
 - Live on 2026-10-27, exec returned about one second after its parent command exited. Later
   writes from a background child were lost and failed with a broken pipe. The writer died,
   while its loop survived. Use `setsid -f CMD </dev/null >LOG 2>&1` for detached work.
@@ -234,7 +264,7 @@ only your own processes. Keep bracket patterns in SSH commands. Never kill provi
 
 ## 12. Spec drift
 
-Checked through 2026-10-27:
+Checked through 2026-10-27, with items from 2026-11-06 marked by date:
 
 - The fork route was removed on 2026-10-15. CLI fork now exists, but cannot pass the two
   credential-disabling flags required for pool recreation. Use a clean snapshot and explicit create.
@@ -244,14 +274,21 @@ Checked through 2026-10-27:
   per-route parameters disagree, and they are what the server enforces
   ([api-notes.md](api-notes.md#3-idempotency)).
 - The ignored-setting behavior above is historical. Since 2026-10-25 the free plan rejects
-  non-1800 values. `machine_cooldown` and `max_run_disabled` are still missing from Error.code.
+  non-1800 values. `machine_cooldown` and `max_run_disabled` were missing from Error.code
+  through 2026-10-27; the spec read on 2026-11-06 lists them.
 - The scope list in the prose leaves out ports, leases, files, wake and desktop; the
   per-route descriptions give their scopes.
 - Some schema descriptions are split into stray keys with `null` values (for example
   `schemas.Files.properties.path`, `schemas.Connection.properties.id`). Read the text around
   them.
-- The docs site renders only with JavaScript. `GET /v1/openapi.json` is public and is the most
-  complete source.
+- The docs moved to Mintlify on 2026-11-06 and now have Markdown versions (for example
+  [auto-pause.md](https://instabox.sh/docs/machines/auto-pause.md)); old paths such as
+  `/docs/cli` and `/docs/sdk` redirect to `/docs/reference/*`. The legal pages still render
+  only with JavaScript. `GET /v1/openapi.json` is public and remains the most complete source.
+- Found on 2026-11-06: the auto-pause docs still suggest holding a lease for a silent task,
+  with no free-plan caveat, while the terms forbid leases renewed from outside the box on the
+  free plan. `Machine.cooldownReason` and `Error.reason` list three abuse reasons;
+  errors.md and `Operation.trigger` add `abuse_proxy`.
 
 ## 13. Hardware, network and software
 
@@ -265,6 +302,11 @@ Checked through 2026-10-27:
 | Egress | shared NAT IPv4; about 3.3 Gbit/s download from a nearby host, about 0.75 Gbit/s upload; outbound port 25 blocked |
 | Ingress | none: not reachable from the internet, IPv6 included; only published ports (through the proxy) and SSH (through the gateway) |
 
+Boxes created or rebuilt after 2026-11-01 also ship the instabox CLI
+(`/usr/local/bin/instabox`), provider skills in `~/.claude/skills` and `~/.agents/skills`, and an
+instabox MCP config, per the 2026-11-01 changelog. Whether the existing pool boxes have them was
+not checked. Treat them as data; no key goes into a box for them ([trust-model.md](trust-model.md)).
+
 The preinstalled tools in `agent-browser` 2026-10-15.4 include `claude`, `codex`, node 22, python 3.13, `uv`,
 `go`, rust, `gh`, `git`, docker with compose, chromium 154, `mosh-server`. `bun` was missing then
 and is in the image as of 2026-10-27. Missing tools include `tmux`, `ripgrep`, `opencode`,
@@ -276,7 +318,10 @@ not signed in; leave them that way ([trust-model.md](trust-model.md)).
 The shared egress IP means per-IP rate limits (for example anonymous container registry pulls)
 can run out sooner than you would expect. Account limits are in
 [api-notes.md](api-notes.md#7-limits): a free org normally gets one sandbox; this account's
-five sandboxes in any state are a grandfathered exception.
+five sandboxes are an early-account allowance that ends on 2026-12-01 00:00 UTC. After that
+only one free sandbox runs at a time, the service pauses the others, and starting another
+fails with `402 early_allowance_ended` (`free_limit` in ibx). The free plan also allows 3
+starts a minute, wakes included; above that a retryable `429 rate_limited`.
 
 ## 14. Timings
 
@@ -299,7 +344,7 @@ public IPv4 addresses before sending. Agents draft the report and let the user s
 Include no keys, tokens, sandbox IDs or personal data. The idle-setting refusal on the free
 plan is expected and is not a bug.
 
-One current documentation discrepancy is that `machine_cooldown` and `max_run_disabled` are
-missing from the `Error.code` enum although the max-run schema documents them. The public-URL
+Current documentation discrepancies, found on 2026-11-06: the lease advice in the auto-pause
+docs against the free-plan terms, and `abuse_proxy` missing from two enums (section 12). The public-URL
 wake behavior also differs between the prose docs and spec; it needs an authorized probe.
 Problems with ibx belong in its repository; security reports follow [the security policy](https://github.com/hevlyo/ibx/security/policy).

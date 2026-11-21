@@ -7,8 +7,11 @@
 # ~/.config/instabox/api-key) and at least two free sandboxes in the pool (ibx pool add ...)
 # that the Vault writes no secrets into (the Vault may be on, but empty: ibx doctor says so).
 # It runs with ibx's default rules: IBX_ALLOW_ANY and IBX_ALLOW_VAULT are ignored.
-# It also runs `ibx keepalive`, which renews the activity lease of every reserved pool sandbox,
-# as the keepalive timer does. Takes a few minutes. Prints PASS/FAIL lines; exits 1 on a FAIL.
+# It also runs `ibx keepalive`, which renews the activity lease of every reserved paid pool
+# sandbox and skips free-plan ones: the instabox Terms of 2026-11-06, 2(e), forbid leases renewed
+# from outside a free sandbox. Since 2026-12-01 a free-plan org with more free sandboxes than
+# limits.freeSandboxes runs only that many at a time: when the two claims cannot both run, it
+# says SKIP and exits 0. Takes a few minutes. Prints PASS/FAIL lines; exits 1 on a FAIL.
 #
 #   IBX_LIVE=1 tests/live.sh
 #   IBX_LIVE=1 IBX=/path/to/ibx tests/live.sh
@@ -93,6 +96,19 @@ if [ "${free:-0}" -lt 2 ]; then
 	echo "SKIP live run needs two free pool boxes with at least 30 minutes of run budget"
 	exit 0
 fi
+# After the early free allowance ended (2026-12-01), only limits.freeSandboxes free-plan boxes
+# run at a time; doctor prints the org's limits on its "org:" line.
+limits=$(sed -n 's/^ok    org: \(.*\); 0 free hours means no cap$/\1/p' "$L/doctor" | head -n 1)
+[ -n "$limits" ] || limits='{}'
+slots=$(jq -r 'if .earlyAllowanceEnded == true then (.freeSandboxes // 0) else "any" end' <<<"$limits" 2>/dev/null) || slots=any
+if [[ $slots =~ ^[0-9]+$ ]]; then
+	runnable=$(live_budget_rows <"$L/ls-all" | jq --argjson slots "$slots" '[.[] | select(.reservation == "free" or .reservation == "abandoned")] |
+		([.[] | select(.free != true)] | length) + ([[.[] | select(.free == true)] | length, $slots] | min)')
+	if [ "${runnable:-0}" -lt 2 ]; then
+		echo "SKIP the free plan runs $slots free box(es) at a time since 2026-12-01 (limits.freeSandboxes), and live.sh needs two running at once"
+		exit 0
+	fi
+fi
 outside=$(jq -r '[.[] | select(.pool | not) | .name][0] // empty' "$L/ls-all")
 if [ -n "$outside" ]; then
 	ibx exec "$outside" -- true 2>"$L/err"
@@ -103,22 +119,28 @@ else
 fi
 
 # ---- two claims at once --------------------------------------------------------------------
-ibx claim "ibx live test A" >"$L/a" 2>"$L/a.err" &
+ibx claim --json "ibx live test A" >"$L/a" 2>"$L/a.err" &
 pa=$!
-ibx claim "ibx live test B" >"$L/b" 2>"$L/b.err" &
+ibx claim --json "ibx live test B" >"$L/b" 2>"$L/b.err" &
 pb=$!
 wait "$pa"
 ra=$?
 wait "$pb"
 rb=$?
-A=$(cat "$L/a") B=$(cat "$L/b")
+A=$(jq -r '.name // empty' "$L/a" 2>/dev/null) B=$(jq -r '.name // empty' "$L/b" 2>/dev/null)
+for f in "$L/a" "$L/b"; do
+	if [ "$(jq -r '.error.code // empty' "$f" 2>/dev/null)" = free_limit ]; then
+		echo "SKIP a claim got free_limit: the free plan runs only limits.freeSandboxes free boxes at a time (2026-12-01)"
+		exit 0 # cleanup releases whichever claim succeeded
+	fi
+done
 check "claim A" 0 "$ra"
 check "claim B" 0 "$rb"
 if [ -n "$A" ] && [ -n "$B" ] && [ "$A" != "$B" ]; then
 	ok "concurrent claims got different sandboxes ($A, $B)"
 else
 	bad "concurrent claims: A=$A B=$B"
-	cat "$L/a.err" "$L/b.err" >&2
+	cat "$L/a" "$L/b" "$L/a.err" "$L/b.err" >&2
 	exit 1
 fi
 ibx ls --json >"$L/ls"
@@ -242,8 +264,19 @@ done
 is "the public URL serves the page" "$body" hi
 ibx keepalive >"$L/keep" 2>&1
 check "keepalive" 0 $?
-yes_ "keepalive leased A" grep -q "^$A: lease until" "$L/keep" || show "$L/keep"
-yes_ "keepalive leased B too" grep -q "^$B: lease until" "$L/keep"
+ibx ls --json >"$L/plan"
+for x in "$A:$L/a" "$B:$L/b"; do
+	b=${x%%:*} claimed=${x#*:}
+	if [ "$(jq -r --arg b "$b" '.[] | select(.name == $b) | .free' "$L/plan")" = true ]; then
+		# Free plan: a lease renewed from outside the sandbox is against the Terms (2(e)).
+		yes_ "keepalive skipped free-plan $b" grep -q "^$b: free plan: renewing a lease from outside the sandbox is not allowed" "$L/keep" || show "$L/keep"
+		yes_ "and leased nothing there" eval '! grep -q "^$b: lease until" "$L/keep"'
+		is "the claim of free-plan $b set no lease" "$(jq -c .leaseUntil "$claimed")" null
+	else
+		yes_ "keepalive leased paid $b" grep -q "^$b: lease until" "$L/keep" || show "$L/keep"
+		yes_ "the claim of paid $b set a lease" jq -e '.leaseUntil | type == "string"' "$claimed"
+	fi
+done
 before=$(ibx ls --json | jq -r --arg a "$A" '.[] | select(.name == $a) | .since')
 sleep 1
 ibx renew "$A" >/dev/null

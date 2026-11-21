@@ -17,7 +17,8 @@ Usage: ./install.sh [options]
 Installs ibx for your coding agents:
   - links skills/ibx into each agent's skills directory as ibx/ (or copies it, with --copy)
   - links scripts/ibx into a bin directory as the ibx command
-  - with --keepalive, installs a timer that runs `ibx keepalive` every 15 minutes
+  - with --keepalive, installs a timer that runs `ibx keepalive` every 15 minutes (paid plans
+    only: the instabox Terms 2(e) of 2026-11-06 forbid it on the free plan)
 
 Options
   --agents LIST      comma-separated skills roots (default: claude,agents)
@@ -32,7 +33,7 @@ Options
                      run ./install.sh --copy again after a git pull)
   --bin DIR          where the ibx command goes (default: ~/.local/bin)
   --no-bin           do not install the ibx command
-  --keepalive        install the keepalive timer for reserved pool sandboxes
+  --keepalive        install the keepalive timer for reserved pool sandboxes (paid plans only)
   --keepalive=all    same, but for every pool sandbox (ibx keepalive --all)
                        Linux: systemd user units ibx-keepalive.service and .timer
                        macOS: ~/Library/LaunchAgents/local.ibx-keepalive.plist
@@ -513,6 +514,10 @@ else
 fi
 
 if [ -n "$keepalive" ]; then
+	# install.sh has no network and cannot see the plan: say it before anything changes.
+	warn "the keepalive timer is for paid plans only. On the free plan, activity leases renewed from"
+	warn "outside the sandbox to keep it from pausing break the instabox Terms 2(e) (2026-11-06);"
+	warn "ibx keepalive skips free sandboxes and ibx doctor fails while the timer is installed."
 	args=
 	[ "$keepalive" = all ] && args=" --all"
 	safe_path "$exe" || conflict "$exe" "the timer needs a path with only letters, digits and ._/+@- (use --bin DIR)"
@@ -670,6 +675,6 @@ if [ -z "$dry" ] && [ "$rc" = 0 ]; then
 	fi
 	say "  - ibx pool add <box>...   put sandboxes in the pool agents may claim"
 	say "  - ibx doctor              check that everything works"
-	[ -n "$keepalive" ] || say "  - optional: ./install.sh --keepalive   keep reserved sandboxes awake"
+	[ -n "$keepalive" ] || say "  - paid plans only: ./install.sh --keepalive   keep reserved sandboxes awake"
 fi
 exit "$rc"
